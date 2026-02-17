@@ -1,0 +1,1 @@
+"""Statsmodels sandbox regression stub."""

@@ -3,6 +3,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# IQE imported tests (synced from iqe-cost-management-plugin)
+tests/suites/iqe_compat/imported/
+
+# IQE shim modules (generated for compatibility with imported tests)
+# These provide stub implementations for IQE framework dependencies
+tests/fauxfactory/
+tests/pandas/
+tests/iqe/
+tests/iqe_cost_management/
+tests/iqe_cost_management_api/
+
+# Note: tests/iqe_adapter/ is NOT ignored - it's our core adapter code
+
 # Virtual environments
 venv/
 env/
