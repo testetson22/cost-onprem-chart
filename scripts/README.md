@@ -13,6 +13,8 @@ Automation scripts for deploying, configuring, and testing the Cost Management O
 | `deploy-rhbk.sh` | Deploy Red Hat Build of Keycloak | OpenShift |
 | `setup-cost-mgmt-tls.sh` | Configure TLS certificates | OpenShift |
 | `query-kruize.sh` | Query Kruize database | All environments |
+| `ocp-ci-cluster-login.sh` | Login to CI ephemeral cluster | OpenShift CI |
+| `download-ci-artifacts.sh` | Download CI artifacts from Prow/GCS | Local |
 
 ## 🚀 Quick Start
 
@@ -347,6 +349,66 @@ Query Kruize database for experiments and recommendations.
 - Database pod accessible via `oc exec`
 
 **Best for:** Debugging, validating data flow, checking recommendation generation status
+
+---
+
+### `ocp-ci-cluster-login.sh`
+Login to an OpenShift CI ephemeral cluster for interactive debugging.
+
+**What it does:**
+- Parses Prow job URL to find cluster claim
+- Retrieves kubeadmin credentials from hosted-mgmt
+- Logs you into the ephemeral cluster
+- Optionally opens the web console
+
+**Usage:**
+```bash
+# Interactive mode
+./ocp-ci-cluster-login.sh
+
+# With Prow URL
+./ocp-ci-cluster-login.sh "https://prow.ci.openshift.org/view/gs/test-platform-results/pr-logs/pull/insights-onprem_cost-onprem-chart/50/pull-ci-insights-onprem-cost-onprem-chart-main-e2e/2014360404288868352"
+```
+
+**IMPORTANT:** The cluster is deleted when the CI job terminates. See `docs/debugging-ci-clusters.md` for how to hold clusters open.
+
+**Requirements:**
+- `oc` CLI installed
+- Access to cluster pool admin group (for cluster claims)
+
+---
+
+### `download-ci-artifacts.sh`
+Download CI artifacts from OpenShift CI for debugging failed or passed test runs.
+
+**What it does:**
+- Downloads all artifacts from a CI job
+- Supports Prow URLs, gcsweb URLs, or PR number + build ID
+- Extracts pytest output, JUnit reports, and logs
+
+**Usage:**
+```bash
+# From Prow URL (copy from GitHub "Details" link)
+./download-ci-artifacts.sh --url "https://prow.ci.openshift.org/view/gs/test-platform-results/pr-logs/pull/insights-onprem_cost-onprem-chart/50/pull-ci-insights-onprem-cost-onprem-chart-main-e2e/2014360404288868352"
+
+# From PR number and build ID
+./download-ci-artifacts.sh 50 2014360404288868352
+
+# To specific directory
+./download-ci-artifacts.sh 50 2014360404288868352 ./my-artifacts
+```
+
+**Key artifacts:**
+| Path | Description |
+|------|-------------|
+| `build-log.txt` | Main CI operator log |
+| `artifacts/e2e/*/build-log.txt` | **Pytest output** |
+| `artifacts/junit_operator.xml` | JUnit test results |
+
+**Requirements:**
+- `gcloud` CLI installed and authenticated
+
+**See also:** [Debugging CI Clusters Guide](../docs/debugging-ci-clusters.md)
 
 ---
 

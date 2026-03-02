@@ -11,6 +11,7 @@ For Cursor IDE users, see `.cursor/rules/` for auto-loaded context rules.
 - `check-logs.md` - View component logs
 - `debug-e2e.md` - Debug E2E test failures
 - `download-ci-artifacts.md` - Download CI artifacts from Prow/GCS
+- `debug-ci-cluster.md` - Access/debug OpenShift CI ephemeral clusters
 
 ## Project Overview
 
@@ -297,3 +298,20 @@ kubectl logs -n cost-onprem -l app.kubernetes.io/component=ros-processor | grep 
 ```
 
 **Note:** Downloaded artifacts are saved to `ci-artifacts-pr<PR>-<BUILD_ID>/` and should NOT be deleted unless explicitly requested by the user.
+
+### Debug CI Clusters
+```bash
+# Login to a running CI cluster
+./scripts/ocp-ci-cluster-login.sh "<PROW_URL>"
+```
+
+**IMPORTANT:** Ephemeral clusters are deleted when the CI job terminates. To hold a cluster open for debugging, add a sleep to `scripts/deploy-test-cost-onprem.sh`:
+
+```bash
+# Add before final exit
+echo "=== HOLDING CLUSTER OPEN FOR DEBUGGING ==="
+sleep 3600  # 1 hour
+exit "${OVERALL_RESULT}"
+```
+
+**See:** `docs/debugging-ci-clusters.md` for full documentation.
