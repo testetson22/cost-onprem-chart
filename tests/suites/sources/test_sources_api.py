@@ -123,6 +123,46 @@ class TestSourcesExternalHealth:
         assert "data" in data, f"Missing data field in response: {data}"
         assert "meta" in data, f"Missing meta field in response: {data}"
 
+    def test_sources_response_has_content_length_header(
+        self, gateway_url: str, authenticated_session: requests.Session
+    ):
+        """Verify Sources API response includes Content-Length header (not chunked).
+        
+        FLPATH-3371: The Cost Management Metrics Operator (CMMO) fails to parse
+        JSON responses when the gateway uses chunked transfer encoding without
+        Content-Length. Go's httputil.DumpResponse re-encodes chunked responses
+        with hex size markers that corrupt the JSON payload.
+        
+        This test ensures the gateway preserves Content-Length headers from
+        upstream responses, which prevents chunked encoding issues.
+        """
+        response = authenticated_session.get(
+            f"{gateway_url}/cost-management/v1/sources",
+            timeout=30,
+        )
+
+        assert response.status_code == 200, (
+            f"Sources endpoint failed: {response.status_code} - {response.text[:200]}"
+        )
+        
+        # Verify Content-Length is present (not chunked transfer encoding)
+        content_length = response.headers.get("Content-Length")
+        transfer_encoding = response.headers.get("Transfer-Encoding", "")
+        
+        assert content_length is not None, (
+            f"Response missing Content-Length header. "
+            f"Transfer-Encoding: {transfer_encoding}. "
+            f"This breaks CMMO JSON parsing (FLPATH-3371). "
+            f"Ensure Envoy gateway does not strip Content-Length or add chunked encoding."
+        )
+        
+        # Verify no chunked transfer encoding
+        assert "chunked" not in transfer_encoding.lower(), (
+            f"Response uses chunked transfer encoding (Transfer-Encoding: {transfer_encoding}). "
+            f"This breaks CMMO JSON parsing (FLPATH-3371). "
+            f"Ensure Envoy gateway preserves Content-Length from upstream."
+        )
+
 
 @pytest.mark.sources
 @pytest.mark.api
