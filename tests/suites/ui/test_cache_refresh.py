@@ -51,7 +51,6 @@ def save_screenshot(page: Page, name: str) -> str:
 
 
 @pytest.mark.ui
-@pytest.mark.flpath_3114
 class TestCacheRefresh:
     """Test that UI cache correctly invalidates on refresh.
     
