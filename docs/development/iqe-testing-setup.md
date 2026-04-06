@@ -102,8 +102,11 @@ You need an OpenShift cluster with:
 # Basic run
 ./scripts/run-iqe-tests.sh
 
-# With custom marker
+# With custom marker (legacy)
 ./scripts/run-iqe-tests.sh --marker "cost_ocp_on_prem"
+
+# With tier-based markers
+USE_TIER_MARKERS=true ./scripts/run-iqe-tests.sh --profile extended
 
 # With test filter
 ./scripts/run-iqe-tests.sh --filter "not ai_workloads"
@@ -330,8 +333,9 @@ The default `IQE_FILTER` in `run-iqe-tests-local.sh` skips:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NAMESPACE` | `cost-onprem` | Target Kubernetes namespace |
-| `IQE_MARKER` | `cost_ocp_on_prem` | Pytest marker expression |
-| `IQE_FILTER` | (see script) | Pytest -k filter |
+| `USE_TIER_MARKERS` | `false` | Use tier-based `-m` expressions instead of `-k` filters |
+| `IQE_MARKER` | `cost_ocp_on_prem` | Pytest marker expression (overridden by tier mode) |
+| `IQE_FILTER` | (see script) | Pytest -k filter (empty in tier mode) |
 | `IQE_TIMEOUT` | `14400` | Test timeout in seconds (containerized, 4 hours) |
 | `IQE_CORE_PATH` | `../iqe-core` | Path to iqe-core repo |
 | `IQE_PLUGIN_PATH` | `../iqe-cost-management-plugin` | Path to plugin repo |

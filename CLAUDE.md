@@ -332,24 +332,32 @@ IQE (Insights QE) tests provide comprehensive integration testing for cost-manag
 
 ### Test Profiles
 
-| Profile | Tests | Duration | Use Case |
-|---------|-------|----------|----------|
-| `smoke` | ~43 | ~17 min | PR checks |
-| `extended` | ~2100 | ~33 min | Daily CI |
-| `stable` | ~2350 | ~40 min | Weekly CI |
-| `full` | ~3324 | ~60 min | Release validation |
+Profiles compose non-overlapping tier markers (`cost_onprem_smoke`, `cost_onprem_api`,
+`cost_onprem_ui`, `cost_onprem_infra`, `cost_onprem_data`):
+
+| Profile | Tiers | ~Tests | ~Duration | Use Case |
+|---------|-------|--------|-----------|----------|
+| `smoke` | smoke | ~43 | ~17 min | PR checks |
+| `extended` | api + ui + infra + data (no smoke) | ~2,200 | ~25 min | Daily CI |
+| `stable` | all tiers, blocked excluded | ~2,244 | ~35 min | Weekly CI |
+| `full` | all on-prem (including blocked) | ~2,294 | ~42 min | Release validation |
 
 Tests are I/O-bound waiting for backend data processing. Use `--listener-cpu max`
 to boost the listener deployment's CPU during the run (~40-50% faster ingestion).
 
+Selection mode is controlled by `USE_TIER_MARKERS` env var (default: `false`).
+When `true`, profiles use `-m` marker expressions with no `-k` filters.
+When `false` (legacy), profiles use `-m cost_ocp_on_prem` + `-k` skip filters.
+
 ### Known Issues
 
-Tests are organized into skip groups with `SKIP_*` env vars. Key blockers:
+Tests are organized into skip groups with `SKIP_*` env vars (legacy mode) or
+excluded via the `cost_onprem_blocked` marker (tier mode). Key blockers:
 - **COST-7179** — GPU/MIG schema mismatch blocks ~90 tests + cascading failures
 - **90-day data** — NISE generates ~60 days; 90-day range tests fail (~228 tests)
 - **FLPATH-3423** — Source CRUD update returns 500 (1 test)
 
 See `docs/development/skipped-iqe-tests.md` for full details on all skip groups,
-pytest markers, and test profiles.
+tier markers, pytest markers, and test profiles.
 
 See `docs/development/iqe-testing-setup.md` for full setup guide.

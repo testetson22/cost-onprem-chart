@@ -10,10 +10,15 @@
 # See docs/development/skipped-iqe-tests.md for full documentation.
 #
 # Profiles (use --profile flag):
-#   smoke     - Source + cost model tests (~43 tests, ~17 min) - FOR PR CHECKS
-#   extended  - All except infra tests (~2100 tests, ~33 min) - DAILY CI
-#   stable    - All validated tests (~2350 tests, ~40 min) - WEEKLY CI
-#   full      - All cost_ocp_on_prem tests (~3324 tests, 2-3 hours) - RELEASE VALIDATION
+#   smoke     - Smoke tier only (~43 tests, ~17 min) - PR CHECKS
+#   extended  - API + UI + Infra + Data, no smoke (~2,200 tests, ~25 min) - DAILY CI
+#   stable    - All tiers, blocked excluded (~2,244 tests, ~35 min) - WEEKLY CI
+#   full      - All on-prem tests including blocked (~2,294 tests, ~42 min) - RELEASE
+#
+# Selection modes (USE_TIER_MARKERS env var):
+#   false (default) - Legacy: -m cost_ocp_on_prem + -k skip filters
+#   true            - Tier-based: -m "(cost_onprem_smoke or ...)" with no -k filters
+#                     Requires IQE plugin with tier markers applied
 # =============================================================================
 
 # Prevent multiple sourcing
@@ -30,8 +35,50 @@ _IQE_FILTERS_SOURCED=1
 # Empty means use individual SKIP_* settings (defaults to stable-like behavior)
 TEST_PROFILE="${TEST_PROFILE:-}"
 
+# Feature flag: set to "true" to use tier-based marker selection instead of -k filters.
+# Requires IQE plugin with tier markers (cost_onprem_smoke, cost_onprem_api, etc.)
+USE_TIER_MARKERS="${USE_TIER_MARKERS:-false}"
+
 # Apply profile settings (called after arg parsing)
 apply_profile() {
+    if [[ "${USE_TIER_MARKERS}" == "true" ]]; then
+        apply_profile_tiered
+    else
+        apply_profile_legacy
+    fi
+}
+
+# Tier-based profile selection: uses pytest -m marker expressions.
+# Each test has exactly one tier; profiles compose tiers by union.
+# No -k filters needed — blocked tests are excluded via the cost_onprem_blocked marker.
+apply_profile_tiered() {
+    local blocked="and not cost_onprem_blocked"
+    case "${TEST_PROFILE}" in
+        smoke)
+            IQE_MARKER="cost_onprem_smoke ${blocked}"
+            ;;
+        extended)
+            # Everything except smoke — mutually exclusive with smoke
+            IQE_MARKER="(cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            ;;
+        stable)
+            # All tiers, blocked excluded
+            IQE_MARKER="(cost_onprem_smoke or cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            ;;
+        full)
+            # Everything including blocked — umbrella marker, no filters
+            IQE_MARKER="cost_ocp_on_prem"
+            ;;
+        *)
+            # Default: same as stable
+            IQE_MARKER="(cost_onprem_smoke or cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            ;;
+    esac
+    SKIP_FILTER_BUILD=true
+}
+
+# Legacy profile selection: umbrella marker + -k skip filters.
+apply_profile_legacy() {
     case "${TEST_PROFILE}" in
         smoke)
             # Quick validation (~43 tests, ~17 min)

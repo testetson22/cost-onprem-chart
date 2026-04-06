@@ -2,18 +2,22 @@
 
 > **Living Document**: This document tracks tests that are skipped when running IQE tests against on-prem Cost Management deployments. It should be updated as issues are resolved or new skip patterns are identified.
 >
-> **Last Updated**: 2026-03-25
+> **Last Updated**: 2026-04-06
 
 ## Overview
 
-IQE tests are organized into profiles that progressively include more tests:
+IQE tests are organized into profiles that compose non-overlapping tiers.
+Smoke and extended are **mutually exclusive**; stable is their union.
 
-| Profile | Tests | Duration | Use Case |
-|---------|-------|----------|----------|
-| `smoke` | ~43 | ~17 min | PR checks, quick validation |
-| `extended` | ~2100 | ~33 min | Daily CI, broader coverage |
-| `stable` | ~2350 | ~40 min | Weekly CI, comprehensive |
-| `full` | ~3324 | ~60 min | Release validation |
+| Profile | Tiers | ~Tests | ~Duration | Use Case |
+|---------|-------|--------|-----------|----------|
+| `smoke` | smoke | ~43 | ~17 min | PR checks |
+| `extended` | api + ui + infra + data (no smoke) | ~2,200 | ~25 min | Daily CI |
+| `stable` | smoke + api + ui + infra + data (blocked excluded) | ~2,244 | ~35 min | Weekly CI |
+| `full` | all on-prem (including blocked) | ~2,294 | ~42 min | Release validation |
+
+> In legacy mode (default), profiles use `-k` skip filters instead of tier markers.
+> The test sets are equivalent; the difference is how selection is expressed.
 
 > **Note**: Durations measured with `--listener-cpu max` on test cluster (3 workers, 12 CPU / 32GB each)
 
@@ -39,63 +43,108 @@ IQE tests are organized into profiles that progressively include more tests:
 
 ### `smoke` (Default for PRs)
 
-**~43 tests, ~17 minutes**
+**~43 tests, ~17 minutes** | Tier: `cost_onprem_smoke`
 
 A curated set of source and cost model tests that pass reliably. Good for quick validation.
 
 ```bash
-# Filter: positive selection + skip filters
-(test_api_ocp_source and not test_api_ocp_source_crud) or test_api_cost_model_ocp
+# Tier mode:    -m "cost_onprem_smoke and not cost_onprem_blocked"
+# Legacy mode:  -k "(test_api_ocp_source and not test_api_ocp_source_crud) or test_api_cost_model_ocp"
 ```
 
 Includes:
-- Source CRUD operations (except update)
-- Cost model creation and application
-- Basic API validation
+- Source ingestion and data verification
+- Cost model creation, CRUD, and rate application
+- Health check endpoints
 
 ---
 
 ### `extended` (Default for Daily CI)
 
-**~2100 tests, ~33 minutes**
+**~2,200 tests, ~25 minutes** | Tiers: `api` + `ui` + `infra` + `data`
 
-All tests except infrastructure and blocked groups. Broad coverage for daily CI.
+Everything except smoke, blocked excluded. Mutually exclusive with smoke.
+
+```bash
+# Tier mode: -m "(cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) and not cost_onprem_blocked"
+```
 
 ---
 
 ### `stable` (Weekly CI)
 
-**~2350 tests, ~40 minutes**
+**~2,244 tests, ~35 minutes** | Tiers: `smoke` + `api` + `ui` + `infra` + `data`
 
-Comprehensive coverage including infrastructure tests.
+All tiers, blocked excluded. Runs every passing on-prem test.
 
-Includes everything in `extended` plus:
-- **Infrastructure tests** (~250 tests) - Bucketing, ingestion, cost filtering
+```bash
+# Tier mode: -m "(cost_onprem_smoke or cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) and not cost_onprem_blocked"
+```
 
 ---
 
 ### `full` (Release Validation)
 
-**~3353 tests, ~42 minutes** (with fail-fast + listener CPU max)
+**~2,294 tests, ~42 minutes** | All on-prem tests including blocked
 
-All `cost_ocp_on_prem` marked tests. No filters applied. Expect ~2,900 errors
-from cascading GPU/MIG fixture failures and ~31 test failures from known issues.
-With fail-fast enabled, stalled sources are detected in seconds instead of 30+ min each.
+All `cost_ocp_on_prem` tests with no exclusions. Expect errors from
+cascading GPU/MIG fixture failures (COST-7179). With fail-fast enabled,
+stalled sources are detected in seconds instead of 30+ min each.
+
+```bash
+# Tier mode: -m "cost_ocp_on_prem"
+```
 
 ---
 
 ## Pytest Markers (IQE Plugin)
 
-The IQE plugin registers on-prem-specific markers for finer-grained test selection.
-These are additive — a test may carry multiple markers.
+The IQE plugin registers on-prem-specific markers at two levels:
+
+### Tier Markers (non-overlapping)
+
+Every on-prem test gets exactly **one tier marker** that classifies what kind of
+test it is. Profiles compose tiers by union.
+
+| Tier Marker | ~Tests | Description |
+|-------------|--------|-------------|
+| `cost_onprem_smoke` | ~43 | Smoke — source ingestion, cost model CRUD |
+| `cost_onprem_api` | ~1,850 | API coverage — reports, tagging, forecasting, resource types |
+| `cost_onprem_ui` | ~101 | UI tests — navigation, details, explorer, cost models |
+| `cost_onprem_infra` | ~250 | Infrastructure — bucketing, distribution, date validation, multi-source |
+| `cost_onprem_data` | ~50 | Data-intensive — daily flow, advanced daily, multi-month datasets |
+
+### State / Scope Markers
+
+These are orthogonal to tiers — a test can carry both a tier and a state marker.
 
 | Marker | Functions | Purpose | Status |
 |--------|-----------|---------|--------|
-| `cost_ocp_on_prem` | ~242 | All on-prem eligible tests | Active — base selector |
-| `cost_onprem_smoke` | 24 | Core smoke: source ingestion, cost models, basic API | Active |
+| `cost_ocp_on_prem` | ~398 | All on-prem eligible tests | Active — umbrella selector |
 | `cost_onprem_blocked` | 35+ | Blocked by external issues (GPU/MIG, backend bugs) | Active — see breakdown below |
-| `cost_onprem_data_intensive` | 5 | Large/multi-month datasets (daily flow, bucketing) | Active — also `cost_onprem_blocked` currently |
-| `cost_onprem_infra` | 7 | Infrastructure/config validation (bucketing, ingestion) | Active |
+
+### Deprecated Markers
+
+| Marker | Replacement | Status |
+|--------|-------------|--------|
+| `cost_onprem_data_intensive` | `cost_onprem_data` | Kept for backwards compatibility |
+
+### Selection Modes
+
+The chart repo supports two selection modes via the `USE_TIER_MARKERS` env var:
+
+| Mode | `USE_TIER_MARKERS` | How it works |
+|------|--------------------|--------------|
+| Legacy (default) | `false` | `-m cost_ocp_on_prem` + `-k` skip filter expressions |
+| Tier-based | `true` | `-m "(cost_onprem_smoke or cost_onprem_api) and not cost_onprem_blocked"` — no `-k` filters |
+
+```bash
+# Run with tier-based markers
+USE_TIER_MARKERS=true ./scripts/run-iqe-tests.sh --profile extended
+
+# Run with legacy filters (default)
+./scripts/run-iqe-tests.sh --profile extended
+```
 
 ### `cost_onprem_blocked` Breakdown
 
@@ -123,6 +172,21 @@ and ultimately not created:
   to GPU/MIG. Passing tests left unmarked; erroring tests marked `cost_onprem_blocked`.
 - **`cost_onprem_slow`** — Renamed to `cost_onprem_data_intensive` to reflect that these
   tests are slow because they use large datasets, not because of inefficiency.
+
+### Choosing a Tier for New Tests
+
+When adding a new on-prem test, assign exactly one tier marker:
+
+| If the test... | Use tier |
+|----------------|----------|
+| Validates basic source ingestion or cost model CRUD | `cost_onprem_smoke` |
+| Exercises report/query API endpoints | `cost_onprem_api` |
+| Runs in the browser (UI navigation, details, explorer) | `cost_onprem_ui` |
+| Requires specific deployment config, multi-source fixtures, or bucketing | `cost_onprem_infra` |
+| Uses large/multi-month datasets with notably longer ingestion | `cost_onprem_data` |
+
+When in doubt, default to `cost_onprem_api`. The `smoke` tier is intentionally
+small and curated.
 
 ---
 
