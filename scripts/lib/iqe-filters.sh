@@ -17,8 +17,9 @@
 #
 # Selection modes (USE_TIER_MARKERS env var):
 #   false (default) - Legacy: -m cost_ocp_on_prem + -k skip filters
-#   true            - Tier-based: -m "(cost_onprem_smoke or ...)" with no -k filters
-#                     Requires IQE plugin with tier markers applied
+#   true            - Tier-based: -m "(cost_onprem_smoke or ...)" for test selection
+#                     Still uses -k skip filters for parameterized exclusions
+#                     (smoke and full skip -k filters entirely)
 # =============================================================================
 
 # Prevent multiple sourcing
@@ -48,33 +49,48 @@ apply_profile() {
     fi
 }
 
-# Tier-based profile selection: uses pytest -m marker expressions.
+# Tier-based profile selection: uses pytest -m marker expressions for test selection.
 # Each test has exactly one tier; profiles compose tiers by union.
-# No -k filters needed — blocked tests are excluded via the cost_onprem_blocked marker.
+# Extended/stable still use -k skip filters for parameterized exclusions (date-range,
+# order-by, etc.) that can't be expressed with per-function markers.
 apply_profile_tiered() {
     local blocked="and not cost_onprem_blocked"
     case "${TEST_PROFILE}" in
         smoke)
             IQE_MARKER="cost_onprem_smoke ${blocked}"
+            SKIP_FILTER_BUILD=true
             ;;
         extended)
             # Everything except smoke — mutually exclusive with smoke
             IQE_MARKER="(cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            # Still apply -k skip filters for parameterized exclusions (date-range, order-by, etc.)
+            SKIP_INFRA_TESTS=true
+            SKIP_SLOW_TESTS=false
+            SKIP_DELTA_TESTS=false
+            SKIP_FLAKY_TESTS=false
             ;;
         stable)
-            # All tiers, blocked excluded
+            # All tiers, blocked excluded — still needs -k filters for parameterized exclusions
             IQE_MARKER="(cost_onprem_smoke or cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            SKIP_INFRA_TESTS=false
+            SKIP_SLOW_TESTS=false
+            SKIP_DELTA_TESTS=false
+            SKIP_FLAKY_TESTS=false
             ;;
         full)
             # Everything including blocked — umbrella marker, no filters
             IQE_MARKER="cost_ocp_on_prem"
+            SKIP_FILTER_BUILD=true
             ;;
         *)
             # Default: same as stable
             IQE_MARKER="(cost_onprem_smoke or cost_onprem_api or cost_onprem_ui or cost_onprem_infra or cost_onprem_data) ${blocked}"
+            SKIP_INFRA_TESTS=false
+            SKIP_SLOW_TESTS=false
+            SKIP_DELTA_TESTS=false
+            SKIP_FLAKY_TESTS=false
             ;;
     esac
-    SKIP_FILTER_BUILD=true
 }
 
 # Legacy profile selection: umbrella marker + -k skip filters.
