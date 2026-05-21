@@ -247,6 +247,7 @@ class TestIngestionThroughput:
         """Get a fresh JWT token for long-running tests."""
         return obtain_jwt_token(self._keycloak_config)
     
+    @pytest.mark.timeout(1800)  # 30 min: generation + upload + summary table wait
     @pytest.mark.parametrize("profile_name", ["baseline", "small"])
     def test_perf_ing_001_single_source_baseline(
         self,
@@ -269,14 +270,19 @@ class TestIngestionThroughput:
         """
         cluster_id = generate_cluster_id()
         source_name = f"perf-ing-001-{cluster_id[-8:]}"
-        
+
         # Get pod for internal API calls
         ingress_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=ingress")
         if not ingress_pod:
             pytest.skip("Ingress pod not found")
-        
+
         koku_api_url = f"http://{self.helm_release}-koku-api.{self.namespace}.svc.cluster.local:8000/api/cost-management/v1"
-        
+
+        # Pre-test cleanup: remove any leftover source/DB records with this name
+        # from a previous cancelled run to prevent HTTP 400 duplicate-source errors.
+        db_pod = database_config.pod_name if database_config else None
+        cleanup_database_records(self.namespace, db_pod, cluster_id)
+
         # Register source
         with perf_timer.measure("source_registration"):
             source = register_source(
@@ -347,6 +353,7 @@ class TestIngestionThroughput:
             pytest.param(90, 1200, id="90-days"),
         ],
     )
+    @pytest.mark.timeout(1800)  # 30 min ceiling — well above the 1200s max variant
     def test_perf_ing_002_single_source_burst(
         self,
         data_days: int,
@@ -590,6 +597,16 @@ class TestIngestionThroughput:
                 if schema:
                     processed_count += 1
         
+        # Wait for all Celery work from this test to fully drain before completing.
+        # This prevents downstream tests from starting while this test's tasks
+        # (cost model calculations, summaries, etc.) are still in flight.
+        from .conftest import wait_for_queue_drain
+        drain_result = wait_for_queue_drain(
+            self.namespace,
+            max_wait_seconds=600,
+            label=f"ING-003[{concurrent_sources}]",
+        )
+
         perf_result.metrics = {
             "concurrent_sources": concurrent_sources,
             "successful_uploads": len(upload_results),
@@ -598,12 +615,13 @@ class TestIngestionThroughput:
             "error_rate": len(errors) / concurrent_sources if concurrent_sources > 0 else 0,
             "total_upload_mb": sum(r.get("package_size_mb", 0) for r in upload_results),
             "errors": errors,
+            "queue_drain": drain_result,
         }
         perf_result.timings = perf_timer.get_timings()
         perf_result.passed = processed_count == concurrent_sources
-        
+
         perf_collector.add_result(perf_result)
-        
+
         assert len(errors) == 0, f"Upload errors: {errors}"
         assert processed_count == concurrent_sources, f"Only {processed_count}/{concurrent_sources} processed"
 
@@ -743,6 +761,10 @@ class TestIngestionThroughput:
         
         processing_time = time.time() - processing_start
         
+        # Capture final queue depths — key diagnostic for processing timeout failures
+        from .conftest import get_celery_queue_depths
+        final_queue_depths = get_celery_queue_depths(cluster_config.namespace)
+
         perf_result.metrics = {
             "target_size_mb": target_size_mb,
             "actual_size_mb": round(package_size_mb, 2),
@@ -758,6 +780,7 @@ class TestIngestionThroughput:
             "avg_cpu_cores": sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0,
             "max_cpu_cores": max(cpu_samples) if cpu_samples else 0,
             "processing_completed": schema is not None,
+            "final_queue_depths": final_queue_depths,
         }
         perf_result.timings = perf_timer.get_timings()
         perf_result.passed = schema is not None
