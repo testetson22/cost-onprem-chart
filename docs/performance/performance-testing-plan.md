@@ -485,7 +485,7 @@ pytest tests/suites/performance/test_ingestion.py::TestIngestionThroughput::test
 ## Next Steps
 
 1. [ ] Provision performance test cluster (ODF-enabled)
-2. [ ] Set up Prometheus/Grafana observability stack (FLPATH-4061)
+2. [x] Set up Prometheus/Grafana observability stack (FLPATH-4061) — See [OBSERVABILITY.md](./OBSERVABILITY.md)
 3. [ ] Execute Phase 1 (baseline establishment with v0.2.20)
 4. [ ] Run initial baseline for Small profile (FLPATH-4065)
 5. [ ] Create HTML visualization for JSON reports (deferred)

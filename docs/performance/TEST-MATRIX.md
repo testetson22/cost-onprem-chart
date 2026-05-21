@@ -11,7 +11,8 @@ This document provides a high-level view of all performance test permutations.
 | [**Scale**](#scale-tests-perf-scale) | 5 | sources, queries, date ranges | 9 |
 | [**ROS**](#roskruize-tests-perf-ros) | 4 | Kruize/recommendation performance | 4 |
 | [**Soak**](#soakstability-tests-perf-soak) | 4 | Long-running stability (memory, disk, queues) | 4 |
-| **Total** | **25** | | **47** |
+| [**Listener CPU Sizing**](#listener-cpu-sizing-scenarios) | cross-cutting | listener CPU × load profile | 20 |
+| **Total** | **25+** | | **67+** |
 
 ---
 
@@ -42,7 +43,7 @@ Tests data upload and processing capacity.
 | **ING-003** | Concurrent uploads | `concurrent_sources` | `2`, `5`, `10` |
 | **ING-004** | Large file upload (50MB+) | `target_size_mb` | `50`, `100` |
 | **ING-005** | High frequency uploads | - | (configurable via env) |
-| **ING-006** | Processing window validation | `profile_name` | `small`, `medium`, `large` |
+| **ING-006** | Processing window validation | `profile_name` | cumulative per `PERF_PROFILE`: baseline adds `baseline`, small adds `small`, etc. |
 
 ### Ingestion Test Matrix
 
@@ -62,6 +63,7 @@ Tests data upload and processing capacity.
 | `PERF_ING_005_DURATION_MINUTES` | 15 | High-frequency test duration |
 | `PERF_ING_005_INTERVAL_SECONDS` | 300 | Upload interval |
 | `PERF_INGESTION_BURST_DAYS` | 30 | Default burst duration |
+| `PERF_ING_006_UPLOADS` | 2 (baseline profile) / 4 (small+) | Daily uploads to simulate |
 
 ---
 
@@ -195,15 +197,21 @@ pytest suites/performance/test_api_latency.py::TestAPIHealthCheck -v
 pytest -k "ing_001 and baseline" -v
 ```
 
-### Standard Suite (~30 min)
+### Baseline profile (~30-50 min)
 ```bash
-# All API + Scale tests
-pytest suites/performance/test_api_latency.py suites/performance/test_scale.py -v
+# Full suite including ING-006[window_validation] (2 uploads, trimmed dataset)
+PERF_PROFILE=baseline pytest -m performance -v
 ```
 
-### Full Performance (~2-4 hours)
+### Small profile (~2-3 hours)
 ```bash
-PERF_PROFILE=small pytest -m performance --timeout=7200 -v
+# Includes ING-006[small] (~2 hrs alone) + full suite
+PERF_PROFILE=small pytest -m performance --timeout=14400 -v
+```
+
+### Full Performance (~4-8 hours)
+```bash
+PERF_PROFILE=medium pytest -m performance --timeout=28800 -v
 ```
 
 ### Profile-Specific
@@ -256,6 +264,101 @@ For tests requiring pre-existing data, use `setup-test-data.sh`:
 # Setup for performance tests
 ./scripts/setup-test-data.sh --scenario perf-small
 ```
+
+---
+
+## Listener CPU Sizing Scenarios
+
+The listener is the ingestion bottleneck — it receives Kafka messages, downloads
+payloads from S3, and hands them off to Celery workers. Its CPU limit directly
+determines upload throughput and backpressure behaviour under concurrent load.
+
+### Why This Matters
+
+The on-prem default is **150m request / 300m limit** (aligned with SaaS Clowder).
+In production environments with burst ingestion or large file uploads, this may be
+undersized. These scenarios answer: *"what CPU do I need to meet my SLA?"*
+
+### Listener CPU Configurations
+
+| Label | CPU Request | CPU Limit | Notes |
+|-------|------------|-----------|-------|
+| `constrained` | 150m | 300m | Chart default (SaaS-aligned) |
+| `moderate` | 250m | 500m | Modest uplift |
+| `recommended` | 500m | 1000m | Suggested for production |
+| `uncapped` | 500m | node max | Benchmark ceiling (`--listener-cpu max`) |
+
+### Listener CPU × Load Profile Matrix
+
+Primary focus: ingestion tests (ING-001, ING-003, ING-004, ING-006) since those
+are directly CPU-bound on the listener. API and ROS tests are largely unaffected.
+
+| CPU Config | baseline (~30-50 min) | small (~2-3 hr) | medium (~4-6 hr) | large | Primary Metric |
+|------------|-----------------------|-----------------|-----------------|-------|----------------|
+| `constrained` (300m) | ING-001..006[wv] ✓ | ING-001,003,005,006[wv+small] ✓ | ING-006[+medium] ✓ | ING-004 ✓ | Throughput ceiling |
+| `moderate` (500m) | - | ING-001,003,005,006 ✓ | ING-006 ✓ | ING-004 ✓ | Improvement delta |
+| `recommended` (1000m) | - | ING-001,003,005,006 ✓ | ING-006 ✓ | ING-004 ✓ | Target SLA check |
+| `uncapped` (max) | - | ING-001,003,005,006 ✓ | ING-006 ✓ | ING-004 ✓ | Theoretical max |
+
+### Key Questions Per Scenario
+
+| Scenario | Question |
+|----------|----------|
+| `constrained` × `small` | Does the default config meet the 6-hour processing window? |
+| `constrained` × `large` | At what file size does 300m CPU become a bottleneck? |
+| `moderate/recommended` × `small` | What is the throughput improvement per 250m of CPU? |
+| `uncapped` × `medium` | What is the maximum achievable throughput without CPU constraints? |
+| `constrained` × `concurrent=10` | Does CPU throttling cause backpressure / message lag under concurrency? |
+| `recommended` × `concurrent=10` | Does 1000m CPU fully resolve concurrency backpressure? |
+
+### Execution
+
+Use `--listener-cpu` combined with `--perf-profile` and `-k` to run specific
+cells of the matrix:
+
+```bash
+# Row: constrained × small (establish baseline)
+./scripts/deploy-test-cost-onprem.sh \
+  --skip-deploy --perf-only --perf-profile small \
+  --collect-metrics
+
+# Row: recommended × small (compare against baseline)
+./scripts/deploy-test-cost-onprem.sh \
+  --skip-deploy --perf-only --perf-profile small \
+  --listener-cpu 1000m \
+  --collect-metrics
+
+# Row: uncapped × medium (find ceiling)
+./scripts/deploy-test-cost-onprem.sh \
+  --skip-deploy --perf-only --perf-profile medium \
+  --listener-cpu max \
+  --collect-metrics
+
+# Focused: concurrency test only, two CPU configs
+PERF_PROFILE=small LISTENER_CPU_LIMIT=300m \
+  pytest tests/suites/performance/test_ingestion.py -k "ing_003" -v
+
+PERF_PROFILE=small LISTENER_CPU_LIMIT=1000m \
+  pytest tests/suites/performance/test_ingestion.py -k "ing_003" -v
+```
+
+### Metrics to Capture Per Run
+
+| Metric | Source | Target |
+|--------|--------|--------|
+| Upload throughput (MB/s) | Test output | > 10 MB/s at `recommended` |
+| Processing time (s) per MB | Test output | < 30s/MB at `recommended` |
+| Listener CPU utilization % | Prometheus `container_cpu_usage_seconds_total` | < 80% sustained |
+| Kafka consumer lag | `kafka_consumergroup_lag` | < 100 messages |
+| 6-hour window compliance | ING-006 pass/fail | All profiles pass at `recommended` |
+
+### Suggested Priority Order
+
+1. `constrained` × `small` — establish the current baseline (run this first)
+2. `recommended` × `small` — validate the proposed production default
+3. `constrained` × `medium` — find where default config breaks
+4. `uncapped` × `medium` — find the ceiling
+5. `recommended` × `large` (ING-004 only) — large file upload with recommended CPU
 
 ---
 

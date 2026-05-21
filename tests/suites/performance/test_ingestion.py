@@ -64,6 +64,23 @@ from .profiles import PROFILES, get_profile_metrics, get_profile_nise_yaml
 
 UPLOAD_CONTENT_TYPE = "application/vnd.redhat.hccm.filename+tgz"
 
+# ING-006 profiles to run, filtered by PERF_PROFILE.
+# Running all three variants (small/medium/large) during a baseline run adds
+# 4-10 hours of wall clock time. Restrict to only the profiles appropriate for
+# the current run level.
+_ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
+# ING-006 parametrize values per run level.
+# baseline: skipped — even small takes 2+ hours; baseline must stay <30 min.
+# small+:   run the variants appropriate for the run level.
+# The empty-list case is handled by a skip sentinel so pytest doesn't error.
+# ING-006 uses a dedicated "window_validation" profile by default for speed.
+# window_validation (~20-30 min/run) vs small (~2 hr/run).
+# Full small/medium/large variants are only added for medium+ run levels.
+# ING-006 runs the variant matching the active profile.
+# large+ all use "large" since there's no heavier ING-006 variant beyond that.
+_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("baseline", "small", "medium", "large") else "large"
+ING_006_PROFILES = [_ING_006_PROFILE]
+
 
 # =============================================================================
 # Helper Functions
@@ -865,7 +882,7 @@ class TestIngestionThroughput:
         assert error_rate < 0.1, f"Error rate {error_rate:.1%} exceeds 10% threshold"
 
     @pytest.mark.timeout(21600)  # 6 hours max
-    @pytest.mark.parametrize("profile_name", ["small", "medium", "large"])
+    @pytest.mark.parametrize("profile_name", ING_006_PROFILES)
     def test_perf_ing_006_processing_window_validation(
         self,
         cluster_config: ClusterConfig,
@@ -937,8 +954,11 @@ class TestIngestionThroughput:
         print(f"  Clusters: {clusters}")
         print(f"  Registered sources: {len(sources)}")
         
-        # Simulate 4 uploads per day (6-hour intervals)
-        uploads_per_day = 4
+        # Simulate daily uploads (6-hour intervals).
+        # Default: 2 for baseline profile (fast sanity check), 4 for all others
+        # (matches real-world upload cadence). Override via PERF_ING_006_UPLOADS.
+        default_uploads = 2 if profile_name == "baseline" else 4
+        uploads_per_day = int(os.environ.get("PERF_ING_006_UPLOADS", str(default_uploads)))
         upload_results = []
         total_start_time = time.time()
         

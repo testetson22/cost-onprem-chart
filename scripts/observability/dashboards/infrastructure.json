@@ -1,0 +1,239 @@
+{
+  "annotations": {
+    "list": [
+      { "builtIn": 1, "datasource": { "type": "grafana", "uid": "-- Grafana --" }, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" }
+    ]
+  },
+  "description": "Cost On-Prem Infrastructure Metrics - Node CPU, memory, disk I/O, network, Valkey",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    { "asDropdown": true, "icon": "external link", "includeVars": true, "keepTime": true, "tags": ["cost-onprem"], "targetBlank": false, "title": "Cost On-Prem Dashboards", "type": "dashboards" }
+  ],
+  "panels": [
+    {
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "code": { "language": "plaintext", "showLineNumbers": false }, "content": "# Infrastructure Metrics\nNode resources, Valkey cache, and cluster-level performance.", "mode": "markdown" },
+      "title": "",
+      "transparent": true,
+      "type": "text"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 85 }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 2 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "CPU", "refId": "A" }],
+      "title": "Cluster CPU",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 85 }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 2 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "(1 - (avg(node_memory_MemAvailable_bytes) / avg(node_memory_MemTotal_bytes))) * 100", "legendFormat": "Memory", "refId": "A" }],
+      "title": "Cluster Memory",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 85 }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 2 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "(1 - (avg(node_filesystem_avail_bytes{mountpoint=\"/\"}) / avg(node_filesystem_size_bytes{mountpoint=\"/\"}))) * 100", "legendFormat": "Disk", "refId": "A" }],
+      "title": "Disk Usage",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "decbytes" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 2 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "redis_memory_used_bytes{namespace=\"${namespace}\"}", "legendFormat": "Memory", "refId": "A" }],
+      "title": "Valkey Memory",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 2 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "redis_connected_clients{namespace=\"${namespace}\"}", "legendFormat": "Clients", "refId": "A" }],
+      "title": "Valkey Clients",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 100 }] }, "unit": "short" }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 2 },
+      "id": 7,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "expr": "sum(increase(redis_evicted_keys_total{namespace=\"${namespace}\"}[1h]))", "legendFormat": "Evictions", "refId": "A" }],
+      "title": "Valkey Evictions (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 8,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "title": "Node CPU Usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 9,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "title": "Node Memory Usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "Bps" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 10,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(node_disk_read_bytes_total[5m])) by (instance)", "legendFormat": "{{instance}} Read", "refId": "A" },
+        { "expr": "sum(rate(node_disk_written_bytes_total[5m])) by (instance)", "legendFormat": "{{instance}} Write", "refId": "B" }
+      ],
+      "title": "Disk I/O",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "Bps" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 11,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(node_network_receive_bytes_total{device!~\"lo|veth.*|docker.*|br.*\"}[5m])) by (instance)", "legendFormat": "{{instance}} RX", "refId": "A" },
+        { "expr": "sum(rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|docker.*|br.*\"}[5m])) by (instance)", "legendFormat": "{{instance}} TX", "refId": "B" }
+      ],
+      "title": "Network I/O",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 20,
+      "panels": [],
+      "title": "Valkey Cache",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "bytes" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "id": 12,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "redis_memory_used_bytes{namespace=\"${namespace}\"}", "legendFormat": "Used", "refId": "A" },
+        { "expr": "redis_memory_max_bytes{namespace=\"${namespace}\"}", "legendFormat": "Max", "refId": "B" }
+      ],
+      "title": "Valkey Memory",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "ops" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "id": 13,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(redis_commands_processed_total{namespace=\"${namespace}\"}[5m]))", "legendFormat": "Commands/s", "refId": "A" },
+        { "expr": "sum(rate(redis_keyspace_hits_total{namespace=\"${namespace}\"}[5m]))", "legendFormat": "Hits/s", "refId": "B" },
+        { "expr": "sum(rate(redis_keyspace_misses_total{namespace=\"${namespace}\"}[5m]))", "legendFormat": "Misses/s", "refId": "C" }
+      ],
+      "title": "Valkey Operations",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "percent" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "id": 14,
+      "options": { "legend": { "calcs": ["mean", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "redis_keyspace_hits_total{namespace=\"${namespace}\"} / (redis_keyspace_hits_total{namespace=\"${namespace}\"} + redis_keyspace_misses_total{namespace=\"${namespace}\"} + 0.0001) * 100", "legendFormat": "Hit Rate", "refId": "A" }
+      ],
+      "title": "Valkey Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "id": 15,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "redis_connected_clients{namespace=\"${namespace}\"}", "legendFormat": "Connected Clients", "refId": "A" },
+        { "expr": "redis_blocked_clients{namespace=\"${namespace}\"}", "legendFormat": "Blocked Clients", "refId": "B" }
+      ],
+      "title": "Valkey Clients",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["cost-onprem", "performance", "infrastructure", "valkey"],
+  "templating": {
+    "list": [
+      { "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" }, "hide": 0, "includeAll": false, "label": "Data Source", "multi": false, "name": "datasource", "options": [], "query": "prometheus", "refresh": 1, "regex": "", "skipUrlSync": false, "type": "datasource" },
+      { "current": { "selected": false, "text": "cost-onprem", "value": "cost-onprem" }, "datasource": { "type": "prometheus", "uid": "${datasource}" }, "definition": "label_values(kube_namespace_labels, namespace)", "hide": 0, "includeAll": false, "label": "Namespace", "multi": false, "name": "namespace", "options": [], "query": { "qryType": 1, "query": "label_values(kube_namespace_labels, namespace)", "refId": "PrometheusVariableQueryEditor-VariableQuery" }, "refresh": 1, "regex": "cost.*", "skipUrlSync": false, "sort": 1, "type": "query" }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Cost On-Prem Infrastructure",
+  "uid": "cost-onprem-infrastructure",
+  "version": 1,
+  "weekStart": ""
+}

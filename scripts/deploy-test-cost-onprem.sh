@@ -43,6 +43,12 @@ set -euo pipefail
 #   --perf-profile PROFILE    Performance profile: baseline, small, medium, large (default: baseline)
 #   --perf-only               Run only performance tests (skip deployment and chart tests)
 #
+#   Observability options (FLPATH-4061):
+#   --deploy-observability    Deploy postgres_exporter and valkey-exporter for metrics
+#   --collect-metrics         Collect Prometheus metrics during performance tests
+#   --upload-metrics          Upload metrics to S3 after tests (requires S3_BUCKET to be set)
+#   --metrics-interval SECS   Metrics collection interval in seconds (default: 30)
+#
 #   Other:
 #   --save-versions [FILE]    Save deployment version info to JSON file (default: version_info.json)
 #   --verbose                 Enable verbose output
@@ -119,6 +125,17 @@ IQE_PROFILE="${IQE_PROFILE:-stable}"
 RUN_PERF="${RUN_PERF:-false}"
 PERF_PROFILE="${PERF_PROFILE:-baseline}"
 PERF_ONLY="${PERF_ONLY:-false}"
+DEPLOY_OBSERVABILITY="${DEPLOY_OBSERVABILITY:-false}"
+COLLECT_METRICS="${COLLECT_METRICS:-false}"
+UPLOAD_METRICS="${UPLOAD_METRICS:-false}"
+METRICS_INTERVAL="${METRICS_INTERVAL:-30}"
+METRICS_COLLECTOR_PID=""
+
+# Performance output directory - unified structure for metrics + test results + reports
+# Format: {PERF_OUTPUT_DIR}/{TEST_RUN_ID}/ with subdirs: metrics/, results/, reports/
+PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-./perf-runs}"
+# TEST_RUN_ID is auto-generated: {chart_version}-{perf_profile}-{epoch}
+TEST_RUN_ID="${TEST_RUN_ID:-}"
 SAVE_VERSIONS="${SAVE_VERSIONS:-false}"
 VERSION_INFO_FILE="${VERSION_INFO_FILE:-version_info.json}"
 LISTENER_CPU_LIMIT="${LISTENER_CPU_LIMIT:-}"
@@ -170,6 +187,15 @@ NC='\033[0m' # No Color
 
 cleanup_on_exit() {
     local exit_code=$?
+    
+    # Stop metrics collection if running
+    if [[ -n "${METRICS_COLLECTOR_PID}" ]]; then
+        echo ""
+        echo -e "${YELLOW}[CLEANUP] Stopping metrics collection...${NC}"
+        kill -TERM "${METRICS_COLLECTOR_PID}" 2>/dev/null || true
+    fi
+    
+    # Reset CPU boost if applied
     if [[ "${CPU_BOOST_APPLIED}" == "true" ]] && [[ -n "${ORIGINAL_LISTENER_CPU_LIMIT}" ]]; then
         echo ""
         echo -e "${YELLOW}[CLEANUP] Resetting listener CPU to original values...${NC}"
@@ -966,6 +992,252 @@ reset_listener_cpu() {
 }
 
 ################################################################################
+# Observability Stack (FLPATH-4061)
+################################################################################
+
+deploy_observability() {
+    if [[ "${DEPLOY_OBSERVABILITY}" != "true" ]]; then
+        log_verbose "Skipping observability deployment (--deploy-observability not specified)"
+        return 0
+    fi
+
+    log_step "Deploying observability stack (FLPATH-4061)"
+
+    local observability_script="${LOCAL_SCRIPTS_DIR}/deploy-observability.sh"
+    if [[ ! -x "${observability_script}" ]]; then
+        log_error "Observability deployment script not found at: ${observability_script}"
+        return 1
+    fi
+
+    # Export environment variables for deploy-observability.sh
+    export NAMESPACE="${NAMESPACE}"
+    export HELM_RELEASE_NAME="${HELM_RELEASE_NAME:-cost-onprem}"
+    export SKIP_GRAFANA="true"  # We don't need Grafana for metrics collection
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY RUN: Would execute: ${observability_script}"
+        return 0
+    fi
+
+    if ! "${observability_script}"; then
+        log_warning "Observability deployment had issues, continuing..."
+    else
+        log_success "Observability stack deployed"
+    fi
+}
+
+start_metrics_collection() {
+    if [[ "${COLLECT_METRICS}" != "true" ]]; then
+        return 0
+    fi
+
+    log_step "Starting metrics collection"
+
+    local collect_script="${LOCAL_SCRIPTS_DIR}/observability/collect-metrics.sh"
+    if [[ ! -x "${collect_script}" ]]; then
+        log_error "Metrics collection script not found at: ${collect_script}"
+        return 1
+    fi
+
+    # Generate TEST_RUN_ID if not already set
+    if [[ -z "${TEST_RUN_ID}" ]]; then
+        local chart_version="unknown"
+        local epoch_time
+        epoch_time=$(date +%s)
+        
+        # Try to get chart version from Helm release
+        if command -v helm &>/dev/null; then
+            local helm_chart
+            helm_chart=$(helm list -n "${NAMESPACE}" -o json 2>/dev/null | jq -r ".[0].chart // empty" 2>/dev/null)
+            if [[ -n "$helm_chart" ]]; then
+                chart_version=$(echo "$helm_chart" | sed 's/.*-\([0-9][0-9.]*\)/\1/' | tr '.' '-')
+            fi
+        fi
+        
+        TEST_RUN_ID="${chart_version}-${PERF_PROFILE}-${epoch_time}"
+    fi
+
+    # Create unified output directory structure
+    mkdir -p "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/metrics"
+    mkdir -p "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/results"
+    mkdir -p "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/reports"
+
+    # Export variables for collect-metrics.sh and pytest
+    export NAMESPACE="${NAMESPACE}"
+    export PERF_PROFILE="${PERF_PROFILE}"
+    export HELM_RELEASE_NAME="${HELM_RELEASE_NAME:-cost-onprem}"
+    export TEST_RUN_ID="${TEST_RUN_ID}"
+    export PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR}"
+    # collect-metrics.sh uses OUTPUT_DIR for its output
+    export OUTPUT_DIR="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/metrics"
+    # Tell collect-metrics.sh not to add another TEST_RUN_ID subdirectory
+    export METRICS_FLAT_OUTPUT=true
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY RUN: Would start metrics collection"
+        log_info "  TEST_RUN_ID: ${TEST_RUN_ID}"
+        log_info "  Output: ${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/"
+        return 0
+    fi
+
+    log_info "Starting metrics collection (interval: ${METRICS_INTERVAL}s)"
+    log_info "  TEST_RUN_ID: ${TEST_RUN_ID}"
+    log_info "  Output: ${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/"
+    log_info "    metrics/  - Prometheus snapshots"
+    log_info "    results/  - Test results JSON"
+    log_info "    reports/  - JUnit XML, HTML report"
+
+    # Start metrics collection in background
+    "${collect_script}" --continuous "${METRICS_INTERVAL}" &
+    METRICS_COLLECTOR_PID=$!
+
+    log_success "Metrics collection started (PID: ${METRICS_COLLECTOR_PID})"
+}
+
+stop_metrics_collection() {
+    if [[ -z "${METRICS_COLLECTOR_PID}" ]]; then
+        return 0
+    fi
+
+    log_step "Stopping metrics collection"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY RUN: Would stop metrics collection"
+        return 0
+    fi
+
+    # Send SIGTERM to gracefully stop collection
+    if kill -0 "${METRICS_COLLECTOR_PID}" 2>/dev/null; then
+        kill -TERM "${METRICS_COLLECTOR_PID}" 2>/dev/null || true
+        wait "${METRICS_COLLECTOR_PID}" 2>/dev/null || true
+        log_success "Metrics collection stopped"
+    fi
+
+    METRICS_COLLECTOR_PID=""
+}
+
+upload_perf_results_to_s3() {
+    if [[ "${UPLOAD_METRICS}" != "true" ]]; then
+        return 0
+    fi
+
+    log_step "Uploading performance results to S3"
+
+    if [[ -z "${S3_BUCKET:-}" ]]; then
+        log_warning "S3_BUCKET not set, skipping upload"
+        return 0
+    fi
+
+    if [[ -z "${TEST_RUN_ID:-}" ]]; then
+        log_warning "TEST_RUN_ID not set, skipping upload"
+        return 0
+    fi
+
+    local test_run_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}"
+    if [[ ! -d "${test_run_dir}" ]]; then
+        log_warning "Test run directory not found: ${test_run_dir}"
+        return 0
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY RUN: Would upload ${test_run_dir} to s3://${S3_BUCKET}/${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}/"
+        return 0
+    fi
+
+    # Generate metadata.json with test run context
+    generate_metadata_json
+
+    # Upload entire directory recursively
+    local s3_prefix="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}"
+    local endpoint_arg=""
+    if [[ -n "${S3_ENDPOINT:-}" ]]; then
+        endpoint_arg="--endpoint-url ${S3_ENDPOINT}"
+    fi
+
+    log_info "Uploading to s3://${S3_BUCKET}/${s3_prefix}/"
+
+    if command -v aws &>/dev/null; then
+        aws s3 sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" ${endpoint_arg} --no-progress
+    elif command -v mc &>/dev/null; then
+        if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+            mc alias set s3upload "${S3_ENDPOINT:-https://s3.amazonaws.com}" \
+                "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" --api S3v4 &>/dev/null
+            mc mirror "${test_run_dir}" "s3upload/${S3_BUCKET}/${s3_prefix}/"
+        else
+            mc mirror "${test_run_dir}" "s3/${S3_BUCKET}/${s3_prefix}/"
+        fi
+    elif command -v s3cmd &>/dev/null; then
+        local s3cmd_args=()
+        [[ -n "${S3_ENDPOINT:-}" ]] && s3cmd_args+=("--host=${S3_ENDPOINT}" "--host-bucket=${S3_ENDPOINT}/${S3_BUCKET}")
+        [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && s3cmd_args+=("--access_key=${AWS_ACCESS_KEY_ID}")
+        [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && s3cmd_args+=("--secret_key=${AWS_SECRET_ACCESS_KEY}")
+        s3cmd sync "${test_run_dir}/" "s3://${S3_BUCKET}/${s3_prefix}/" "${s3cmd_args[@]}"
+    else
+        log_error "No S3 client found (aws, mc, or s3cmd). Install one of them."
+        return 1
+    fi
+
+    log_success "Uploaded to s3://${S3_BUCKET}/${s3_prefix}/"
+}
+
+generate_metadata_json() {
+    local metadata_file="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/metadata.json"
+    
+    log_info "Generating metadata.json..."
+    
+    # Get cluster info
+    local ocp_version="unknown"
+    local node_count=0
+    local storage_type="unknown"
+    
+    if command -v oc &>/dev/null; then
+        ocp_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "unknown")
+        node_count=$(oc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+        
+        # Detect storage type
+        if oc get storagecluster -n openshift-storage &>/dev/null; then
+            storage_type="ODF"
+        elif oc get storageclass s4-storage &>/dev/null; then
+            storage_type="S4"
+        fi
+    fi
+    
+    # Get chart version
+    local chart_version="unknown"
+    if command -v helm &>/dev/null; then
+        chart_version=$(helm list -n "${NAMESPACE}" -o json 2>/dev/null | jq -r ".[0].app_version // .[0].chart // \"unknown\"" 2>/dev/null || echo "unknown")
+    fi
+    
+    # Count files in each subdirectory
+    local metrics_count=$(find "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/metrics" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    local results_count=$(find "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/results" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    local reports_count=$(find "${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/reports" -type f 2>/dev/null | wc -l | tr -d ' ')
+    
+    cat > "${metadata_file}" <<EOF
+{
+  "test_run_id": "${TEST_RUN_ID}",
+  "chart_version": "${chart_version}",
+  "perf_profile": "${PERF_PROFILE}",
+  "namespace": "${NAMESPACE}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "cluster_info": {
+    "ocp_version": "${ocp_version}",
+    "node_count": ${node_count},
+    "storage_type": "${storage_type}",
+    "platform": "${CLUSTER_PLATFORM:-unknown}"
+  },
+  "file_counts": {
+    "metrics": ${metrics_count},
+    "results": ${results_count},
+    "reports": ${reports_count}
+  }
+}
+EOF
+    
+    log_success "Generated: ${metadata_file}"
+}
+
+################################################################################
 # Performance Test Execution (FLPATH-4036)
 ################################################################################
 
@@ -983,6 +1255,9 @@ run_performance_tests() {
     # Export performance profile for tests
     export PERF_PROFILE="${PERF_PROFILE}"
 
+    # Start metrics collection if requested (also sets up unified output dir)
+    start_metrics_collection
+
     # Build pytest arguments for performance tests
     local perf_args=("--performance")
     if [[ "${VERBOSE}" == "true" ]]; then
@@ -991,23 +1266,36 @@ run_performance_tests() {
     # Show stdout for visibility into long-running tests
     perf_args+=("-s")
 
+    # Determine output location based on whether we have unified output setup
+    local output_info="tests/reports/performance/"
+    if [[ -n "${TEST_RUN_ID:-}" ]]; then
+        output_info="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/"
+    fi
+
     if [[ "${DRY_RUN}" == "true" ]]; then
         log_info "DRY RUN: Would execute: ${pytest_script} ${perf_args[*]}"
+        stop_metrics_collection
         return 0
     fi
 
     log_info "Performance test command: ${pytest_script} ${perf_args[*]}"
-    log_info "Performance reports will be saved to: tests/reports/performance/"
+    log_info "Output directory: ${output_info}"
 
+    local test_result=0
     if ! "${pytest_script}" "${perf_args[@]}"; then
         log_error "Performance tests failed"
-        log_info "Check tests/reports/performance/ for detailed results"
-        return 1
+        log_info "Check ${output_info} for detailed results"
+        test_result=1
+    else
+        log_success "Performance tests completed"
+        log_info "Results: ${output_info}"
     fi
 
-    log_success "Performance tests completed"
-    log_info "Performance reports: tests/reports/performance/"
-    return 0
+    # Stop metrics collection and upload if requested
+    stop_metrics_collection
+    upload_perf_results_to_s3
+
+    return ${test_result}
 }
 
 ################################################################################
@@ -1119,8 +1407,16 @@ print_summary() {
     [[ "${SKIP_HELM}" == "false" ]] && echo "  ✓ Deploy Cost On-Prem Helm Chart" || echo "  ✗ Deploy Cost On-Prem Helm Chart (SKIPPED)"
     [[ "${SKIP_TLS}" == "false" ]] && echo "  ✓ Setup TLS Certificates" || echo "  ✗ Setup TLS Certificates (SKIPPED)"
     [[ "${SKIP_TEST}" == "false" ]] && echo "  ✓ Run Chart Tests" || echo "  ✗ Run Chart Tests (SKIPPED)"
-    if [[ "${PERF_ONLY}" == "true" ]]; then
-        echo "  ✓ Run Performance Tests (profile: ${PERF_PROFILE})"
+    if [[ "${DEPLOY_OBSERVABILITY}" == "true" ]]; then
+        echo "  ✓ Deploy Observability (postgres_exporter, valkey-exporter)"
+    else
+        echo "  ✗ Deploy Observability (OPTIONAL)"
+    fi
+    if [[ "${PERF_ONLY}" == "true" ]] || [[ "${RUN_PERF}" == "true" ]]; then
+        local perf_opts="profile: ${PERF_PROFILE}"
+        [[ "${COLLECT_METRICS}" == "true" ]] && perf_opts="${perf_opts}, collect-metrics: ${METRICS_INTERVAL}s"
+        [[ "${UPLOAD_METRICS}" == "true" ]] && perf_opts="${perf_opts}, upload-to-s3"
+        echo "  ✓ Run Performance Tests (${perf_opts})"
     else
         echo "  ✗ Run Performance Tests (OPTIONAL)"
     fi
@@ -1229,6 +1525,22 @@ main() {
                 RUN_PERF=true
                 shift
                 ;;
+            --deploy-observability)
+                DEPLOY_OBSERVABILITY=true
+                shift
+                ;;
+            --collect-metrics)
+                COLLECT_METRICS=true
+                shift
+                ;;
+            --upload-metrics)
+                UPLOAD_METRICS=true
+                shift
+                ;;
+            --metrics-interval)
+                METRICS_INTERVAL="$2"
+                shift 2
+                ;;
             --run-iqe)
                 RUN_IQE=true
                 shift
@@ -1309,6 +1621,9 @@ main() {
 
     deploy_helm_chart
     setup_tls
+    
+    # Deploy observability after Helm chart so services exist for auto-detection
+    deploy_observability
     
     # Run tests and capture result (don't exit on failure)
     local test_result=0

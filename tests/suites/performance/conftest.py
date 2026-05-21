@@ -661,8 +661,22 @@ def perf_result(
 
 @pytest.fixture(scope="session")
 def perf_reports_dir() -> Path:
-    """Get the directory for performance reports."""
-    reports_dir = Path(__file__).parent.parent.parent / "reports" / "performance"
+    """Get the directory for performance reports.
+    
+    When called from deploy-test-cost-onprem.sh with unified output structure,
+    uses PERF_OUTPUT_DIR/TEST_RUN_ID/results/ for S3 upload compatibility.
+    Otherwise falls back to tests/reports/performance/ for standalone runs.
+    """
+    perf_output_dir = os.environ.get("PERF_OUTPUT_DIR")
+    test_run_id = os.environ.get("TEST_RUN_ID")
+    
+    if perf_output_dir and test_run_id:
+        # Unified output mode - write to results/ subdirectory
+        reports_dir = Path(perf_output_dir) / test_run_id / "results"
+    else:
+        # Standalone mode - use default location
+        reports_dir = Path(__file__).parent.parent.parent / "reports" / "performance"
+    
     reports_dir.mkdir(parents=True, exist_ok=True)
     return reports_dir
 
