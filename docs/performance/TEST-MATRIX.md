@@ -77,8 +77,8 @@ Tests API response times under various conditions.
 | **API-002** | Report under load | `concurrent_users` | `5`, `10`, `20` |
 | **API-003** | Cost model CRUD | `iterations` | `10` (via `PERF_API_003_ITERATIONS`) |
 | **API-004** | Source pagination | `page_size` | `10`, `50`, `100` |
-| **API-005** | Complex group-by | `group_by_dims` | `[project]`, `[project,node]`, `[project,node,namespace]` |
-| **API-006** | Tag filtering | `tag_count` | `1`, `5`, `10` |
+| **API-005** | Complex group-by | `group_by_dims` | `[project]`, `[project,node]`, `[project,cluster]` (API max: 2 dims) |
+| **API-006** | Tag filtering | `tag_count` | `1`, `5`, `10` (uses real tags from tags API; skips if insufficient tags) |
 
 ### API Test Matrix
 
@@ -91,9 +91,9 @@ Tests API response times under various conditions.
 |------|---|-----|-----|-------|
 | API-002 users | ✓ | ✓ | ✓ | Concurrent load |
 
-| Test | 1 dim | 2 dims | 3 dims | Notes |
-|------|-------|--------|--------|-------|
-| API-005 group-by | ✓ | ✓ | ✓ | Query complexity |
+| Test | 1 dim | 2 dims (node) | 2 dims (cluster) | Notes |
+|------|-------|---------------|-------------------|-------|
+| API-005 group-by | ✓ | ✓ | ✓ | API enforces max 2 group_by dims |
 
 | Test | 1 tag | 5 tags | 10 tags | Notes |
 |------|-------|--------|---------|-------|

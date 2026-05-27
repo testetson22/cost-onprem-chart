@@ -72,7 +72,9 @@ VALKEY_PORT=${VALKEY_PORT:-6379}
 
 # Script directory for dashboard files
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DASHBOARDS_DIR="${SCRIPT_DIR}/observability/dashboards"
+# Dashboard directories - collected-metrics has active dashboards, prometheus has legacy
+DASHBOARDS_DIR="${SCRIPT_DIR}/observability/dashboards/collected-metrics"
+DASHBOARDS_PROMETHEUS_DIR="${SCRIPT_DIR}/observability/dashboards/prometheus"
 
 # Logging functions
 log_debug() {
@@ -745,8 +747,31 @@ EOF
 create_grafana_datasources() {
     log_info "Creating Grafana datasources..."
     
-    # Get Thanos Querier URL for user workload monitoring
     local thanos_url="https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+
+    # Create a service account for Grafana and bind cluster-monitoring-view
+    log_info "Ensuring grafana-sa service account with cluster-monitoring-view..."
+    oc create serviceaccount grafana-sa -n "${GRAFANA_NAMESPACE}" 2>/dev/null || true
+    oc adm policy add-cluster-role-to-user cluster-monitoring-view \
+        -z grafana-sa -n "${GRAFANA_NAMESPACE}" 2>/dev/null || true
+
+    # Get a bearer token for the service account
+    local prom_token=""
+    prom_token=$(oc create token grafana-sa -n "${GRAFANA_NAMESPACE}" --duration=8760h 2>/dev/null || true)
+    if [[ -z "${prom_token}" ]]; then
+        # Fallback for older OCP: read from the SA secret
+        local secret_name
+        secret_name=$(oc get sa grafana-sa -n "${GRAFANA_NAMESPACE}" -o jsonpath='{.secrets[0].name}' 2>/dev/null || true)
+        if [[ -n "${secret_name}" ]]; then
+            prom_token=$(oc get secret "${secret_name}" -n "${GRAFANA_NAMESPACE}" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+        fi
+    fi
+
+    if [[ -z "${prom_token}" ]]; then
+        log_warning "Could not obtain Prometheus bearer token — Grafana datasource may not work"
+    else
+        log_success "Obtained Prometheus bearer token for grafana-sa (valid 1 year)"
+    fi
     
     cat <<EOF | oc apply -f -
 apiVersion: v1
@@ -767,7 +792,7 @@ data:
           httpHeaderName1: Authorization
           tlsSkipVerify: true
         secureJsonData:
-          httpHeaderValue1: "Bearer \${PROMETHEUS_TOKEN}"
+          httpHeaderValue1: "Bearer ${prom_token}"
         editable: false
       - name: Prometheus-UWM
         type: prometheus
@@ -777,7 +802,7 @@ data:
           httpHeaderName1: Authorization
           tlsSkipVerify: true
         secureJsonData:
-          httpHeaderValue1: "Bearer \${PROMETHEUS_TOKEN}"
+          httpHeaderValue1: "Bearer ${prom_token}"
         editable: false
       - name: MinIO (Infinity)
         type: yesoreyeram-infinity-datasource
@@ -794,6 +819,12 @@ data:
         basicAuthUser: "${AWS_ACCESS_KEY_ID:-}"
         editable: true
 EOF
+
+    if [[ -n "${prom_token}" ]]; then
+        # Restart Grafana to pick up the new datasource config
+        oc rollout restart deployment/grafana -n "${GRAFANA_NAMESPACE}" 2>/dev/null || true
+        log_info "Grafana restarted to pick up datasource with valid token"
+    fi
 }
 
 # Create dashboards provisioning config

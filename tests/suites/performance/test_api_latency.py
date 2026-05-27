@@ -236,8 +236,10 @@ class TestAPILatency:
         
         perf_collector.add_result(perf_result)
         
-        # Assert reasonable latency (P95 < 5s)
         for endpoint, result in results.items():
+            assert result["success_rate"] >= 0.95, (
+                f"Success rate for {endpoint}: {result['success_rate']:.0%} below 95%"
+            )
             assert result["latencies"]["p95"] < 5.0, (
                 f"P95 latency for {endpoint} exceeds 5s: {result['latencies']['p95']}s"
             )
@@ -454,7 +456,9 @@ class TestAPILatency:
         
         perf_collector.add_result(perf_result)
         
-        # Pagination should be fast regardless of page size
+        assert result["success_rate"] >= 0.95, (
+            f"Success rate {result['success_rate']:.0%} below 95% threshold"
+        )
         assert result["latencies"]["p95"] < 3.0, (
             f"P95 latency for page_size={page_size} exceeds 3s"
         )
@@ -462,8 +466,8 @@ class TestAPILatency:
     @pytest.mark.parametrize("group_by_dims", [
         ["project"],
         ["project", "node"],
-        ["project", "node", "cluster"],
-    ])
+        ["project", "cluster"],
+    ], ids=["1-dim", "2-dim-node", "2-dim-cluster"])
     def test_perf_api_005_complex_group_by(
         self,
         group_by_dims: List[str],
@@ -474,6 +478,7 @@ class TestAPILatency:
         """PERF-API-005: Complex group-by query - Multi-dimension grouping.
         
         Tests query performance with increasing grouping complexity.
+        The Koku API enforces a maximum of 2 group_by dimensions.
         """
         session = self._get_authenticated_session()
         iterations = 10
@@ -503,11 +508,13 @@ class TestAPILatency:
             "success_rate": result["success_rate"],
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = result["success_rate"] >= 0.90  # More lenient for complex queries
+        perf_result.passed = result["success_rate"] >= 0.90
         
         perf_collector.add_result(perf_result)
         
-        # Complex queries can be slower, allow up to 10s
+        assert result["success_rate"] >= 0.90, (
+            f"Success rate {result['success_rate']:.0%} below 90% threshold"
+        )
         assert result["latencies"]["p95"] < 10.0, (
             f"P95 latency for {len(group_by_dims)}-dim group_by exceeds 10s"
         )
@@ -523,19 +530,41 @@ class TestAPILatency:
         """PERF-API-006: Tag filtering - Filter by N tags.
         
         Tests query performance with increasing tag filter complexity.
+        Discovers real tag keys from the tags API to avoid 400 errors
+        from non-existent fabricated tags.
         """
         session = self._get_authenticated_session()
         iterations = 10
         
-        # Build tag filter params
+        # Discover available tags from the API
+        tags_response = session.get(
+            f"{self.api_base}/tags/openshift/",
+            timeout=30,
+            verify=False,
+        )
+        available_tags = []
+        if tags_response.status_code == 200:
+            tag_data = tags_response.json().get("data", [])
+            for entry in tag_data:
+                if isinstance(entry, dict) and "key" in entry:
+                    available_tags.append(entry["key"])
+                elif isinstance(entry, str):
+                    available_tags.append(entry)
+        
+        if len(available_tags) < tag_count:
+            pytest.skip(
+                f"Need {tag_count} tags but only {len(available_tags)} available; "
+                f"upload data with tags to enable this test"
+            )
+        
+        selected_tags = available_tags[:tag_count]
+        
         params = {
             "filter[time_scope_units]": "day",
-            "filter[time_scope_value]": "-7",
+            "filter[time_scope_value]": "-10",
         }
-        
-        # Add tag filters (these may or may not exist, testing query parsing)
-        for i in range(tag_count):
-            params[f"filter[tag:app{i}]"] = f"value{i}"
+        for tag_key in selected_tags:
+            params[f"filter[tag:{tag_key}]"] = "*"
         
         with perf_timer.measure("tag_filtering"):
             result = run_latency_test(
@@ -547,6 +576,7 @@ class TestAPILatency:
         
         perf_result.metrics = {
             "tag_count": tag_count,
+            "tag_keys_used": selected_tags,
             "iterations": iterations,
             "latencies": result["latencies"],
             "success_rate": result["success_rate"],
@@ -556,7 +586,9 @@ class TestAPILatency:
         
         perf_collector.add_result(perf_result)
         
-        # Tag filtering should scale reasonably
+        assert result["success_rate"] >= 0.95, (
+            f"Success rate {result['success_rate']:.0%} below 95% threshold"
+        )
         assert result["latencies"]["p95"] < 5.0, (
             f"P95 latency for {tag_count} tags exceeds 5s"
         )

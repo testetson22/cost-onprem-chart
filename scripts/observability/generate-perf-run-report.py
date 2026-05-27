@@ -45,25 +45,30 @@ import xml.etree.ElementTree as ET
 KPI_THRESHOLDS: dict[str, list[dict]] = {
     # --- API Latency (P95 targets in seconds) ---
     "api_001": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 2.0, "yellow": 5.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",          "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "Success rate",   "metric": "aggregate_success_rate", "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_002": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 2.0, "yellow": 5.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_003": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 2.0, "yellow": 5.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
     ],
     "api_004": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 1.5, "yellow": 3.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 1.5,  "yellow": 3.0,  "unit": "s"},
+        {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_005": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 5.0, "yellow": 10.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 5.0,  "yellow": 10.0, "unit": "s"},
+        {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.90, "yellow": 0.70, "unit": "%"},
     ],
     "api_006": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 2.0, "yellow": 5.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_status": [
-        {"label": "P95 latency",  "metric": "aggregate_p95", "op": "<", "green": 0.5, "yellow": 1.0, "unit": "s"}
+        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 0.5,  "yellow": 1.0,  "unit": "s"},
     ],
     # --- Ingestion ---
     "ing_001": [
@@ -225,6 +230,18 @@ def load_metadata(run_dir: Path) -> dict:
             return json.loads(meta_path.read_text())
         except Exception:
             pass
+    return {}
+
+
+def load_grafana_links(run_dir: Path) -> dict:
+    """Load grafana-links.json if present (written by push-grafana-snapshot.py)."""
+    for candidate in [run_dir / "reports" / "grafana-links.json",
+                      run_dir / "grafana-links.json"]:
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text())
+            except Exception:
+                pass
     return {}
 
 
@@ -438,10 +455,11 @@ def js_colors(values: list[bool], true_color="#27ae60", false_color="#e74c3c") -
 
 
 def render_html(run_dir: Path, output_path: Path) -> None:
-    session   = load_session(run_dir)
-    metadata  = load_metadata(run_dir)
-    junit     = parse_junit(run_dir)
-    snapshots = load_metrics_snapshots(run_dir)
+    session        = load_session(run_dir)
+    metadata       = load_metadata(run_dir)
+    junit          = parse_junit(run_dir)
+    snapshots      = load_metrics_snapshots(run_dir)
+    grafana_links  = load_grafana_links(run_dir)
 
     if not session:
         print(f"[WARN] No session JSON found in {run_dir}/results/ — report will be sparse")
@@ -463,10 +481,24 @@ def render_html(run_dir: Path, output_path: Path) -> None:
     ts_raw       = metadata.get("created_at", session.get("timestamp", "") if session else "")
     ts_str       = ts_raw[:19].replace("T", " ") + " UTC" if ts_raw else "unknown"
     cluster_info = metadata.get("cluster_info", results[0].get("cluster_info", {}) if results else {})
-    total   = junit["total"]   if junit else len(results)
-    passed  = junit["passed"]  if junit else sum(1 for r in results if r.get("passed"))
-    failed  = junit["failed"]  if junit else sum(1 for r in results if not r.get("passed"))
-    skipped = junit["skipped"] if junit else 0
+    # Session results are the source of truth for pass/fail because they
+    # capture metric-based failures (e.g. 0% success_rate) that may not
+    # trigger a pytest assertion.  JUnit is only used for skipped count and
+    # duration since it includes tests the session collector never sees.
+    session_passed = sum(1 for r in results if r.get("passed"))
+    session_failed = sum(1 for r in results if not r.get("passed"))
+    if results:
+        passed  = session_passed
+        failed  = session_failed
+        total   = junit["total"] if junit else len(results)
+        skipped = junit["skipped"] if junit else 0
+    elif junit:
+        total   = junit["total"]
+        passed  = junit["passed"]
+        failed  = junit["failed"]
+        skipped = junit["skipped"]
+    else:
+        total = passed = failed = skipped = 0
     dur_min = round((junit["duration_s"] if junit else sum(
         sum(t["duration_seconds"] for t in r.get("timings", [])) for r in results
     )) / 60, 1)
@@ -624,6 +656,22 @@ def render_html(run_dir: Path, output_path: Path) -> None:
     pass_color = "#27ae60" if failed == 0 else "#e74c3c"
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    # Grafana links banner
+    grafana_banner = ""
+    snap_url = grafana_links.get("snapshot_url", "")
+    live_url = grafana_links.get("live_dashboard_url", "")
+    if snap_url or live_url:
+        g_parts = []
+        if snap_url:
+            g_parts.append(f'<a href="{snap_url}" target="_blank" class="g-btn">Grafana Snapshot</a>')
+        if live_url:
+            g_parts.append(f'<a href="{live_url}" target="_blank" class="g-btn g-btn-live">Live Dashboard</a>')
+        grafana_banner = (
+            '<div class="grafana-bar" id="grafana-bar">'
+            '<span class="g-label">Grafana:</span> '
+            + " ".join(g_parts) + '</div>'
+        )
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -675,12 +723,21 @@ def render_html(run_dir: Path, output_path: Path) -> None:
   .err-msg {{ font-size:10px; color:var(--fail); max-width:320px; word-break:break-word; }}
 
   .footer {{ margin-top:32px; font-size:11px; color:var(--muted); text-align:center; }}
+
+  /* Grafana links banner */
+  .grafana-bar {{ background:#1a1a2e; color:#eee; padding:10px 24px; border-radius:8px; display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }}
+  .g-label {{ font-size:12px; color:#aaa; font-weight:600; text-transform:uppercase; letter-spacing:.5px; }}
+  .g-btn {{ display:inline-block; padding:6px 14px; border-radius:5px; text-decoration:none; font-size:12px; font-weight:600; background:#e6521e; color:#fff; }}
+  .g-btn:hover {{ background:#c44415; }}
+  .g-btn-live {{ background:#2980b9; }}
+  .g-btn-live:hover {{ background:#1e6090; }}
 </style>
 </head>
 <body>
 <div class="page">
 
   <h1>Performance Run Report</h1>
+  {grafana_banner}
   <div class="meta-row">
     <span><strong>Run:</strong> {run_id}</span>
     <span><strong>Chart:</strong> {chart_ver}</span>

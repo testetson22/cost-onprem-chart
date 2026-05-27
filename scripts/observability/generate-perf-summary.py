@@ -99,6 +99,115 @@ def _import_report_module():
     return mod
 
 
+def load_metrics_snapshots(run_dir: Path) -> dict:
+    """Load and aggregate metrics from collected snapshots.
+    
+    Metrics are collected by collect-metrics.sh and stored in:
+    - ./perf-runs/{run_id}/metrics/ (from script working directory)
+    - Or {run_dir}/metrics/ if present
+    
+    Returns aggregated resource summary with min/max/avg statistics.
+    """
+    import statistics
+    
+    # Try multiple possible locations for metrics
+    run_id = run_dir.name
+    possible_dirs = [
+        run_dir / "metrics",
+        run_dir.parent.parent / "perf-runs" / run_id / "metrics",
+        Path("perf-runs") / run_id / "metrics",
+    ]
+    
+    metrics_dir = None
+    for d in possible_dirs:
+        if d.exists() and list(d.glob("snapshot_*.json")):
+            metrics_dir = d
+            break
+    
+    if not metrics_dir:
+        return {}
+    
+    snapshots = []
+    for snap_file in sorted(metrics_dir.glob("snapshot_*.json")):
+        try:
+            snapshots.append(json.loads(snap_file.read_text()))
+        except Exception:
+            continue
+    
+    if not snapshots:
+        return {}
+    
+    # Collect time-series data for key metrics
+    cpu_values = []
+    mem_values = []
+    valkey_mem = []
+    valkey_clients = []
+    valkey_cmds = []
+    pg_connections = []
+    pg_cache_hit = []
+    
+    for snap in snapshots:
+        m = snap.get("metrics", {})
+        
+        cpu = m.get("pod_cpu_usage", 0)
+        if isinstance(cpu, (int, float)) and cpu > 0:
+            cpu_values.append(cpu)
+        
+        mem = m.get("pod_memory_usage_bytes", 0)
+        if isinstance(mem, (int, float)) and mem > 0:
+            mem_values.append(mem / 1024 / 1024)  # MB
+        
+        vk_mem = m.get("valkey_memory_used_bytes", 0)
+        if isinstance(vk_mem, (int, float)) and vk_mem > 0:
+            valkey_mem.append(vk_mem / 1024 / 1024)  # MB
+        
+        vk_clients = m.get("valkey_connected_clients", 0)
+        if isinstance(vk_clients, (int, float)):
+            valkey_clients.append(vk_clients)
+        
+        vk_cmds = m.get("valkey_commands_per_sec", 0)
+        if isinstance(vk_cmds, (int, float)):
+            valkey_cmds.append(vk_cmds)
+        
+        pg_conn = m.get("pg_connections_active")
+        if isinstance(pg_conn, (int, float)):
+            pg_connections.append(pg_conn)
+        elif isinstance(pg_conn, list) and pg_conn:
+            for item in pg_conn:
+                if isinstance(item, dict) and "value" in item:
+                    pg_connections.append(float(item["value"]))
+        
+        pg_hit = m.get("pg_cache_hit_rate")
+        if isinstance(pg_hit, (int, float)):
+            pg_cache_hit.append(pg_hit)
+        elif isinstance(pg_hit, list) and pg_hit:
+            for item in pg_hit:
+                if isinstance(item, dict) and "value" in item:
+                    pg_cache_hit.append(float(item["value"]))
+    
+    def _stats(values):
+        if not values:
+            return None
+        return {
+            "min": round(min(values), 3),
+            "max": round(max(values), 3),
+            "avg": round(statistics.mean(values), 3),
+        }
+    
+    return {
+        "snapshot_count": len(snapshots),
+        "time_start": snapshots[0].get("timestamp", ""),
+        "time_end": snapshots[-1].get("timestamp", ""),
+        "pod_cpu_cores": _stats(cpu_values),
+        "pod_memory_mb": _stats(mem_values),
+        "valkey_memory_mb": _stats(valkey_mem),
+        "valkey_clients": _stats(valkey_clients),
+        "valkey_cmds_sec": _stats(valkey_cmds),
+        "pg_connections": _stats(pg_connections),
+        "pg_cache_hit_pct": _stats(pg_cache_hit),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Summary generation
 # ---------------------------------------------------------------------------
@@ -203,9 +312,12 @@ def build_summary(run_dir: Path) -> dict:
             })
 
     # Ingestion rows — one row per ingestion test
+    # Match test names like test_perf_ing_001, test_perf_ing_002, etc.
+    # Avoid false positives like api_006_tag_filtering (contains 'ing' in 'filtering')
     ing_rows = []
     for r in results:
-        if "ing" not in r.get("test_name", ""):
+        test_name = r.get("test_name", "")
+        if "_ing_" not in test_name and not test_name.startswith("ing_"):
             continue
         m = r.get("metrics") or {}
         timings = {t["name"]: round(t["duration_seconds"], 2) for t in r.get("timings", [])}
@@ -270,11 +382,15 @@ def build_summary(run_dir: Path) -> dict:
     run_meta["kpi_violations"] = kpi_violations
     run_meta["kpi_warnings"] = kpi_warnings
 
+    # Load resource metrics from collected snapshots
+    resources = load_metrics_snapshots(run_dir)
+
     return {
         "run":       run_meta,
         "tests":     test_rows,
         "api":       api_rows,
         "ingestion": ing_rows,
+        "resources": resources,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -297,9 +413,11 @@ def update_s3_index(run_dir: Path, summary: dict,
 
     index_key  = f"{s3_prefix.rstrip('/')}/index.json"
     index_url  = f"{s3_endpoint.rstrip('/')}/{s3_bucket}/{index_key}"
+    resources = summary.get("resources", {})
     run_entry  = {
         "run_id":        summary["run"]["run_id"],
-        "timestamp":     summary["run"]["timestamp"],
+        "start_time":    resources.get("time_start", summary["run"]["timestamp"]),
+        "end_time":      resources.get("time_end", ""),
         "chart_version": summary["run"]["chart_version"],
         "profile":       summary["run"]["profile"],
         "passed":        summary["run"]["passed"],

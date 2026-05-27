@@ -111,7 +111,7 @@ dashboards/
 `deploy-test-cost-onprem.sh --perf-only` automatically runs `push-grafana-snapshot.py` at
 the end of every run. If Grafana is reachable it will:
 
-1. **Import** the `dashboards/*.json` files into Grafana
+1. **Import** the `dashboards/collected-metrics/*.json` files into Grafana (or `dashboards/prometheus/*.json` for legacy operational dashboards)
 2. **Create a permanent snapshot** of the run (static, no Prometheus required after creation)
 3. **Generate a live link** scoped to the run's exact time window
 4. **Patch** `reports/perf-run-report.html` with both links
@@ -228,8 +228,8 @@ Test Run
                    s3://<bucket>/<prefix>/index.json  (listing all runs)
 
 Persistent Grafana (any instance, any location)
-  └── Infinity datasource  →  MinIO HTTP
-        └── dashboards/perf-history.json
+  └── Infinity datasource  →  S3/MinIO HTTP
+        └── dashboards/collected-metrics/perf-history.json
               ├── Run selector (from index.json)
               ├── KPI stat panels
               ├── All test results table
@@ -260,7 +260,7 @@ Grafana → Administration → Plugins → search "Infinity" → Install
 Grafana → Connections → Add datasource → Infinity
   → Set allowed hosts: https://minio-s3-...
   → Set auth: Basic Auth with MinIO access key/secret
-Grafana → Dashboards → Import → upload dashboards/perf-history.json
+Grafana → Dashboards → Import → upload dashboards/collected-metrics/perf-history.json
 ```
 
 **3. What gets uploaded automatically:**
@@ -297,7 +297,7 @@ python3 scripts/observability/generate-perf-summary.py \
   --update-index
 ```
 
-### Dashboard: `dashboards/perf-history.json`
+### Dashboard: `dashboards/collected-metrics/perf-history.json`
 
 | Panel | Query |
 |-------|-------|

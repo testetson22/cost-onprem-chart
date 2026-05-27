@@ -32,6 +32,7 @@ CPU_CONFIGS = [
     {"label": "moderate",    "limit": "500m",  "color": "#e67e22"},
     {"label": "recommended", "limit": "1000m", "color": "#27ae60"},
     {"label": "uncapped",    "limit": "max",   "color": "#2980b9"},
+    {"label": "unknown",     "limit": "?",     "color": "#95a5a6"},
 ]
 CPU_LABELS  = [c["label"] for c in CPU_CONFIGS]
 CPU_BY_LABEL = {c["label"]: c for c in CPU_CONFIGS}
@@ -137,16 +138,45 @@ def parse_metrics_summary(run_dir: Path) -> Optional[dict]:
     return None
 
 
-def infer_cpu_label(run_id: str, metadata: Optional[dict]) -> str:
-    """Best-effort: infer listener CPU config from metadata or run ID."""
+def _cpu_limit_to_label(cpu: str) -> Optional[str]:
+    """Map a CPU limit string (e.g. '300m', 'max', '2000m') to a matrix label."""
+    if not cpu:
+        return None
+    cpu = str(cpu).strip()
+    if cpu.lower() in ("max", "none", "unlimited"):
+        return "uncapped"
+    if cpu.lower() in ("default", ""):
+        return None
+    try:
+        millicores = int(cpu.rstrip("m"))
+    except ValueError:
+        return None
+    if millicores >= 1000:
+        return "recommended"
+    if millicores >= 500:
+        return "moderate"
+    return "constrained"
+
+
+def infer_cpu_label(run_id: str, metadata: Optional[dict],
+                    session: Optional[dict] = None) -> str:
+    """Best-effort: infer listener CPU config from metadata, session, or run ID."""
     if metadata:
-        cpu = metadata.get("listener_cpu_limit", "")
-        if cpu:
-            if cpu == "max":       return "uncapped"
-            if int(cpu.rstrip("m")) >= 1000: return "recommended"
-            if int(cpu.rstrip("m")) >= 500:  return "moderate"
-            return "constrained"
-    # Default: assume constrained (chart default) for unlabelled runs
+        label = _cpu_limit_to_label(metadata.get("listener_cpu_limit", ""))
+        if label:
+            return label
+
+    if session:
+        for r in session.get("results", []):
+            m = r.get("metrics") or {}
+            cpu_val = m.get("listener_cpu_limit") or m.get("listener_cpu")
+            label = _cpu_limit_to_label(str(cpu_val) if cpu_val else "")
+            if label:
+                return label
+            cores = m.get("listener_cpu_cores", 0)
+            if isinstance(cores, (int, float)) and cores > 1.5:
+                return "uncapped"
+
     return "constrained"
 
 
@@ -225,7 +255,7 @@ def load_runs(runs_dir: Path) -> list[dict]:
         session  = load_session(run_dir)
 
         profile    = infer_profile(run_dir.name, metadata)
-        cpu_label  = infer_cpu_label(run_dir.name, metadata)
+        cpu_label  = infer_cpu_label(run_dir.name, metadata, session)
 
         perf_summary = extract_perf_summary(session) if session else []
 
@@ -253,11 +283,20 @@ def load_runs(runs_dir: Path) -> list[dict]:
                 html_report = str(hp.relative_to(runs_dir))
                 break
 
+        if junit:
+            if junit["failed"] == 0:
+                run_status = "passed"
+            else:
+                run_status = "failed"
+        else:
+            run_status = "no-results"
+
         runs.append({
             "run_id":        run_dir.name,
             "run_dir":       run_dir,
             "profile":       profile,
             "cpu_label":     cpu_label,
+            "status":        run_status,
             "metadata":      metadata or {},
             "junit":         junit,
             "metrics_summary": metrics,
@@ -394,7 +433,7 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
             else:
                 inner = ""
                 for run in cell_runs:
-                    inner += f'<div class="run-card">{run_summary_html(run)}</div>'
+                    inner += f'<div class="run-card" data-status="{run["status"]}" data-run="{run["run_id"]}">{run_summary_html(run)}</div>'
                 cells.append(f'<td class="cell">{inner}</td>')
 
         row_label = (
@@ -463,7 +502,7 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
         ) if cluster else ""
 
         detail_sections.append(f"""
-<div class="detail-section" id="{anchor}">
+<div class="detail-section" id="{anchor}" data-status="{run["status"]}" data-run="{run["run_id"]}">
   <div class="detail-header" style="border-left:4px solid {cpu_color}">
     <span class="detail-run-id">{run["run_id"]}</span>
     <span class="detail-tags">
@@ -489,7 +528,7 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
         cpu_c = CPU_BY_LABEL.get(run["cpu_label"], {})
         cpu_color = cpu_c.get("color", "#666")
         run_list_items += (
-            f'<li>'
+            f'<li data-status="{run["status"]}" data-run="{run["run_id"]}">'
             f'{status}'
             f'<span class="ri-id">{run["run_id"]}</span><br>'
             f'<span class="ri-tags">'
@@ -597,6 +636,12 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
   .legend-item {{ display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 12px; }}
   .legend-dot {{ width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }}
 
+  /* Filter chips */
+  .filter-chip {{ cursor: pointer; transition: box-shadow .15s, opacity .15s; user-select: none; }}
+  .filter-chip:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.12); }}
+  .filter-chip.active {{ box-shadow: 0 0 0 2px var(--accent); }}
+  [data-hidden="true"] {{ display: none !important; }}
+
   @media (max-width: 768px) {{
     .sidebar {{ display: none; }}
   }}
@@ -630,10 +675,10 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
         Generated: {generated_at}
       </div>
       <div class="stats-row">
-        <div class="stat-chip"><div class="n">{total_runs}</div><div class="l">Total runs</div></div>
-        <div class="stat-chip" style="border-color:#27ae60"><div class="n" style="color:#27ae60">{total_pass}</div><div class="l">All passed</div></div>
-        <div class="stat-chip" style="border-color:#e74c3c"><div class="n" style="color:#e74c3c">{total_fail}</div><div class="l">Had failures</div></div>
-        <div class="stat-chip"><div class="n">{in_progress}</div><div class="l">In progress / no results</div></div>
+        <div class="stat-chip filter-chip active" data-filter="all"><div class="n">{total_runs}</div><div class="l">Total runs</div></div>
+        <div class="stat-chip filter-chip" data-filter="passed" style="border-color:#27ae60"><div class="n" style="color:#27ae60">{total_pass}</div><div class="l">All passed</div></div>
+        <div class="stat-chip filter-chip" data-filter="failed" style="border-color:#e74c3c"><div class="n" style="color:#e74c3c">{total_fail}</div><div class="l">Had failures</div></div>
+        <div class="stat-chip filter-chip" data-filter="no-results"><div class="n">{in_progress}</div><div class="l">In progress / no results</div></div>
       </div>
     </div>
 
@@ -660,6 +705,35 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
     {perf_detail_sections}
   </main>
 </div>
+<script>
+(function() {{
+  const chips = document.querySelectorAll('.filter-chip');
+  const filterable = document.querySelectorAll('[data-status]');
+
+  chips.forEach(chip => {{
+    chip.addEventListener('click', () => {{
+      const filter = chip.dataset.filter;
+      chips.forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+
+      filterable.forEach(el => {{
+        if (filter === 'all') {{
+          el.removeAttribute('data-hidden');
+        }} else {{
+          el.setAttribute('data-hidden', el.dataset.status !== filter ? 'true' : 'false');
+        }}
+      }});
+
+      document.querySelectorAll('.cell').forEach(cell => {{
+        const cards = cell.querySelectorAll('.run-card');
+        if (cards.length === 0) return;
+        const anyVisible = Array.from(cards).some(c => c.getAttribute('data-hidden') !== 'true');
+        cell.closest('tr').style.display = '';
+      }});
+    }});
+  }});
+}})();
+</script>
 </body>
 </html>"""
 

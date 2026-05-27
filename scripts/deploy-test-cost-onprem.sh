@@ -139,7 +139,8 @@ METRICS_COLLECTOR_PID=""
 
 # Performance output directory - unified structure for metrics + test results + reports
 # Format: {PERF_OUTPUT_DIR}/{TEST_RUN_ID}/ with subdirs: metrics/, results/, reports/
-PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-./perf-runs}"
+# Use tests/perf-runs to align with pytest conftest.py output location
+PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-tests/perf-runs}"
 # TEST_RUN_ID is auto-generated: {chart_version}-{perf_profile}-{epoch}
 TEST_RUN_ID="${TEST_RUN_ID:-}"
 SAVE_VERSIONS="${SAVE_VERSIONS:-false}"
@@ -1242,6 +1243,7 @@ generate_metadata_json() {
   "test_run_id": "${TEST_RUN_ID}",
   "chart_version": "${chart_version}",
   "perf_profile": "${PERF_PROFILE}",
+  "listener_cpu_limit": "${LISTENER_CPU:-default}",
   "namespace": "${NAMESPACE}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "cluster_info": {

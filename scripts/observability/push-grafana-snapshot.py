@@ -94,10 +94,13 @@ class GrafanaClient:
             pass
         return None
 
-    def create_datasource_if_missing(self, thanos_url: str) -> str:
+    def create_datasource_if_missing(self, thanos_url: str,
+                                     bearer_token: Optional[str] = None) -> str:
         """Ensure a Prometheus datasource exists, return its UID."""
         uid = self.get_datasource_uid()
         if uid:
+            if bearer_token:
+                self._update_datasource_token(uid, bearer_token)
             return uid
         body = {
             "name": "Prometheus",
@@ -108,6 +111,10 @@ class GrafanaClient:
             "jsonData": {
                 "httpMethod": "POST",
                 "tlsSkipVerify": True,
+                "httpHeaderName1": "Authorization",
+            },
+            "secureJsonData": {
+                "httpHeaderValue1": f"Bearer {bearer_token}" if bearer_token else "",
             },
         }
         try:
@@ -115,6 +122,18 @@ class GrafanaClient:
             return r.get("datasource", {}).get("uid") or r.get("uid", "prometheus")
         except Exception:
             return "prometheus"
+
+    def _update_datasource_token(self, uid: str, bearer_token: str) -> None:
+        """Update an existing datasource's bearer token."""
+        try:
+            ds = self._request("GET", f"/api/datasources/uid/{uid}")
+            ds.setdefault("jsonData", {})["httpHeaderName1"] = "Authorization"
+            ds["jsonData"]["tlsSkipVerify"] = True
+            ds["secureJsonData"] = {"httpHeaderValue1": f"Bearer {bearer_token}"}
+            self._request("PUT", f"/api/datasources/{ds['id']}", ds)
+            print(f"[OK] Updated datasource {uid} with fresh bearer token")
+        except Exception as e:
+            print(f"[WARN] Could not update datasource token: {e}")
 
     def dashboard_exists(self, uid: str) -> bool:
         try:
@@ -134,14 +153,31 @@ class GrafanaClient:
             pass
         return "Prometheus"
 
-    def import_dashboard(self, dashboard: dict, datasource_uid: str) -> Optional[str]:
-        """Import a dashboard JSON, replacing datasource UIDs. Returns the new slug URL."""
-        dash = deepcopy(dashboard)
+    def import_dashboard(self, dashboard: dict, datasource_uid: str,
+                         extra_uids: Optional[dict] = None) -> Optional[str]:
+        """Import a dashboard JSON, replacing datasource UIDs.
+
+        *extra_uids* is an optional dict of ``{placeholder: real_uid}`` for
+        non-Prometheus datasources, e.g. ``{"__INFINITY_UID__": "abc123"}``.
+        Also replaces ``__S3_BASE_URL__`` with the Infinity datasource URL if
+        an ``__S3_BASE_URL__`` key is present in *extra_uids*.
+        """
+        raw = json.dumps(dashboard)
+
+        # Replace well-known placeholders in the raw JSON string
+        raw = raw.replace("__DS_UID__", datasource_uid)
+        if extra_uids:
+            for placeholder, real_uid in extra_uids.items():
+                raw = raw.replace(placeholder, real_uid)
+
+        dash = json.loads(raw)
         dash.pop("id", None)
         dash.pop("version", None)
-        # Replace all datasource references
-        _replace_datasource(dash, datasource_uid)
-        # Set the datasource template variable's current value so it resolves on load
+
+        # For dashboards that still use generic datasource refs (no placeholders),
+        # rewrite only prometheus-type UIDs
+        _replace_datasource(dash, datasource_uid, only_type="prometheus")
+
         ds_name = self.get_datasource_name()
         for var in dash.get("templating", {}).get("list", []):
             if var.get("type") == "datasource" and var.get("name") == "datasource":
@@ -152,12 +188,12 @@ class GrafanaClient:
             "dashboard": dash,
             "overwrite": True,
             "folderId": 0,
-            "inputs": [{"name": "*", "type": "datasource", "pluginId": "prometheus", "value": datasource_uid}],
         }
         try:
             r = self._request("POST", "/api/dashboards/db", body)
             return r.get("uid") or dash.get("uid")
-        except Exception:
+        except Exception as exc:
+            print(f"  [WARN] import_dashboard failed: {exc}", file=sys.stderr)
             return None
 
     def save_dashboard(self, dashboard: dict) -> dict:
@@ -202,29 +238,33 @@ class GrafanaClient:
         try:
             r    = self._request("GET", f"/api/dashboards/uid/{uid}")
             slug = r.get("meta", {}).get("slug", uid)
-            # Use the datasource UID (not name) so var-datasource resolves correctly
-            ds_uid = self.get_datasource_uid() or "prometheus"
             return (
                 f"{self.base_url}/d/{uid}/{slug}"
                 f"?orgId=1&from={from_ms}&to={to_ms}"
-                f"&var-namespace={namespace}&var-datasource={ds_uid}"
+                f"&var-namespace={namespace}"
             )
         except Exception:
             return f"{self.base_url}/d/{uid}?from={from_ms}&to={to_ms}"
 
 
-def _replace_datasource(obj, uid: str) -> None:
-    """Recursively replace datasource UIDs/values in a dashboard dict."""
+def _replace_datasource(obj, uid: str, *, only_type: str = "") -> None:
+    """Recursively replace datasource UIDs/values in a dashboard dict.
+
+    If *only_type* is set (e.g. "prometheus"), only datasource refs whose
+    ``type`` matches are rewritten — others are left untouched.
+    """
     if isinstance(obj, dict):
         if "datasource" in obj and isinstance(obj["datasource"], dict):
-            obj["datasource"]["uid"] = uid
+            ds = obj["datasource"]
+            if not only_type or ds.get("type", "") == only_type:
+                ds["uid"] = uid
         if obj.get("type") == "datasource" and "current" in obj:
             obj["current"]["value"] = uid
         for v in obj.values():
-            _replace_datasource(v, uid)
+            _replace_datasource(v, uid, only_type=only_type)
     elif isinstance(obj, list):
         for item in obj:
-            _replace_datasource(item, uid)
+            _replace_datasource(item, uid, only_type=only_type)
 
 
 # ---------------------------------------------------------------------------
@@ -486,8 +526,39 @@ def _grafana_version(client: "GrafanaClient") -> str:
 
 def detect_thanos_url() -> str:
     """Get the Thanos Querier URL for user workload monitoring."""
-    # From inside the cluster this is always the same
     return "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+
+
+def get_grafana_sa_token(namespace: str) -> Optional[str]:
+    """Get a bearer token for the grafana-sa service account."""
+    try:
+        token = subprocess.run(
+            ["oc", "create", "token", "grafana-sa", "-n", namespace, "--duration=8760h"],
+            capture_output=True, text=True, timeout=15
+        )
+        if token.returncode == 0 and token.stdout.strip():
+            return token.stdout.strip()
+    except Exception:
+        pass
+    # Fallback: read from SA secret (older OCP)
+    try:
+        secret = subprocess.run(
+            ["oc", "get", "sa", "grafana-sa", "-n", namespace,
+             "-o", "jsonpath={.secrets[0].name}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if secret.returncode == 0 and secret.stdout.strip():
+            tok = subprocess.run(
+                ["oc", "get", "secret", secret.stdout.strip(), "-n", namespace,
+                 "-o", "jsonpath={.data.token}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if tok.returncode == 0 and tok.stdout.strip():
+                import base64
+                return base64.b64decode(tok.stdout.strip()).decode()
+    except Exception:
+        pass
+    return None
 
 
 def load_session(run_dir: Path) -> Optional[dict]:
@@ -678,9 +749,16 @@ def main() -> None:
             raise SystemExit(0)
     print(f"[OK] Grafana is healthy (v{_grafana_version(client)})")
 
-    # Ensure datasource exists
+    # Get a bearer token for Thanos Querier access
+    prom_token = get_grafana_sa_token(args.namespace)
+    if prom_token:
+        print("[OK] Obtained Prometheus bearer token from grafana-sa")
+    else:
+        print("[WARN] Could not get grafana-sa token — datasource may not authenticate to Thanos")
+
+    # Ensure datasource exists with a valid bearer token
     thanos_url    = detect_thanos_url()
-    datasource_uid = client.create_datasource_if_missing(thanos_url)
+    datasource_uid = client.create_datasource_if_missing(thanos_url, bearer_token=prom_token)
     print(f"[INFO] Datasource UID: {datasource_uid}")
 
     snapshot_url     = None
@@ -715,12 +793,27 @@ def main() -> None:
     # 2. Import live dashboards and build time-ranged link
     dashboards_dir = Path(__file__).parent / "dashboards"
     imported_uid   = None
+
+    # Discover Infinity datasource UID + S3 base URL for perf-history dashboard
+    extra_uids: dict[str, str] = {}
+    try:
+        all_ds = client._request("GET", "/api/datasources")
+        for ds in all_ds:
+            if ds.get("type") == "yesoreyeram-infinity-datasource":
+                extra_uids["__INFINITY_UID__"] = ds["uid"]
+                extra_uids["__S3_BASE_URL__"] = ds.get("url", "").rstrip("/")
+                print(f"[INFO] Infinity datasource: uid={ds['uid']}, url={ds.get('url','')}")
+                break
+    except Exception:
+        pass
+
     if dashboards_dir.exists():
         print("[INFO] Importing live dashboards...")
         for dash_file in sorted(dashboards_dir.glob("*.json")):
             try:
                 dash_json = json.loads(dash_file.read_text())
-                uid = client.import_dashboard(dash_json, datasource_uid)
+                uid = client.import_dashboard(dash_json, datasource_uid,
+                                              extra_uids=extra_uids)
                 if uid and "overview" in dash_file.name:
                     imported_uid = uid
                 print(f"  [OK] {dash_file.name} → uid={uid}")
