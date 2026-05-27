@@ -38,6 +38,8 @@ from .conftest import (
 )
 from .test_ingestion import generate_and_upload_data
 
+_ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
+
 
 # =============================================================================
 # Constants
@@ -132,8 +134,12 @@ def get_kruize_experiment_count(
     kruize_password: str,
     cluster_id: Optional[str] = None,
 ) -> int:
-    """Get the count of Kruize experiments."""
-    where_clause = f"WHERE cluster_name = '{cluster_id}'" if cluster_id else ""
+    """Get the count of Kruize experiments.
+
+    Kruize stores cluster_name as ``org_id;cluster_uuid`` (e.g.
+    ``org1234567;abcd-1234``), so we match with LIKE to be org-agnostic.
+    """
+    where_clause = f"WHERE cluster_name LIKE '%{cluster_id}'" if cluster_id else ""
     
     result = execute_db_query(
         namespace,
@@ -156,12 +162,15 @@ def get_kruize_recommendation_count(
     kruize_password: str,
     cluster_id: Optional[str] = None,
 ) -> int:
-    """Get the count of Kruize recommendations."""
+    """Get the count of Kruize recommendations.
+
+    Uses LIKE for cluster matching — see ``get_kruize_experiment_count``.
+    """
     if cluster_id:
         query = f"""
         SELECT COUNT(*) FROM kruize_recommendations r
         JOIN kruize_experiments e ON r.experiment_name = e.experiment_name
-        WHERE e.cluster_name = '{cluster_id}'
+        WHERE e.cluster_name LIKE '%{cluster_id}'
         """
     else:
         query = "SELECT COUNT(*) FROM kruize_recommendations"
@@ -279,32 +288,10 @@ class TestROSPerformance:
         return pod
 
     @pytest.fixture(scope="class")
-    def upload_url(self, cluster_config) -> str:
-        """Get upload URL for ingestion."""
-        gateway_route = run_oc_command([
-            "get", "route", "-n", cluster_config.namespace,
-            f"{cluster_config.helm_release_name}-api",
-            "-o", "jsonpath={.spec.host}"
-        ], check=False)
-        
-        if gateway_route.returncode != 0 or not gateway_route.stdout.strip():
-            pytest.skip("Gateway route not found")
-        
-        return f"https://{gateway_route.stdout.strip()}/api/ingress/v1/upload"
-
-    @pytest.fixture(scope="class")
-    def gateway_url(self, cluster_config) -> str:
-        """Get gateway URL."""
-        gateway_route = run_oc_command([
-            "get", "route", "-n", cluster_config.namespace,
-            f"{cluster_config.helm_release_name}-api",
-            "-o", "jsonpath={.spec.host}"
-        ], check=False)
-        
-        if gateway_route.returncode != 0 or not gateway_route.stdout.strip():
-            pytest.skip("Gateway route not found")
-        
-        return f"https://{gateway_route.stdout.strip()}"
+    def upload_url(self, gateway_url: str) -> str:
+        """Get upload URL for ingestion via the session-scoped gateway_url."""
+        # gateway_url from conftest already includes /api (e.g. https://host/api)
+        return f"{gateway_url}/ingress/v1/upload"
 
     @pytest.fixture(scope="class")
     def ingress_pod(self, cluster_config) -> str:
@@ -374,7 +361,7 @@ class TestROSPerformance:
                 source_name=source_name,
                 start_date=start_date,
                 end_date=end_date,
-                ingress_url=gateway_url + "/api/ingress",
+                ingress_url=gateway_url + "/ingress",
                 jwt_token=jwt_token,
                 profile_name="baseline",  # Uses ROS-enabled data generation
             )
@@ -443,6 +430,10 @@ class TestROSPerformance:
         
         assert exp_count >= 1, f"Expected at least 1 experiment, got {exp_count}"
 
+    @pytest.mark.skipif(
+        _ACTIVE_PROFILE == "baseline",
+        reason="ROS-002 (50 workloads, 10 min) is a scale test — not appropriate for baseline.",
+    )
     @pytest.mark.timeout(1200)
     def test_perf_ros_002_multi_workload_scale(
         self,
@@ -505,7 +496,7 @@ class TestROSPerformance:
                 source_name=source_name,
                 start_date=start_date,
                 end_date=end_date,
-                ingress_url=gateway_url + "/api/ingress",
+                ingress_url=gateway_url + "/ingress",
                 jwt_token=jwt_token,
                 profile_name="baseline",
             )
@@ -647,7 +638,7 @@ class TestROSPerformance:
                 source_name=source_name,
                 start_date=start_date,
                 end_date=end_date,
-                ingress_url=gateway_url + "/api/ingress",
+                ingress_url=gateway_url + "/ingress",
                 jwt_token=jwt_token,
                 profile_name="baseline",
             )
@@ -691,7 +682,7 @@ class TestROSPerformance:
                 source_name=source_name,
                 start_date=start_date2,
                 end_date=end_date2,
-                ingress_url=gateway_url + "/api/ingress",
+                ingress_url=gateway_url + "/ingress",
                 jwt_token=jwt_token,
                 profile_name="baseline",
             )
@@ -740,6 +731,10 @@ class TestROSPerformance:
         print(f"  Refresh processing: {refresh_time:.1f}s")
         print(f"  Speedup ratio: {perf_result.metrics['speedup_ratio']:.2f}x")
 
+    @pytest.mark.skipif(
+        _ACTIVE_PROFILE == "baseline",
+        reason="ROS-004 (100 workloads, 15 min) is a memory pressure test — not appropriate for baseline.",
+    )
     @pytest.mark.timeout(1800)
     def test_perf_ros_004_kruize_memory_pressure(
         self,
@@ -828,7 +823,7 @@ class TestROSPerformance:
                     source_name=source_name,
                     start_date=start_date,
                     end_date=end_date,
-                    ingress_url=gateway_url + "/api/ingress",
+                    ingress_url=gateway_url + "/ingress",
                     jwt_token=jwt_token,
                     profile_name="baseline",
                 )

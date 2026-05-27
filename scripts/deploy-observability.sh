@@ -657,7 +657,7 @@ spec:
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
               value: Viewer
             - name: GF_INSTALL_PLUGINS
-              value: grafana-clock-panel,grafana-piechart-panel
+              value: grafana-clock-panel,grafana-piechart-panel,yesoreyeram-infinity-datasource
           resources:
             requests:
               cpu: 100m
@@ -779,6 +779,20 @@ data:
         secureJsonData:
           httpHeaderValue1: "Bearer \${PROMETHEUS_TOKEN}"
         editable: false
+      - name: MinIO (Infinity)
+        type: yesoreyeram-infinity-datasource
+        access: proxy
+        isDefault: false
+        jsonData:
+          auth_method: "basicAuth"
+          tlsSkipVerify: true
+          allowedHosts:
+            - "${S3_ENDPOINT:-https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com}"
+        secureJsonData:
+          basicAuthPassword: "${AWS_SECRET_ACCESS_KEY:-}"
+        basicAuth: true
+        basicAuthUser: "${AWS_ACCESS_KEY_ID:-}"
+        editable: true
 EOF
 }
 

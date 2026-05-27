@@ -26,6 +26,7 @@ import requests
 
 from conftest import ClusterConfig, JWTToken, obtain_jwt_token
 from e2e_helpers import (
+    wait_for_processing_complete,
     NISEConfig,
     SourceRegistration,
     cleanup_database_records,
@@ -36,7 +37,6 @@ from e2e_helpers import (
     register_source,
     upload_with_retry,
     wait_for_provider,
-    wait_for_summary_tables,
 )
 from utils import (
     create_upload_package_from_files,
@@ -64,22 +64,88 @@ from .profiles import PROFILES, get_profile_metrics, get_profile_nise_yaml
 
 UPLOAD_CONTENT_TYPE = "application/vnd.redhat.hccm.filename+tgz"
 
-# ING-006 profiles to run, filtered by PERF_PROFILE.
-# Running all three variants (small/medium/large) during a baseline run adds
-# 4-10 hours of wall clock time. Restrict to only the profiles appropriate for
-# the current run level.
+# ---------------------------------------------------------------------------
+# Profile-filtered parametrize lists — all gated by PERF_PROFILE so that
+# baseline runs stay fast (<30 min) and heavier variants only appear at the
+# run levels where they're meaningful.
+# ---------------------------------------------------------------------------
 _ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
-# ING-006 parametrize values per run level.
-# baseline: skipped — even small takes 2+ hours; baseline must stay <30 min.
-# small+:   run the variants appropriate for the run level.
-# The empty-list case is handled by a skip sentinel so pytest doesn't error.
-# ING-006 uses a dedicated "window_validation" profile by default for speed.
-# window_validation (~20-30 min/run) vs small (~2 hr/run).
-# Full small/medium/large variants are only added for medium+ run levels.
-# ING-006 runs the variant matching the active profile.
-# large+ all use "large" since there's no heavier ING-006 variant beyond that.
-_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("baseline", "small", "medium", "large") else "large"
-ING_006_PROFILES = [_ING_006_PROFILE]
+
+# ING-001: data profile variants to generate and upload.
+# baseline → baseline data (1 cluster, 3 nodes, 1 day)
+# small+   → small data (1 cluster, 15 nodes, 30 days)
+# medium+  → medium data (2 clusters, 25 nodes, 30 days)
+# large+   → large data (7 clusters, 19 nodes, 30 days)
+_ING_001_PROFILES: dict = {
+    "baseline": ["baseline"],
+    "small":    ["small"],
+    "medium":   ["small", "medium"],
+    "large":    ["small", "medium", "large"],
+}
+ING_001_PROFILES = _ING_001_PROFILES.get(_ACTIVE_PROFILE, _ING_001_PROFILES["large"])
+
+# ING-002: burst window variants (data_days, processing_timeout_s).
+# baseline → skipped; ING-002 is a volume/burst test — ING-001 already covers
+#            the single-source pipeline for baseline.  Adding burst windows here
+#            only adds 5-20 min of upload+processing time with no extra signal.
+# small    → 30 + 60-day
+# medium+  → all three (30, 60, 90-day)
+_ING_002_SKIP_REASON = (
+    "ING-002 is a volume/burst test, not a baseline scenario — "
+    "ING-001 already validates the single-source pipeline end-to-end."
+)
+_ING_002_VARIANTS: dict = {
+    "baseline": [pytest.param(30, 600,  id="30-days",
+                              marks=pytest.mark.skip(reason=_ING_002_SKIP_REASON))],
+    "small":    [pytest.param(30, 600,  id="30-days"),
+                 pytest.param(60, 900,  id="60-days")],
+    "medium":   [pytest.param(30, 600,  id="30-days"),
+                 pytest.param(60, 900,  id="60-days"),
+                 pytest.param(90, 1200, id="90-days")],
+    "large":    [pytest.param(30, 600,  id="30-days"),
+                 pytest.param(60, 900,  id="60-days"),
+                 pytest.param(90, 1200, id="90-days")],
+}
+ING_002_PARAMS = _ING_002_VARIANTS.get(_ACTIVE_PROFILE, _ING_002_VARIANTS["large"])
+
+# ING-004: large-file target sizes.
+# Skipped for baseline — ING-004 intentionally ignores PERF_PROFILE and always
+# generates large-profile (133 nodes) × 30-day NISE data regardless of the active
+# profile.  That makes the 50 MB variant take 45-60 min of local NISE generation,
+# which is not a baseline concern.  ING-001 already validates the upload+processing
+# pipeline end-to-end.  ING-004 is meaningful from small upward where large-file
+# upload limits and ingress timeout behaviour are worth testing.
+_ING_004_SKIP_REASON = (
+    "ING-004 always generates large-profile NISE data regardless of PERF_PROFILE "
+    "— 50 MB takes 45-60 min of data generation, not appropriate for baseline."
+)
+_ING_004_SIZES: dict = {
+    "baseline": [pytest.param(50, id="50", marks=pytest.mark.skip(reason=_ING_004_SKIP_REASON))],
+    "small":    [50],
+    "medium":   [50, 100],
+    "large":    [50, 100],
+}
+ING_004_SIZES = _ING_004_SIZES.get(_ACTIVE_PROFILE, _ING_004_SIZES["large"])
+
+# ING-006: processing-window validation profile.
+# Skipped for baseline.  The original 30-min observation was partly monitoring
+# overhead (wait_for_summary_tables on downstream tables), but even with the fixed
+# wait_for_processing_complete (completed_datetime gate) the test still takes 20+
+# minutes at baseline: NISE generates 6-hour windows of OCP metrics twice, and that
+# local data-generation cost is real regardless of how fast the pipeline processes
+# it.  ING-001 already validates the upload+processing path for baseline; ING-006
+# is meaningful from small upward where the SC-4 (6-hour window) SLA check is
+# worth the generation cost.
+_ING_006_SKIP_REASON = (
+    "ING-006 generates 6-hour NISE windows x2, taking 20+ min even for baseline "
+    "profile — SC-4 window validation is not meaningful at this data volume."
+)
+_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("small", "medium", "large") else "large"
+ING_006_PROFILES = (
+    [_ING_006_PROFILE]
+    if _ACTIVE_PROFILE != "baseline"
+    else [pytest.param("baseline", marks=pytest.mark.skip(reason=_ING_006_SKIP_REASON))]
+)
 
 
 # =============================================================================
@@ -248,7 +314,7 @@ class TestIngestionThroughput:
         return obtain_jwt_token(self._keycloak_config)
     
     @pytest.mark.timeout(1800)  # 30 min: generation + upload + summary table wait
-    @pytest.mark.parametrize("profile_name", ["baseline", "small"])
+    @pytest.mark.parametrize("profile_name", ING_001_PROFILES)
     def test_perf_ing_001_single_source_baseline(
         self,
         profile_name: str,
@@ -315,44 +381,35 @@ class TestIngestionThroughput:
                 profile_name=profile_name,
             )
         
-        # Wait for processing
         with perf_timer.measure("processing_wait"):
-            schema = wait_for_summary_tables(
+            proc = wait_for_processing_complete(
                 self.namespace,
                 database_config.pod_name,
                 cluster_id,
-                timeout=900,
-                interval=30,
+                max_wait_seconds=1500,  # test timeout=1800; leave headroom for registration+upload
             )
-        
+
         # Capture listener CPU at end
         listener_cpu = get_listener_cpu_usage(self.namespace)
-        
-        # Record metrics
+
         perf_result.metrics = {
             "profile": profile_name,
             "upload": upload_result,
             "listener_cpu_cores": listener_cpu,
-            "processing_completed": schema is not None,
+            "processing_completed": proc["complete"],
+            "schema_name": proc.get("schema_name"),
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = schema is not None
-        
-        if not schema:
+        perf_result.passed = proc["complete"]
+
+        if not proc["complete"]:
             perf_result.error_message = "Processing did not complete within timeout"
-        
+
         perf_collector.add_result(perf_result)
         
-        assert schema is not None, "Data processing did not complete"
+        assert proc["complete"], "Data processing did not complete"
 
-    @pytest.mark.parametrize(
-        "data_days,timeout_seconds",
-        [
-            pytest.param(30, 600, id="30-days"),
-            pytest.param(60, 900, id="60-days"),
-            pytest.param(90, 1200, id="90-days"),
-        ],
-    )
+    @pytest.mark.parametrize("data_days,timeout_seconds", ING_002_PARAMS)
     @pytest.mark.timeout(1800)  # 30 min ceiling — well above the 1200s max variant
     def test_perf_ing_002_single_source_burst(
         self,
@@ -442,30 +499,21 @@ class TestIngestionThroughput:
             perf_collector.add_result(perf_result)
             pytest.fail(f"{data_days}-day data upload exceeded {timeout_seconds}s timeout")
         
-        # Calculate remaining time for processing
-        remaining_time = max(60, test_deadline - time.time())
-        
-        # Monitor processing with CPU sampling
+        # Monitor processing; sample CPU on each poll cycle.
         with perf_timer.measure("processing_wait"):
-            start_wait = time.time()
-            schema = None
-            
-            while time.time() - start_wait < remaining_time:
-                schema = wait_for_summary_tables(
-                    self.namespace,
-                    database_config.pod_name,
-                    cluster_id,
-                    timeout=60,
-                    interval=30,
-                )
-                
-                # Sample CPU
+            def _sample_cpu():
                 cpu = get_listener_cpu_usage(self.namespace)
                 if cpu:
                     cpu_samples.append(cpu)
-                
-                if schema:
-                    break
+
+            proc = wait_for_processing_complete(
+                self.namespace,
+                database_config.pod_name,
+                cluster_id,
+                max_wait_seconds=1500,  # test timeout=1800; leave headroom for upload+registration
+                on_poll=_sample_cpu,
+            )
+        schema = proc.get("schema_name")
         
         # Calculate metrics
         processing_time = perf_timer.get_timing("processing_wait")
@@ -482,14 +530,14 @@ class TestIngestionThroughput:
             "avg_cpu_cores": sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0,
             "max_cpu_cores": max(cpu_samples) if cpu_samples else 0,
             "processing_throughput_mb_s": round(throughput_mb_s, 4),
-            "processing_completed": schema is not None,
+            "processing_completed": proc["complete"],
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = schema is not None
+        perf_result.passed = proc["complete"]
         
         perf_collector.add_result(perf_result)
         
-        assert schema is not None, f"{data_days}-day data processing did not complete"
+        assert proc["complete"], f"{data_days}-day data processing did not complete"
 
     @pytest.mark.timeout(600)  # 10 minutes per concurrent upload test
     @pytest.mark.parametrize("concurrent_sources", [2, 5, 10])
@@ -515,8 +563,15 @@ class TestIngestionThroughput:
         - Time to complete all
         - Error rate
         """
-        # Cap workers so the test client doesn't become the bottleneck
+        # Cap workers so the test client doesn't become the bottleneck.
+        # If the cap clips the requested value, record both so results are not misleading.
+        requested_sources = concurrent_sources
         concurrent_sources = min(concurrent_sources, perf_config.concurrent_upload_max)
+        if concurrent_sources < requested_sources:
+            print(
+                f"\n[ING-003] PERF_CONCURRENT_UPLOADS_MAX={perf_config.concurrent_upload_max} "
+                f"capped requested {requested_sources} → {concurrent_sources} workers"
+            )
         
         ingress_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=ingress")
         if not ingress_pod:
@@ -583,18 +638,19 @@ class TestIngestionThroughput:
                     else:
                         upload_results.append(result)
         
-        # Wait for all to process
+        # Wait for all sources to process — each blocks until its manifest is done.
+        # Divide remaining budget evenly: 600s test - ~120s for uploads/registration.
+        per_source_max = max(60, 480 // max(concurrent_sources, 1))
         processed_count = 0
         with perf_timer.measure("processing_wait_all"):
             for source_info in sources:
-                schema = wait_for_summary_tables(
+                proc = wait_for_processing_complete(
                     self.namespace,
                     database_config.pod_name,
                     source_info["cluster_id"],
-                    timeout=600,
-                    interval=30,
+                    max_wait_seconds=per_source_max,
                 )
-                if schema:
+                if proc["complete"]:
                     processed_count += 1
         
         # Wait for all Celery work from this test to fully drain before completing.
@@ -608,6 +664,7 @@ class TestIngestionThroughput:
         )
 
         perf_result.metrics = {
+            "concurrent_sources_requested": requested_sources,
             "concurrent_sources": concurrent_sources,
             "successful_uploads": len(upload_results),
             "failed_uploads": len(errors),
@@ -626,7 +683,7 @@ class TestIngestionThroughput:
         assert processed_count == concurrent_sources, f"Only {processed_count}/{concurrent_sources} processed"
 
     @pytest.mark.timeout(3600)  # 60 minutes for large file upload test (generation + upload + processing)
-    @pytest.mark.parametrize("target_size_mb", [50, 100])
+    @pytest.mark.parametrize("target_size_mb", ING_004_SIZES)
     def test_perf_ing_004_large_file_upload(
         self,
         target_size_mb: int,
@@ -734,34 +791,25 @@ class TestIngestionThroughput:
         
         upload_throughput = package_size_mb / upload_seconds if upload_seconds > 0 else 0
         
-        # Wait for processing - large files need extended time
-        # Based on empirical data: ~67MB takes 20+ minutes to process
-        # Allow up to 45 minutes for processing large files
+        # Wait for manifest processing — no manual time ceiling; @pytest.mark.timeout guards.
         with perf_timer.measure("processing_wait"):
-            processing_start = time.time()
-            schema = None
-            max_wait = 2700  # 45 minutes for processing large files
-            
-            while time.time() - processing_start < max_wait:
-                schema = wait_for_summary_tables(
-                    self.namespace,
-                    database_config.pod_name,
-                    cluster_id,
-                    timeout=60,
-                    interval=30,
-                )
-                
-                # Sample CPU during processing
+            def _sample_cpu():
                 cpu = get_listener_cpu_usage(self.namespace)
                 if cpu:
                     cpu_samples.append(cpu)
-                
-                if schema:
-                    break
-        
-        processing_time = time.time() - processing_start
-        
-        # Capture final queue depths — key diagnostic for processing timeout failures
+
+            proc = wait_for_processing_complete(
+                self.namespace,
+                database_config.pod_name,
+                cluster_id,
+                max_wait_seconds=3300,  # test timeout=3600; leave headroom for generation+upload
+                on_poll=_sample_cpu,
+            )
+        schema = proc.get("schema_name")
+
+        processing_time = proc["elapsed_s"]
+
+        # Capture final queue depths — key diagnostic for stalled processing
         from .conftest import get_celery_queue_depths
         final_queue_depths = get_celery_queue_depths(cluster_config.namespace)
 
@@ -779,11 +827,11 @@ class TestIngestionThroughput:
             "cpu_samples": cpu_samples,
             "avg_cpu_cores": sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0,
             "max_cpu_cores": max(cpu_samples) if cpu_samples else 0,
-            "processing_completed": schema is not None,
+            "processing_completed": proc["complete"],
             "final_queue_depths": final_queue_depths,
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = schema is not None
+        perf_result.passed = proc["complete"]
         
         perf_collector.add_result(perf_result)
         
@@ -794,9 +842,9 @@ class TestIngestionThroughput:
         print(f"  Upload: {upload_seconds:.1f}s ({upload_throughput:.2f} MB/s)")
         print(f"  Processing: {processing_time:.1f}s")
         print(f"  Total: {upload_seconds + processing_time:.1f}s")
-        print(f"  Completed: {schema is not None}")
+        print(f"  Completed: {proc['complete']}")
         
-        assert schema is not None, f"Large file ({package_size_mb:.2f} MB) processing did not complete"
+        assert proc["complete"], f"Large file ({package_size_mb:.2f} MB) processing did not complete"
 
     @pytest.mark.timeout(1200)  # 20 minutes for high-frequency upload test
     def test_perf_ing_005_high_frequency_uploads(
@@ -909,6 +957,7 @@ class TestIngestionThroughput:
     def test_perf_ing_006_processing_window_validation(
         self,
         cluster_config: ClusterConfig,
+        ingress_url: str,
         database_config,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
@@ -1006,7 +1055,7 @@ class TestIngestionThroughput:
                             source.source_name if hasattr(source, 'source_name') else f"source-{i}",
                             data_start,
                             data_end,
-                            f"https://{cluster_config.gateway_route_host}/api/ingress/v1/upload",
+                            f"{ingress_url}/v1/upload",
                             jwt_token,
                             profile_name=profile_name,
                         )
@@ -1023,18 +1072,18 @@ class TestIngestionThroughput:
                             "error": str(e),
                         })
             
-            # Wait for processing to complete
+            # Wait for each manifest to fully process — 1 hour per source per upload cycle.
             with perf_timer.measure(f"processing_{upload_num + 1}"):
                 for source, cluster_id in zip(sources, cluster_ids):
                     try:
-                        wait_for_summary_tables(
+                        wait_for_processing_complete(
                             self.namespace,
                             database_config.pod_name,
                             cluster_id,
-                            timeout=1800,  # 30 min per source
+                            max_wait_seconds=3600,
                         )
                     except Exception as e:
-                        print(f"    Warning: Summary wait failed for {cluster_id}: {e}")
+                        print(f"    Warning: Processing wait failed for {cluster_id}: {e}")
             
             upload_elapsed = time.time() - upload_start
             successful = sum(1 for d in upload_details if d.get("success", False))

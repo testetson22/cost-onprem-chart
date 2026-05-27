@@ -196,47 +196,72 @@ query_prometheus_range() {
 }
 
 # Define metrics to collect
-declare -A METRICS=(
+# Metric names and their PromQL queries — parallel arrays for bash 3.2 compatibility.
+# (bash 3.2 is the default on macOS; declare -A requires bash 4+)
+METRIC_NAMES=(
     # API metrics
-    ["api_request_rate"]="sum(rate(http_requests_total{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m]))"
-    ["api_latency_p50"]="histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
-    ["api_latency_p95"]="histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
-    ["api_latency_p99"]="histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
-    ["api_error_rate"]="sum(rate(http_requests_total{namespace=\"${NAMESPACE}\", job=~\".*koku.*\", status=~\"5..\"}[5m]))"
-    
+    api_request_rate
+    api_latency_p50
+    api_latency_p95
+    api_latency_p99
+    api_error_rate
     # Celery/Processing metrics
-    ["celery_queue_depth_total"]="sum(celery_queue_length{namespace=\"${NAMESPACE}\"})"
-    ["celery_queue_depth_by_queue"]="celery_queue_length{namespace=\"${NAMESPACE}\"}"
-    ["celery_task_rate"]="sum(rate(celery_task_received_total{namespace=\"${NAMESPACE}\"}[5m]))"
-    ["celery_task_success_rate"]="sum(rate(celery_task_succeeded_total{namespace=\"${NAMESPACE}\"}[5m]))"
-    ["celery_task_failure_rate"]="sum(rate(celery_task_failed_total{namespace=\"${NAMESPACE}\"}[5m]))"
-    ["celery_task_duration_p95"]="histogram_quantile(0.95, sum(rate(celery_task_runtime_seconds_bucket{namespace=\"${NAMESPACE}\"}[5m])) by (le))"
-    
+    celery_queue_depth_total
+    celery_queue_depth_by_queue
+    celery_task_rate
+    celery_task_success_rate
+    celery_task_failure_rate
+    celery_task_duration_p95
     # Database metrics
-    ["pg_connections_active"]="pg_stat_activity_count{namespace=\"${NAMESPACE}\"}"
-    ["pg_connections_max"]="pg_settings_max_connections{namespace=\"${NAMESPACE}\"}"
-    ["pg_cache_hit_rate"]="pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} / (pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} + pg_stat_database_blks_read{namespace=\"${NAMESPACE}\", datname=\"koku\"} + 0.0001) * 100"
-    ["pg_database_size_bytes"]="pg_database_size_bytes{namespace=\"${NAMESPACE}\", datname=\"koku\"}"
-    ["pg_locks_exclusive"]="pg_locks_count{namespace=\"${NAMESPACE}\", mode=\"ExclusiveLock\"}"
-    
+    pg_connections_active
+    pg_connections_max
+    pg_cache_hit_rate
+    pg_database_size_bytes
+    pg_locks_exclusive
     # Valkey/Redis metrics
-    ["valkey_memory_used_bytes"]="redis_memory_used_bytes{namespace=\"${NAMESPACE}\"}"
-    ["valkey_connected_clients"]="redis_connected_clients{namespace=\"${NAMESPACE}\"}"
-    ["valkey_commands_per_sec"]="rate(redis_commands_processed_total{namespace=\"${NAMESPACE}\"}[5m])"
-    ["valkey_hit_rate"]="redis_keyspace_hits_total{namespace=\"${NAMESPACE}\"} / (redis_keyspace_hits_total{namespace=\"${NAMESPACE}\"} + redis_keyspace_misses_total{namespace=\"${NAMESPACE}\"} + 0.0001) * 100"
-    ["valkey_evictions"]="increase(redis_evicted_keys_total{namespace=\"${NAMESPACE}\"}[5m])"
-    
+    valkey_memory_used_bytes
+    valkey_connected_clients
+    valkey_commands_per_sec
+    valkey_hit_rate
+    valkey_evictions
     # ROS/Kruize metrics
-    ["kruize_heap_used_bytes"]="jvm_memory_used_bytes{namespace=\"${NAMESPACE}\", pod=~\".*kruize.*\", area=\"heap\"}"
-    ["kruize_experiments_total"]="kruize_experiments_total{namespace=\"${NAMESPACE}\"}"
-    
+    kruize_heap_used_bytes
+    kruize_experiments_total
     # Pod resource metrics
-    ["pod_cpu_usage"]="sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}[5m])) by (pod)"
-    ["pod_memory_usage_bytes"]="sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}) by (pod)"
-    
+    pod_cpu_usage
+    pod_memory_usage_bytes
     # Ingress metrics
-    ["ingress_upload_rate"]="sum(rate(ingress_uploads_total{namespace=\"${NAMESPACE}\"}[5m]))"
-    ["kafka_consumer_lag"]="sum(kafka_consumer_records_lag{namespace=\"${NAMESPACE}\"})"
+    ingress_upload_rate
+    kafka_consumer_lag
+)
+METRIC_QUERIES=(
+    "sum(rate(http_requests_total{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m]))"
+    "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
+    "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
+    "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
+    "sum(rate(http_requests_total{namespace=\"${NAMESPACE}\", job=~\".*koku.*\", status=~\"5..\"}[5m]))"
+    "sum(celery_queue_length{namespace=\"${NAMESPACE}\"})"
+    "celery_queue_length{namespace=\"${NAMESPACE}\"}"
+    "sum(rate(celery_task_received_total{namespace=\"${NAMESPACE}\"}[5m]))"
+    "sum(rate(celery_task_succeeded_total{namespace=\"${NAMESPACE}\"}[5m]))"
+    "sum(rate(celery_task_failed_total{namespace=\"${NAMESPACE}\"}[5m]))"
+    "histogram_quantile(0.95, sum(rate(celery_task_runtime_seconds_bucket{namespace=\"${NAMESPACE}\"}[5m])) by (le))"
+    "pg_stat_activity_count{namespace=\"${NAMESPACE}\"}"
+    "pg_settings_max_connections{namespace=\"${NAMESPACE}\"}"
+    "pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} / (pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} + pg_stat_database_blks_read{namespace=\"${NAMESPACE}\", datname=\"koku\"} + 0.0001) * 100"
+    "pg_database_size_bytes{namespace=\"${NAMESPACE}\", datname=\"koku\"}"
+    "pg_locks_count{namespace=\"${NAMESPACE}\", mode=\"ExclusiveLock\"}"
+    "redis_memory_used_bytes{namespace=\"${NAMESPACE}\"}"
+    "redis_connected_clients{namespace=\"${NAMESPACE}\"}"
+    "rate(redis_commands_processed_total{namespace=\"${NAMESPACE}\"}[5m])"
+    "redis_keyspace_hits_total{namespace=\"${NAMESPACE}\"} / (redis_keyspace_hits_total{namespace=\"${NAMESPACE}\"} + redis_keyspace_misses_total{namespace=\"${NAMESPACE}\"} + 0.0001) * 100"
+    "increase(redis_evicted_keys_total{namespace=\"${NAMESPACE}\"}[5m])"
+    "jvm_memory_used_bytes{namespace=\"${NAMESPACE}\", pod=~\".*kruize.*\", area=\"heap\"}"
+    "kruize_experiments_total{namespace=\"${NAMESPACE}\"}"
+    "sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}[5m])) by (pod)"
+    "sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}) by (pod)"
+    "sum(rate(ingress_uploads_total{namespace=\"${NAMESPACE}\"}[5m]))"
+    "sum(kafka_consumer_records_lag{namespace=\"${NAMESPACE}\"})"
 )
 
 # Collect all metrics and save to JSON
@@ -259,8 +284,10 @@ collect_metrics_snapshot() {
     json_output+='"metrics": {'
     
     local first=true
-    for metric_name in "${!METRICS[@]}"; do
-        local query="${METRICS[$metric_name]}"
+    local i
+    for i in "${!METRIC_NAMES[@]}"; do
+        local metric_name="${METRIC_NAMES[$i]}"
+        local query="${METRIC_QUERIES[$i]}"
         local result
         result=$(query_prometheus "$query")
         
@@ -308,8 +335,10 @@ collect_metrics_range() {
     json_output+='"metrics": {'
     
     local first=true
-    for metric_name in "${!METRICS[@]}"; do
-        local query="${METRICS[$metric_name]}"
+    local i
+    for i in "${!METRIC_NAMES[@]}"; do
+        local metric_name="${METRIC_NAMES[$i]}"
+        local query="${METRIC_QUERIES[$i]}"
         local result
         result=$(query_prometheus_range "$query" "$start_time" "$end_time" "$step")
         

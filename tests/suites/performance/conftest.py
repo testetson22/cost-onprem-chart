@@ -92,9 +92,12 @@ class PerfTestConfig:
         default_factory=lambda: float(os.environ.get("PERF_MEMORY_GROWTH_MAX", "5.0"))
     )
     
-    # Concurrent upload settings
+    # Concurrent upload settings.
+    # Should be >= the highest ING-003 parametrize value (currently 10) so that
+    # test variants are not silently collapsed.  Override downward on resource-
+    # constrained machines via PERF_CONCURRENT_UPLOADS_MAX.
     concurrent_upload_max: int = field(
-        default_factory=lambda: int(os.environ.get("PERF_CONCURRENT_UPLOADS_MAX", "5"))
+        default_factory=lambda: int(os.environ.get("PERF_CONCURRENT_UPLOADS_MAX", "10"))
     )
 
 
@@ -115,7 +118,7 @@ def _create_perf_config() -> PerfTestConfig:
         timeout_kruize_experiments=int(os.environ.get("PERF_TIMEOUT_KRUIZE", "300")),
         timeout_kruize_recommendations=int(os.environ.get("PERF_TIMEOUT_RECOMMENDATIONS", "600")),
         memory_growth_daily_percent_max=float(os.environ.get("PERF_MEMORY_GROWTH_MAX", "5.0")),
-        concurrent_upload_max=int(os.environ.get("PERF_CONCURRENT_UPLOADS_MAX", "5")),
+        concurrent_upload_max=int(os.environ.get("PERF_CONCURRENT_UPLOADS_MAX", "10")),
     )
 
 

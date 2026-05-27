@@ -162,6 +162,56 @@ def infer_profile(run_id: str, metadata: Optional[dict]) -> str:
     return "baseline"
 
 
+def load_session(run_dir: Path) -> Optional[dict]:
+    """Load session_*.json — the aggregated results file written by the perf collector."""
+    for sf in sorted((run_dir / "results").glob("session_*.json")):
+        try:
+            return json.loads(sf.read_text())
+        except Exception:
+            pass
+    return None
+
+
+def extract_perf_summary(session: dict) -> list[dict]:
+    """Pull key per-test metrics out of the session results list."""
+    rows = []
+    for r in session.get("results", []):
+        name    = r.get("test_name", "")
+        passed  = r.get("passed", False)
+        err_msg = r.get("error_message") or ""
+        m       = r.get("metrics", {}) or {}
+        timings = {t["name"]: t["duration_seconds"] for t in r.get("timings", [])}
+
+        # Derive the most useful metrics per test type
+        highlights = {}
+        if "upload_throughput_mb_s" in m:
+            highlights["throughput"] = f'{m["upload_throughput_mb_s"]:.2f} MB/s'
+        if "actual_size_mb" in m:
+            highlights["size"] = f'{m["actual_size_mb"]:.1f} MB'
+        if "processing_time_seconds" in m:
+            highlights["proc"] = f'{m["processing_time_seconds"]/60:.1f} min'
+        if "total_upload_mb" in m:
+            highlights["total_mb"] = f'{m["total_upload_mb"]:.1f} MB'
+        if "concurrent_sources" in m:
+            highlights["concurrent"] = str(m["concurrent_sources"])
+        if "total_elapsed_hours" in m:
+            highlights["elapsed"] = f'{m["total_elapsed_hours"]:.2f} hr'
+            highlights["window_ok"] = "✅" if m.get("within_window") else "❌"
+        # Upload throughput from timings
+        up_s = timings.get("concurrent_uploads") or timings.get("data_generation_and_upload")
+        if up_s and "total_upload_mb" in m and m["total_upload_mb"] > 0:
+            highlights["throughput"] = f'{m["total_upload_mb"] / up_s:.2f} MB/s'
+
+        rows.append({
+            "name":       name,
+            "passed":     passed,
+            "error":      err_msg[:100] if err_msg else "",
+            "highlights": highlights,
+            "timings":    {k: round(v, 1) for k, v in timings.items()},
+        })
+    return rows
+
+
 def load_runs(runs_dir: Path) -> list[dict]:
     runs = []
     if not runs_dir.exists():
@@ -172,46 +222,48 @@ def load_runs(runs_dir: Path) -> list[dict]:
         metadata = load_metadata(run_dir)
         junit    = parse_junit(run_dir)
         metrics  = parse_metrics_summary(run_dir)
+        session  = load_session(run_dir)
 
         profile    = infer_profile(run_dir.name, metadata)
         cpu_label  = infer_cpu_label(run_dir.name, metadata)
 
-        # Gather key ingestion metrics from perf test output if available
-        ingestion_metrics = {}
-        for rf in sorted((run_dir / "results").glob("perf-results*.json")):
-            try:
-                data = json.loads(rf.read_text())
-                for test in data.get("results", []):
-                    timings = test.get("timings", {})
-                    if "upload_seconds" in timings:
-                        pkg_mb  = test.get("metrics", {}).get("package_size_mb", 0)
-                        up_s    = timings.get("upload_seconds", 0)
-                        proc_s  = timings.get("processing_seconds", timings.get("processing_wait", 0))
-                        ingestion_metrics[test.get("test_id", rf.name)] = {
-                            "package_mb":       round(pkg_mb, 1),
-                            "upload_s":         round(up_s, 1),
-                            "throughput_mbs":   round(pkg_mb / up_s, 2) if up_s > 0 else 0,
-                            "processing_s":     round(proc_s, 1),
-                        }
-            except Exception:
-                pass
+        perf_summary = extract_perf_summary(session) if session else []
+
+        # Build result file links (relative to runs_dir)
+        result_links = []
+        for rf in sorted((run_dir / "results").glob("*.json")):
+            if rf.name.startswith("session_"):
+                continue
+            result_links.append({
+                "name": rf.stem[:60],
+                "path": str(rf.relative_to(runs_dir)),
+            })
 
         html_report = None
-        for hp in sorted((run_dir / "reports").glob("*.html")):
-            # Path relative to runs_dir so links work from perf-matrix-report.html
-            html_report = str(hp.relative_to(runs_dir))
-            break
+        # Prefer the visual perf-run-report.html over the generic pytest report
+        report_priority = ["perf-run-report.html", "report.html"]
+        reports_dir = run_dir / "reports"
+        for preferred in report_priority:
+            hp = reports_dir / preferred
+            if hp.exists():
+                html_report = str(hp.relative_to(runs_dir))
+                break
+        if html_report is None:
+            for hp in sorted(reports_dir.glob("*.html")):
+                html_report = str(hp.relative_to(runs_dir))
+                break
 
         runs.append({
-            "run_id":            run_dir.name,
-            "run_dir":           run_dir,
-            "profile":           profile,
-            "cpu_label":         cpu_label,
-            "metadata":          metadata or {},
-            "junit":             junit,
-            "metrics_summary":   metrics,
-            "ingestion_metrics": ingestion_metrics,
-            "html_report":       html_report,
+            "run_id":        run_dir.name,
+            "run_dir":       run_dir,
+            "profile":       profile,
+            "cpu_label":     cpu_label,
+            "metadata":      metadata or {},
+            "junit":         junit,
+            "metrics_summary": metrics,
+            "perf_summary":  perf_summary,
+            "result_links":  result_links,
+            "html_report":   html_report,
         })
     return runs
 
@@ -268,25 +320,35 @@ def run_summary_html(run: dict) -> str:
         if failed > 0:
             lines.append(f'<div class="result-fail">{failed} failed, {skipped} skipped</div>')
 
-    # Ingestion metrics
-    ing = run["ingestion_metrics"]
-    if ing:
-        lines.append('<div class="metrics-block">')
-        for test_id, m in list(ing.items())[:3]:
-            lines.append(
-                f'<div class="metric-row"><span class="metric-label">{test_id}</span>'
-                f'<span class="metric-val">'
-                f'{m["package_mb"]} MB · {m["throughput_mbs"]} MB/s · proc {m["processing_s"]}s'
-                f'</span></div>'
-            )
-        lines.append('</div>')
+    # Key perf highlights from session (top 3 interesting tests)
+    perf = run.get("perf_summary", [])
+    if perf:
+        ing_rows = [r for r in perf if "ing" in r["name"].lower() and r.get("highlights")][:3]
+        if ing_rows:
+            lines.append('<div class="metrics-block">')
+            for r in ing_rows:
+                icon = "✅" if r["passed"] else "❌"
+                h = r["highlights"]
+                bits = []
+                if "throughput" in h: bits.append(h["throughput"])
+                if "proc" in h:       bits.append(f'proc {h["proc"]}')
+                if "size" in h:       bits.append(h["size"])
+                if "window_ok" in h:  bits.append(f'6h {h["window_ok"]}')
+                short_name = r["name"].replace("test_perf_", "").replace("_baseline", "")[:40]
+                lines.append(
+                    f'<div class="metric-row">'
+                    f'<span class="metric-label">{icon} {short_name}</span>'
+                    f'<span class="metric-val">{" · ".join(bits)}</span>'
+                    f'</div>'
+                )
+            lines.append('</div>')
 
     # Links
     links = []
     if run["html_report"]:
         links.append(f'<a href="{run["html_report"]}">📊 report</a>')
-    if (run["run_dir"] / "metrics").exists():
-        links.append(f'<a href="{run["run_id"]}/metrics/">📈 metrics</a>')
+    anchor = run["run_id"].replace("[", "").replace("]", "").replace(".", "-")
+    links.append(f'<a href="#{anchor}">📋 results</a>')
     if links:
         lines.append('<div class="cell-links">' + " &nbsp;|&nbsp; ".join(links) + '</div>')
 
@@ -344,6 +406,77 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
         rows_html.append(f'<tr>{row_label}{"".join(cells)}</tr>')
 
     rows = "\n".join(rows_html)
+
+    # Per-run performance detail sections
+    detail_sections = []
+    for run in sorted(runs, key=lambda r: r["run_id"]):
+        perf = run.get("perf_summary", [])
+        result_links = run.get("result_links", [])
+        if not perf and not result_links:
+            continue
+        anchor = run["run_id"].replace("[", "").replace("]", "").replace(".", "-")
+        cpu_c  = CPU_BY_LABEL.get(run["cpu_label"], {})
+        cpu_color = cpu_c.get("color", "#666")
+
+        # Build results table rows
+        table_rows = []
+        for r in perf:
+            icon = "✅" if r["passed"] else "❌"
+            h    = r["highlights"]
+            bits = []
+            if "throughput" in h: bits.append(f'<b>{h["throughput"]}</b>')
+            if "size" in h:       bits.append(h["size"])
+            if "proc" in h:       bits.append(f'proc {h["proc"]}')
+            if "concurrent" in h: bits.append(f'{h["concurrent"]} concurrent')
+            if "elapsed" in h:    bits.append(f'{h["elapsed"]}')
+            if "window_ok" in h:  bits.append(f'6h window {h["window_ok"]}')
+            top_timing = sorted(r["timings"].items(), key=lambda x: x[1], reverse=True)[:2]
+            timing_str = ", ".join(f'{k}: {v}s' for k, v in top_timing)
+            err_td = f'<span style="color:#e74c3c;font-size:10px">{r["error"]}</span>' if r["error"] else ""
+            short = r["name"].replace("test_perf_", "").replace("_baseline", "")
+            # find matching result JSON link
+            result_href = next((l["path"] for l in result_links if short[:30] in l["name"]), "")
+            name_cell = f'<a href="{result_href}">{short}</a>' if result_href else short
+            table_rows.append(
+                f'<tr>'
+                f'<td>{icon} {name_cell}</td>'
+                f'<td>{"&nbsp;·&nbsp;".join(bits)}</td>'
+                f'<td style="font-size:10px;color:#666">{timing_str}</td>'
+                f'<td>{err_td}</td>'
+                f'</tr>'
+            )
+
+        table_html = ""
+        if table_rows:
+            table_html = f"""
+<table class="detail-table">
+  <thead><tr><th>Test</th><th>Key Metrics</th><th>Timings</th><th>Error</th></tr></thead>
+  <tbody>{"".join(table_rows)}</tbody>
+</table>"""
+
+        meta = run["metadata"]
+        cluster = meta.get("cluster_info", {})
+        cluster_info = (
+            f'OCP {cluster.get("ocp_version","?")} · '
+            f'{cluster.get("node_count","?")} nodes · '
+            f'{cluster.get("storage_type","?")} storage'
+        ) if cluster else ""
+
+        detail_sections.append(f"""
+<div class="detail-section" id="{anchor}">
+  <div class="detail-header" style="border-left:4px solid {cpu_color}">
+    <span class="detail-run-id">{run["run_id"]}</span>
+    <span class="detail-tags">
+      <span class="tag" style="background:{cpu_color}">{run["cpu_label"]}</span>
+      <span class="tag tag-profile">{run["profile"]}</span>
+    </span>
+    {f'<span class="detail-cluster">{cluster_info}</span>' if cluster_info else ""}
+    {f'<a href="{run["html_report"]}" class="detail-report-link">📊 full report</a>' if run["html_report"] else ""}
+  </div>
+  {table_html}
+</div>""")
+
+    perf_detail_sections = "\n".join(detail_sections) if detail_sections else ""
 
     # Run index sidebar
     run_list_items = ""
@@ -437,6 +570,18 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
   .metric-val {{ font-family: monospace; font-size: 10px; text-align: right; }}
   .cell-links {{ margin-top: 5px; font-size: 11px; border-top: 1px solid #eee; padding-top: 4px; }}
 
+  /* Detail sections */
+  .detail-section {{ margin-top: 28px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }}
+  .detail-header {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #f7f9fc; flex-wrap: wrap; }}
+  .detail-run-id {{ font-family: monospace; font-size: 12px; font-weight: 600; flex: 1; }}
+  .detail-cluster {{ font-size: 11px; color: var(--muted); }}
+  .detail-report-link {{ font-size: 11px; margin-left: auto; }}
+  .detail-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  .detail-table th {{ background: #eef2f7; text-align: left; padding: 6px 10px; font-size: 11px; font-weight: 600; border-bottom: 1px solid var(--border); }}
+  .detail-table td {{ padding: 6px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }}
+  .detail-table tr:last-child td {{ border-bottom: none; }}
+  .detail-table tr:hover td {{ background: #f9fbfd; }}
+
   /* Sidebar */
   .sidebar h2 {{ font-size: 13px; font-weight: 700; margin-bottom: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }}
   .sidebar ul {{ list-style: none; }}
@@ -508,9 +653,11 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
 
     <p style="margin-top:16px; font-size:11px; color:var(--muted);">
       Each cell represents one or more test runs at that CPU config × load profile combination.
-      Click report links for full pytest-html output. Metrics links open the raw JSON snapshot directory.
-      Add a run by re-executing with the appropriate <code>--listener-cpu</code> and <code>--perf-profile</code> flags.
+      Click <em>report</em> for full pytest-html output · <em>results</em> to jump to the detail table below.
     </p>
+
+    <!-- Per-run performance detail tables -->
+    {perf_detail_sections}
   </main>
 </div>
 </body>

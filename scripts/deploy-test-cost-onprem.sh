@@ -37,7 +37,9 @@ set -euo pipefail
 #   Test options:
 #   --iqe-marker EXPR         Pytest marker for IQE tests (default: cost_ocp_on_prem)
 #   --iqe-profile PROFILE     IQE test profile: smoke, extended, stable, full (default: stable)
-#   --listener-cpu LIMIT      Temporarily set listener CPU limit (e.g., 500m, 1000m, or 'max')
+#   --listener-cpu LIMIT      Temporarily set listener CPU limit (e.g., 500m, 1000m, 'max', or 'none' to disable).
+#                             Defaults to 'max' for --run-perf / --perf-only runs because the listener
+#                             is the principal processing bottleneck and 300m throttles all ingestion tests.
 #   --include-ui              Include UI tests (requires Playwright system dependencies)
 #   --run-perf                Run performance tests after deployment (FLPATH-4036)
 #   --perf-profile PROFILE    Performance profile: baseline, small, medium, large (default: baseline)
@@ -867,8 +869,8 @@ calculate_max_listener_cpu() {
 validate_cpu_limit() {
     local cpu_limit="$1"
     
-    # Special case: "max" means calculate maximum available
-    if [[ "${cpu_limit}" == "max" ]]; then
+    # Special cases
+    if [[ "${cpu_limit}" == "max" ]] || [[ "${cpu_limit}" == "none" ]]; then
         return 0
     fi
     
@@ -1147,6 +1149,14 @@ upload_perf_results_to_s3() {
     # Generate metadata.json with test run context
     generate_metadata_json
 
+    # Generate flat perf-summary.json for Grafana Infinity datasource queries
+    local summary_script="$(dirname "${BASH_SOURCE[0]}")/observability/generate-perf-summary.py"
+    if [[ -f "${summary_script}" ]] && command -v python3 &>/dev/null; then
+        python3 "${summary_script}" --run-dir "${test_run_dir}" 2>/dev/null \
+            && log_info "Generated perf-summary.json" \
+            || log_warning "Could not generate perf-summary.json (non-fatal)"
+    fi
+
     # Upload entire directory recursively
     local s3_prefix="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}"
     local endpoint_arg=""
@@ -1178,6 +1188,14 @@ upload_perf_results_to_s3() {
     fi
 
     log_success "Uploaded to s3://${S3_BUCKET}/${s3_prefix}/"
+
+    # Update the bucket-level index.json so Grafana can list all runs
+    if [[ -f "${summary_script}" ]] && command -v python3 &>/dev/null; then
+        S3_ENDPOINT="${S3_ENDPOINT:-}" S3_BUCKET="${S3_BUCKET}" \
+        S3_PREFIX="${S3_PREFIX:-cost-onprem-performance}" \
+        python3 "${summary_script}" --run-dir "${test_run_dir}" --update-index 2>/dev/null \
+            || log_warning "Could not update bucket index.json (non-fatal)"
+    fi
 }
 
 generate_metadata_json() {
@@ -1255,6 +1273,35 @@ run_performance_tests() {
     # Export performance profile for tests
     export PERF_PROFILE="${PERF_PROFILE}"
 
+    # Listener CPU boost — always applied for perf tests unless explicitly disabled.
+    # The listener is the principal processing bottleneck: at the chart default (300m)
+    # it throttles every ingestion test, producing results that measure the CPU cap
+    # rather than actual pipeline throughput.  This matches the behaviour of chart
+    # tests and IQE plugin tests, both of which complete significantly faster with
+    # --listener-cpu max.  Pass --listener-cpu none to skip the boost intentionally.
+    local perf_listener_cpu="${LISTENER_CPU_LIMIT:-max}"
+    if [[ "${perf_listener_cpu}" != "none" ]] && [[ "${CPU_BOOST_APPLIED:-false}" != "true" ]]; then
+        local effective_cpu_limit="${perf_listener_cpu}"
+        if [[ "${perf_listener_cpu}" == "max" ]]; then
+            calculate_max_listener_cpu
+            effective_cpu_limit="${MAX_LISTENER_CPU}m"
+            log_info "Listener CPU boost: calculated max = ${effective_cpu_limit}"
+        fi
+        if validate_cpu_limit "${effective_cpu_limit}"; then
+            log_step "Boosting listener CPU to ${effective_cpu_limit} for performance tests"
+            if set_listener_cpu "${effective_cpu_limit}"; then
+                CPU_BOOST_APPLIED=true
+                log_success "Listener CPU boosted to ${effective_cpu_limit} (was ${ORIGINAL_LISTENER_CPU_LIMIT})"
+            else
+                log_warning "Could not boost listener CPU — results may reflect the 300m throttle"
+            fi
+        fi
+    elif [[ "${CPU_BOOST_APPLIED:-false}" == "true" ]]; then
+        log_info "Listener CPU already boosted by run_tests() — skipping duplicate boost"
+    else
+        log_warning "Listener CPU boost disabled (--listener-cpu none) — results will reflect chart defaults"
+    fi
+
     # Start metrics collection if requested (also sets up unified output dir)
     start_metrics_collection
 
@@ -1294,6 +1341,41 @@ run_performance_tests() {
     # Stop metrics collection and upload if requested
     stop_metrics_collection
     upload_perf_results_to_s3
+
+    # Generate visual run report if we have a structured output directory
+    if [[ -n "${TEST_RUN_ID:-}" ]]; then
+        local run_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}"
+        local scripts_dir="$(dirname "${BASH_SOURCE[0]}")/observability"
+
+        local run_report_script="${scripts_dir}/generate-perf-run-report.py"
+        if [[ -f "${run_report_script}" ]] && command -v python3 &>/dev/null; then
+            log_info "Generating visual run report..."
+            if python3 "${run_report_script}" --run-dir "${run_dir}" 2>/dev/null; then
+                log_success "Visual report: ${run_dir}/reports/perf-run-report.html"
+            else
+                log_warning "Could not generate visual run report (non-fatal)"
+            fi
+        fi
+
+        # Link Grafana dashboard if available (non-fatal if cluster is down or Grafana not deployed)
+        local grafana_script="${scripts_dir}/push-grafana-snapshot.py"
+        if [[ -f "${grafana_script}" ]] && command -v python3 &>/dev/null; then
+            log_info "Linking Grafana dashboard (if cluster is up)..."
+            if python3 "${grafana_script}" \
+                --run-dir "${run_dir}" \
+                ${GRAFANA_URL:+--grafana-url "${GRAFANA_URL}"} \
+                ${GRAFANA_USER:+--grafana-user "${GRAFANA_USER}"} \
+                ${GRAFANA_PASSWORD:+--grafana-pass "${GRAFANA_PASSWORD}"} \
+                --namespace "${GRAFANA_NAMESPACE:-grafana}" 2>/dev/null; then
+                local links_file="${run_dir}/reports/grafana-links.json"
+                if [[ -f "${links_file}" ]]; then
+                    local snap_url
+                    snap_url=$(python3 -c "import json; d=json.load(open('${links_file}')); print(d.get('snapshot_url',''))" 2>/dev/null)
+                    [[ -n "${snap_url}" ]] && log_success "Grafana snapshot: ${snap_url}"
+                fi
+            fi
+        fi
+    fi
 
     return ${test_result}
 }
