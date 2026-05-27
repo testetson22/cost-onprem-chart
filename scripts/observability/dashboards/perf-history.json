@@ -1,5 +1,5 @@
 {
-  "uid": "cost-onprem-minio-runs",
+  "uid": "cost-onprem-perf-history",
   "title": "Cost On-Prem: Historical Perf Runs (MinIO)",
   "description": "Reads perf-summary.json files from the MinIO/S3 bucket. Requires the Infinity datasource plugin (yesoreyeram-infinity-datasource) configured with MinIO credentials. No live cluster needed.",
   "schemaVersion": 39,

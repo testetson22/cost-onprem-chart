@@ -229,7 +229,7 @@ Test Run
 
 Persistent Grafana (any instance, any location)
   └── Infinity datasource  →  MinIO HTTP
-        └── dashboards/minio-runs.json
+        └── dashboards/perf-history.json
               ├── Run selector (from index.json)
               ├── KPI stat panels
               ├── All test results table
@@ -251,7 +251,7 @@ AWS_SECRET_ACCESS_KEY=<minio-secret> \
 ```
 
 The Infinity datasource is provisioned automatically with MinIO credentials.
-The `minio-runs.json` dashboard is loaded from the dashboards ConfigMap.
+The `perf-history.json` dashboard is loaded from the dashboards ConfigMap.
 
 **2. Import manually** (existing Grafana):
 
@@ -260,7 +260,7 @@ Grafana → Administration → Plugins → search "Infinity" → Install
 Grafana → Connections → Add datasource → Infinity
   → Set allowed hosts: https://minio-s3-...
   → Set auth: Basic Auth with MinIO access key/secret
-Grafana → Dashboards → Import → upload dashboards/minio-runs.json
+Grafana → Dashboards → Import → upload dashboards/perf-history.json
 ```
 
 **3. What gets uploaded automatically:**
@@ -297,7 +297,7 @@ python3 scripts/observability/generate-perf-summary.py \
   --update-index
 ```
 
-### Dashboard: `dashboards/minio-runs.json`
+### Dashboard: `dashboards/perf-history.json`
 
 | Panel | Query |
 |-------|-------|
