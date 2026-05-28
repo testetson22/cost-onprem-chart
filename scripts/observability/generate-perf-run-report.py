@@ -74,6 +74,10 @@ KPI_THRESHOLDS: dict[str, list[dict]] = {
     "ing_001": [
         {"label": "Processing done", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
     ],
+    "ing_002": [
+        {"label": "Processing done", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
+        {"label": "Throughput",      "metric": "processing_throughput_mb_s", "op": ">", "green": 0.1, "yellow": 0.05, "unit": "MB/s"},
+    ],
     "ing_003": [
         {"label": "All processed", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
     ],
@@ -88,28 +92,48 @@ KPI_THRESHOLDS: dict[str, list[dict]] = {
     ],
     # --- ROS ---
     "ros_001": [
-        {"label": "Experiments",      "metric": "experiment_count",        "op": ">", "green": 1, "yellow": 1, "unit": ""},
+        {"label": "Experiments",      "metric": "experiment_count",        "op": ">=", "green": 1, "yellow": 1, "unit": ""},
         {"label": "E2E time",         "metric": "total_e2e_time_sec",     "op": "<", "green": 120, "yellow": 300, "unit": "s"},
     ],
     "ros_002": [
         {"label": "Experiments (90%)", "metric": "experiment_count",       "op": ">", "green": 45, "yellow": 25, "unit": ""},
     ],
+    "ros_003": [
+        {"label": "Refresh done",     "metric": "refresh_complete",        "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
+        {"label": "Speedup ratio",    "metric": "speedup_ratio",          "op": ">=", "green": 1.0, "yellow": 0.5, "unit": "x"},
+    ],
     "ros_004": [
         {"label": "Experiments (80%)", "metric": "experiment_count",       "op": ">", "green": 80, "yellow": 50, "unit": ""},
     ],
     # --- Scale ---
+    "scale_001": [
+        {"label": "Sources created",  "metric": "sources_created",        "op": ">=", "green": 5, "yellow": 3, "unit": ""},
+    ],
     "scale_002": [
         {"label": "API P95 at ramp",  "metric": "final_p95_latency",     "op": "<", "green": 2.0, "yellow": 5.0, "unit": "s"},
+    ],
+    "scale_003": [
+        {"label": "All queries OK",   "metric": "all_queries_passed",    "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
     ],
     "scale_004": [
         {"label": "Success rate",     "metric": "success_rate",           "op": ">", "green": 0.95, "yellow": 0.90, "unit": "%"},
     ],
     "scale_005": [
-        {"label": "P95 latency",      "metric": "p95_latency",           "op": "<", "green": 2.0, "yellow": 3.0, "unit": "s"},
+        {"label": "P95 latency",      "metric": "latencies.p95",         "op": "<", "green": 2.0, "yellow": 3.0, "unit": "s"},
     ],
     # --- Soak ---
+    "soak_001": [
+        {"label": "Zero restarts",    "metric": "pod_restart_count",     "op": "==", "green": 0, "yellow": 0, "unit": ""},
+        {"label": "Upload failures",  "metric": "uploads_failed",        "op": "==", "green": 0, "yellow": 0, "unit": ""},
+    ],
     "soak_002": [
-        {"label": "Memory growth/day", "metric": "max_daily_growth_pct", "op": "<", "green": 2.0, "yellow": 5.0, "unit": "%"},
+        {"label": "No leak detected", "metric": "leak_detected",         "op": "==", "green": 0, "yellow": 0, "unit": "bool"},
+    ],
+    "soak_003": [
+        {"label": "No warnings",      "metric": "warning_count",         "op": "==", "green": 0, "yellow": 0, "unit": ""},
+    ],
+    "soak_004": [
+        {"label": "No concerns",      "metric": "concern_count",         "op": "==", "green": 0, "yellow": 0, "unit": ""},
     ],
 }
 
@@ -153,8 +177,12 @@ def evaluate_kpis(result: dict) -> list[dict]:
 
             if op == "<":
                 status = "green" if val < g else ("yellow" if val < y else "red")
+            elif op == "<=":
+                status = "green" if val <= g else ("yellow" if val <= y else "red")
             elif op == ">":
                 status = "green" if val > g else ("yellow" if val > y else "red")
+            elif op == ">=":
+                status = "green" if val >= g else ("yellow" if val >= y else "red")
             elif op == "==":
                 status = "green" if val == g else "red"
             else:
@@ -162,6 +190,8 @@ def evaluate_kpis(result: dict) -> list[dict]:
 
             evaluations.append({
                 "label": check["label"],
+                "metric": check["metric"],
+                "op": op,
                 "value": val,
                 "unit": check["unit"],
                 "status": status,
@@ -181,9 +211,24 @@ def aggregate_kpi_status(all_evaluations: list[dict]) -> str:
     return "green"
 
 
-def _kpi_status_icon(status: str) -> str:
+def _kpi_status_icon(status: str, kpi: dict | None = None) -> str:
+    """Generate a KPI status dot with optional hover tooltip."""
     icons = {"green": "&#9679;", "yellow": "&#9679;", "red": "&#9679;"}
-    return f'<span style="color:var(--kpi-{status});font-size:16px;vertical-align:middle;">{icons.get(status, "")}</span>'
+    
+    tooltip = ""
+    if kpi:
+        label = kpi.get("label", "")
+        val = kpi.get("value")
+        val_str = f'{val:.3f}' if isinstance(val, float) else str(val)
+        unit = kpi.get("unit", "")
+        op = kpi.get("op", "<")
+        green = kpi.get("green", "?")
+        op_txt = {"<": "<", ">": ">", "==": "=", ">=": "≥", "<=": "≤"}.get(op, op)
+        tooltip = f'{label}: {val_str}{unit} (need {op_txt}{green} for green)'
+        tooltip = tooltip.replace('"', '&quot;')
+    
+    title_attr = f'title="{tooltip}"' if tooltip else ""
+    return f'<span {title_attr} style="color:var(--kpi-{status});font-size:16px;vertical-align:middle;cursor:help;">{icons.get(status, "")}</span>'
 
 
 def _build_resource_summary_html(rs: dict) -> str:
@@ -239,7 +284,18 @@ def _build_resource_summary_html(rs: dict) -> str:
           </div>
         </div>''')
     
-    # Postgres
+    # Postgres CPU
+    pg_cpu = rs.get("postgres_cpu", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Postgres CPU (cores)</div>
+          <div class="values">
+            <span><div class="v">{fmt(pg_cpu.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(pg_cpu.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Postgres Memory
     pg = rs.get("postgres_mb", {})
     cards.append(f'''
         <div class="resource-card">
@@ -275,21 +331,32 @@ def _build_resource_summary_html(rs: dict) -> str:
     </details>'''
 
 
+def _make_row_id(name: str) -> str:
+    """Generate a consistent row ID from a test name."""
+    return name.replace("[", "_").replace("]", "_").replace(" ", "_").replace("-", "_")
+
+
 def _build_kpi_scorecard(all_evals: list[dict], per_test: dict[str, list[dict]]) -> str:
-    """Build the KPI scorecard HTML table."""
+    """Build the KPI scorecard HTML table with links to test results."""
     rows = []
     for test_name, evals in per_test.items():
         short = test_name.replace("test_perf_", "").replace("_baseline", "")
+        row_id = _make_row_id(short)
         for e in evals:
             fmt_val = f'{e["value"]:.3f}' if isinstance(e["value"], float) else str(e["value"])
-            fmt_thresh = f'G&lt;{e["green"]} Y&lt;{e["yellow"]}' if e.get("unit") != "bool" else "pass/fail"
+            if e.get("unit") == "bool":
+                fmt_thresh = "pass/fail"
+            else:
+                op = e.get("op", "<")
+                op_html = {"<": "&lt;", "<=": "≤", ">": "&gt;", ">=": "≥", "==": "="}.get(op, op)
+                fmt_thresh = f'G{op_html}{e["green"]} Y{op_html}{e["yellow"]}'
             rows.append(
                 f'<tr>'
-                f'<td>{short}</td>'
+                f'<td><a href="#test-{row_id}" style="color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted);">{short}</a></td>'
                 f'<td>{e["label"]}</td>'
                 f'<td>{fmt_val} {e["unit"]}</td>'
                 f'<td>{fmt_thresh}</td>'
-                f'<td>{_kpi_status_icon(e["status"])} {e["status"].upper()}</td>'
+                f'<td>{_kpi_status_icon(e["status"], e)}</td>'
                 f'</tr>'
             )
     return (
@@ -511,6 +578,7 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
         "timestamps": [],
         "listener_cpu": [],
         "celery_cpu": [],
+        "postgres_cpu": [],
         "celery_queue_total": [],
         "db_connections": [],
         "memory_mb": [],
@@ -523,15 +591,21 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
         
         m = snap.get("metrics", {})
 
-        # CPU - check multiple possible field names
-        cpu = (snap.get("listener_cpu_cores") or 
-               m.get("listener_cpu_cores") or 
+        # CPU - check multiple possible field names (keep 4 decimal places for millicores)
+        cpu = (snap.get("listener_cpu_cores") or
+               m.get("listener_cpu_cores") or
                m.get("pod_cpu_usage"))
-        series["listener_cpu"].append(round(cpu, 3) if cpu is not None else None)
+        series["listener_cpu"].append(round(cpu, 4) if cpu is not None else None)
 
-        # Celery CPU (may not exist in all formats)
-        celery_cpu = snap.get("celery_worker_cpu_cores") or m.get("celery_worker_cpu_cores")
-        series["celery_cpu"].append(round(celery_cpu, 3) if celery_cpu is not None else None)
+        # Celery CPU (keep 4 decimal places for millicores)
+        celery_cpu = (snap.get("celery_worker_cpu_cores") or 
+                      m.get("celery_worker_cpu_cores"))
+        series["celery_cpu"].append(round(celery_cpu, 4) if celery_cpu is not None else None)
+
+        # Postgres CPU (keep 4 decimal places for millicores)
+        pg_cpu = (snap.get("postgres_cpu_cores") or 
+                  m.get("postgres_cpu_cores"))
+        series["postgres_cpu"].append(round(pg_cpu, 4) if pg_cpu is not None else None)
 
         # Celery queue depth - check multiple formats
         queues = snap.get("celery_queues") or m.get("celery_queues") or {}
@@ -569,7 +643,8 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
         series["valkey_mb"].append(round(valkey, 1) if valkey is not None else None)
 
         # Postgres memory
-        pg = snap.get("postgres_memory_mb") or m.get("postgres_memory_mb")
+        pg = (snap.get("postgres_memory_mb") or 
+              m.get("postgres_memory_mb"))
         series["postgres_mb"].append(round(pg, 1) if pg is not None else None)
 
     return series
@@ -577,18 +652,19 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
 
 def compute_resource_summary(prom_series: dict) -> dict:
     """Compute min/max/avg for resource metrics."""
-    def stats(values):
+    def stats(values, decimals=2):
         nums = [v for v in values if v is not None]
         if not nums:
             return {"min": None, "max": None, "avg": None}
         return {
-            "min": round(min(nums), 2),
-            "max": round(max(nums), 2),
-            "avg": round(sum(nums) / len(nums), 2),
+            "min": round(min(nums), decimals),
+            "max": round(max(nums), decimals),
+            "avg": round(sum(nums) / len(nums), decimals),
         }
     return {
-        "listener_cpu": stats(prom_series["listener_cpu"]),
-        "celery_cpu": stats(prom_series["celery_cpu"]),
+        "listener_cpu": stats(prom_series["listener_cpu"], decimals=4),
+        "celery_cpu": stats(prom_series["celery_cpu"], decimals=4),
+        "postgres_cpu": stats(prom_series["postgres_cpu"], decimals=4),
         "memory_mb": stats(prom_series["memory_mb"]),
         "valkey_mb": stats(prom_series["valkey_mb"]),
         "postgres_mb": stats(prom_series["postgres_mb"]),
@@ -1026,7 +1102,7 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     <summary>All Test Results ({passed}/{total} passed)</summary>
     <div class="section-content">
       <table class="results-table">
-        <thead><tr><th>Test</th><th>Status</th><th>Duration</th><th>Key Metrics</th><th>KPI</th><th style="width:30px"></th></tr></thead>
+        <thead><tr><th>Test</th><th>Status</th><th>Duration</th><th>Key Metrics</th><th>KPI</th><th style="width:60px">Details</th></tr></thead>
         <tbody>
         {"".join(_result_row_expandable(r, per_test_kpis.get(r["test_name"], [])) for r in results)}
         </tbody>
@@ -1102,6 +1178,46 @@ function toggleDetails(id) {{
     print(f"     {len(results)} tests · {passed}/{total} passed · {dur_min} min")
 
 
+KPI_NOTES: dict[str, str] = {
+    "speedup_ratio": "For small datasets, refresh may not be faster than initial processing due to limited caching benefit.",
+}
+
+
+def _build_kpi_details_html(kpis: list[dict] | None) -> str:
+    """Build HTML showing KPI evaluation details with violations highlighted."""
+    if not kpis:
+        return ""
+
+    violations = [k for k in kpis if k.get("status") in ("red", "yellow")]
+    passes = [k for k in kpis if k.get("status") == "green"]
+
+    if not violations:
+        return ""
+
+    items = []
+    for k in violations:
+        color = "var(--kpi-red)" if k["status"] == "red" else "var(--kpi-yellow)"
+        op_desc = {"<": "must be <", ">": "must be >", "==": "must equal", ">=": "must be ≥", "<=": "must be ≤"}.get(k.get("op", "<"), "threshold")
+        val_fmt = f'{k["value"]:.3f}' if isinstance(k["value"], float) else str(k["value"])
+        thresh = k.get("green", "?")
+        metric = k.get("metric", "?")
+        
+        note = ""
+        if k["status"] == "yellow" and metric in KPI_NOTES:
+            note = f'<div style="font-size:11px;color:var(--muted);margin-top:4px;font-style:italic;">ℹ️ {KPI_NOTES[metric]}</div>'
+        
+        items.append(
+            f'<div style="padding:8px 12px;background:{color}22;border-left:3px solid {color};border-radius:4px;margin-bottom:6px;">'
+            f'<strong style="color:{color};">{k["label"]}</strong>: '
+            f'<code>{metric}</code> = <strong>{val_fmt}</strong> {k.get("unit", "")}'
+            f' ({op_desc} {thresh} for green)'
+            f'{note}'
+            f'</div>'
+        )
+
+    return f'<div style="margin-bottom:12px;"><strong style="color:var(--kpi-red);">KPI Violations:</strong><div style="margin-top:8px;">{"".join(items)}</div></div>'
+
+
 def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
     """Build an expandable table row with full metrics in a details element."""
     name   = r["test_name"].replace("test_perf_", "").replace("_baseline", "")
@@ -1127,8 +1243,11 @@ def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
     
     kpi_badges = ""
     if kpis:
-        kpi_parts = [f'{_kpi_status_icon(e["status"])}' for e in kpis]
+        kpi_parts = [_kpi_status_icon(e["status"], e) for e in kpis]
         kpi_badges = " ".join(kpi_parts)
+    
+    # Build KPI violations highlight
+    kpi_violations_html = _build_kpi_details_html(kpis)
     
     # Build expandable details with full metrics
     metrics_json = json.dumps(m, indent=2) if m else "{}"
@@ -1138,9 +1257,9 @@ def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
                         for t in r.get("timings", [])]
         timings_html = f'<div style="margin-top:12px;"><strong>Timings:</strong><div class="metrics-grid" style="margin-top:8px;">{"".join(timing_items)}</div></div>'
     
-    row_id = name.replace("[", "_").replace("]", "_").replace(" ", "_")
+    row_id = _make_row_id(name)
     
-    return f'''<tr>
+    return f'''<tr id="test-{row_id}">
       <td><strong>{name}</strong></td>
       <td>{badge}</td>
       <td>{dur}</td>
@@ -1152,6 +1271,7 @@ def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
       <td colspan="6" style="padding:0;border:none;">
         <div class="test-details">
           {f'<div style="color:var(--fail);margin-bottom:8px;"><strong>Error:</strong> {err}</div>' if err else ''}
+          {kpi_violations_html}
           {timings_html}
           <div style="margin-top:12px;"><strong>Full Metrics:</strong><pre>{metrics_json}</pre></div>
         </div>
@@ -1190,7 +1310,7 @@ def _result_row(r: dict, kpis: list[dict] | None = None) -> str:
     if kpis:
         kpi_parts = []
         for e in kpis:
-            kpi_parts.append(f'{_kpi_status_icon(e["status"])}')
+            kpi_parts.append(_kpi_status_icon(e["status"], e))
         kpi_badges = " ".join(kpi_parts)
 
     err_cell = f'<div class="err-msg">{err}</div>' if err else ""

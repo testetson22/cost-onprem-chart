@@ -462,7 +462,14 @@ main() {
 
     # For performance tests with unified output structure, redirect reports to PERF_OUTPUT_DIR
     if [[ "$is_perf_test" == "true" ]] && [[ -n "${PERF_OUTPUT_DIR:-}" ]] && [[ -n "${TEST_RUN_ID:-}" ]]; then
-        perf_reports_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}/reports"
+        # PERF_OUTPUT_DIR should be an absolute path (set by deploy-test-cost-onprem.sh)
+        # If it's relative, make it absolute relative to PROJECT_ROOT
+        local perf_output_dir_resolved="${PERF_OUTPUT_DIR}"
+        if [[ "$perf_output_dir_resolved" != /* ]]; then
+            perf_output_dir_resolved="${PROJECT_ROOT}/${PERF_OUTPUT_DIR}"
+        fi
+        
+        perf_reports_dir="${perf_output_dir_resolved}/${TEST_RUN_ID}/reports"
         mkdir -p "$perf_reports_dir"
         # Override default junit-xml path from pytest.ini
         pytest_args+=("--junit-xml=${perf_reports_dir}/junit.xml")

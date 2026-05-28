@@ -235,7 +235,14 @@ def generate_node_yaml(
     pods_per_namespace: int,
     base_name: str = "perf",
 ) -> str:
-    """Generate YAML for a single node."""
+    """Generate YAML for a single node.
+    
+    NISE YAML format requires proper nesting:
+    - node properties indented under 'node:'
+    - node_labels for node labels (not 'labels')
+    - namespace_labels for namespace labels (not 'labels')
+    - labels for pod labels
+    """
     node_name = f"{base_name}-node-{node_index:03d}"
     resource_id = f"{base_name}-resource-{node_index:03d}"
     
@@ -251,31 +258,37 @@ def generate_node_yaml(
             mem_request = 0.5 + (pod_idx % 4) * 0.5  # 0.5, 1.0, 1.5, 2.0
             cpu_usage = cpu_request * (0.4 + (pod_idx % 3) * 0.2)  # 40-80% utilization
             mem_usage = mem_request * (0.5 + (pod_idx % 3) * 0.15)  # 50-80% utilization
+            tier = ['web', 'api', 'worker', 'db'][pod_idx % 4]
             
+            # Pod YAML with proper nesting - properties under 'pod:'
+            # pods: is at 14 spaces, so list items at 16 spaces
             pods_yaml.append(f"""                - pod:
-                  pod_name: {pod_name}
-                  cpu_request: {cpu_request}
-                  mem_request_gig: {mem_request}
-                  cpu_limit: {cpu_request * 2}
-                  mem_limit_gig: {mem_request * 2}
-                  pod_seconds: 3600
-                  cpu_usage:
-                    full_period: {cpu_usage:.3f}
-                  mem_usage_gig:
-                    full_period: {mem_usage:.3f}
-                  labels: environment:performance|app:{base_name}-app|tier:{['web', 'api', 'worker', 'db'][pod_idx % 4]}""")
+                    pod_name: {pod_name}
+                    cpu_request: {cpu_request}
+                    mem_request_gig: {mem_request}
+                    cpu_limit: {cpu_request * 2}
+                    mem_limit_gig: {mem_request * 2}
+                    pod_seconds: 3600
+                    cpu_usage:
+                      full_period: {cpu_usage:.3f}
+                    mem_usage_gig:
+                      full_period: {mem_usage:.3f}
+                    labels: environment:performance|app:{base_name}-app|tier:{tier}""")
         
+        # Namespace YAML with namespace_labels (not 'labels')
+        # Namespace name needs proper indentation under 'namespaces:'
         namespaces_yaml.append(f"""            {ns_name}:
-              labels: openshift.io/cluster-monitoring:true|cost-management:enabled
+              namespace_labels: openshift_io_cluster_monitoring:true|cost_management:enabled
               pods:
 {chr(10).join(pods_yaml)}""")
     
-    return f"""        - node:
+    # Node YAML with node_labels (not 'labels') and proper nesting
+    return f"""      - node:
           node_name: {node_name}
+          node_labels: node_role_kubernetes_io_worker:true|kubernetes_io_os:linux|node_kubernetes_io_instance_type:m5.xlarge
           cpu_cores: {cpu_cores}
           memory_gig: {memory_gib}
           resource_id: {resource_id}
-          labels: node-role.kubernetes.io/worker:true|kubernetes.io/os:linux|node.kubernetes.io/instance-type:m5.xlarge
           namespaces:
 {chr(10).join(namespaces_yaml)}"""
 

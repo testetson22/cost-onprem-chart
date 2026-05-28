@@ -526,15 +526,25 @@ class TestAPILatency:
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
         perf_collector: PerfResultCollector,
+        ensure_tags_enabled,
     ):
         """PERF-API-006: Tag filtering - Filter by N tags.
         
         Tests query performance with increasing tag filter complexity.
         Discovers real tag keys from the tags API to avoid 400 errors
         from non-existent fabricated tags.
+        
+        Prerequisites:
+        - Data with labels must be uploaded (NISE profiles include labels)
+        - Tags must be enabled (ensure_tags_enabled fixture handles this)
+        
+        If insufficient tags: fails (not skips) since tag support is expected.
         """
         session = self._get_authenticated_session()
         iterations = 10
+        
+        # Log tag enablement status
+        print(f"\n[API-006] Tag enablement status: {ensure_tags_enabled}")
         
         # Discover available tags from the API
         tags_response = session.get(
@@ -551,10 +561,15 @@ class TestAPILatency:
                 elif isinstance(entry, str):
                     available_tags.append(entry)
         
+        print(f"[API-006] Available tags from API: {available_tags[:20]}")
+        
         if len(available_tags) < tag_count:
-            pytest.skip(
-                f"Need {tag_count} tags but only {len(available_tags)} available; "
-                f"upload data with tags to enable this test"
+            # Fail instead of skip - tags should be available if data was uploaded
+            pytest.fail(
+                f"Tag test infrastructure issue: Need {tag_count} tags but only "
+                f"{len(available_tags)} available via API. Ensure: (1) data with "
+                f"labels was uploaded, (2) tags are enabled, (3) data was processed. "
+                f"Available: {available_tags}"
             )
         
         selected_tags = available_tags[:tag_count]

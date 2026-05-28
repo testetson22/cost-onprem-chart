@@ -141,8 +141,8 @@ METRICS_COLLECTOR_PID=""
 
 # Performance output directory - unified structure for metrics + test results + reports
 # Format: {PERF_OUTPUT_DIR}/{TEST_RUN_ID}/ with subdirs: metrics/, results/, reports/
-# Use tests/perf-runs to align with pytest conftest.py output location
-PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-tests/perf-runs}"
+# Default: PROJECT_ROOT/tests/perf-runs (absolute path to avoid issues when pytest runs from tests/)
+PERF_OUTPUT_DIR="${PERF_OUTPUT_DIR:-${PROJECT_ROOT}/tests/perf-runs}"
 # TEST_RUN_ID is auto-generated: {chart_version}-{perf_profile}-{epoch}
 TEST_RUN_ID="${TEST_RUN_ID:-}"
 SAVE_VERSIONS="${SAVE_VERSIONS:-false}"

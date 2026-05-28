@@ -229,9 +229,16 @@ METRIC_NAMES=(
     # ROS/Kruize metrics
     kruize_heap_used_bytes
     kruize_experiments_total
-    # Pod resource metrics
+    # Pod resource metrics (aggregated)
     pod_cpu_usage
     pod_memory_usage_bytes
+    # Per-component resource metrics
+    listener_cpu_cores
+    listener_memory_mb
+    celery_worker_cpu_cores
+    celery_worker_memory_mb
+    postgres_cpu_cores
+    postgres_memory_mb
     # Ingress metrics
     ingress_upload_rate
     kafka_consumer_lag
@@ -264,6 +271,12 @@ METRIC_QUERIES=(
     "kruize_experiments_total{namespace=\"${NAMESPACE}\"}"
     "sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}[5m])) by (pod)"
     "sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", container!=\"\", container!=\"POD\"}) by (pod)"
+    "sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", pod=~\".*listener.*|.*ingress.*|.*koku-api.*\", container!=\"\", container!=\"POD\"}[5m]))"
+    "sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", pod=~\".*listener.*|.*ingress.*|.*koku-api.*\", container!=\"\", container!=\"POD\"}) / 1024 / 1024"
+    "sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", pod=~\".*worker.*|.*clowder-worker.*|.*celery.*\", container!=\"\", container!=\"POD\"}[5m]))"
+    "sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", pod=~\".*worker.*|.*clowder-worker.*|.*celery.*\", container!=\"\", container!=\"POD\"}) / 1024 / 1024"
+    "sum(rate(container_cpu_usage_seconds_total{namespace=\"${NAMESPACE}\", pod=~\".*postgres.*|.*database.*|.*db.*\", container!=\"\", container!=\"POD\"}[5m]))"
+    "sum(container_memory_working_set_bytes{namespace=\"${NAMESPACE}\", pod=~\".*postgres.*|.*database.*|.*db.*\", container!=\"\", container!=\"POD\"}) / 1024 / 1024"
     "sum(rate(ingress_uploads_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "sum(kafka_consumer_records_lag{namespace=\"${NAMESPACE}\"})"
 )

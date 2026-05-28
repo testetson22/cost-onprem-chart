@@ -899,6 +899,20 @@ def perf_cleanup(cluster_config: ClusterConfig, rh_identity_header: str):
 
 
 # =============================================================================
+# Tag Enablement
+# =============================================================================
+# Tag enablement functions and fixture are defined in the root conftest.py
+# and are available to all test suites. The `ensure_tags_enabled` fixture
+# uses the API (PUT /settings/tags/enable/) to enable tags needed for testing.
+#
+# Performance tests that need tags (e.g., API-006 tag filtering) should
+# include `ensure_tags_enabled` in their fixture dependencies.
+#
+# See: tests/conftest.py for implementation details
+# See: koku docs/architecture/api-settings-endpoints.md for API documentation
+
+
+# =============================================================================
 # Queue Depth Helpers
 # =============================================================================
 
