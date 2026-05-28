@@ -186,6 +186,95 @@ def _kpi_status_icon(status: str) -> str:
     return f'<span style="color:var(--kpi-{status});font-size:16px;vertical-align:middle;">{icons.get(status, "")}</span>'
 
 
+def _build_resource_summary_html(rs: dict) -> str:
+    """Build the resource summary HTML section."""
+    if not rs or not rs.get("snapshot_count"):
+        return ""
+    
+    def fmt(v, suffix=""):
+        return f"{v}{suffix}" if v is not None else "—"
+    
+    cards = []
+    # Listener CPU
+    cpu = rs.get("listener_cpu", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Listener CPU (cores)</div>
+          <div class="values">
+            <span><div class="v">{fmt(cpu.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(cpu.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Celery CPU
+    celery = rs.get("celery_cpu", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Celery Worker CPU (cores)</div>
+          <div class="values">
+            <span><div class="v">{fmt(celery.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(celery.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Memory
+    mem = rs.get("memory_mb", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Process Memory (MB)</div>
+          <div class="values">
+            <span><div class="v">{fmt(mem.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(mem.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Valkey
+    valkey = rs.get("valkey_mb", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Valkey Memory (MB)</div>
+          <div class="values">
+            <span><div class="v">{fmt(valkey.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(valkey.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Postgres
+    pg = rs.get("postgres_mb", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Postgres Memory (MB)</div>
+          <div class="values">
+            <span><div class="v">{fmt(pg.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(pg.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    # Celery Queue
+    queue = rs.get("celery_queue", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Celery Queue Depth</div>
+          <div class="values">
+            <span><div class="v">{fmt(queue.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(queue.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+    
+    time_range = ""
+    if rs.get("time_start") and rs.get("time_end"):
+        time_range = f'<div style="font-size:11px;color:var(--muted);margin-top:8px;">Collection window: {rs["time_start"]} → {rs["time_end"]}</div>'
+    
+    return f'''
+    <details open>
+      <summary>Resource Metrics Summary ({rs["snapshot_count"]} snapshots)</summary>
+      <div class="section-content">
+        <div class="resource-grid">{"".join(cards)}</div>
+        {time_range}
+      </div>
+    </details>'''
+
+
 def _build_kpi_scorecard(all_evals: list[dict], per_test: dict[str, list[dict]]) -> str:
     """Build the KPI scorecard HTML table."""
     rows = []
@@ -233,8 +322,15 @@ def load_metadata(run_dir: Path) -> dict:
     return {}
 
 
-def load_grafana_links(run_dir: Path) -> dict:
-    """Load grafana-links.json if present (written by push-grafana-snapshot.py)."""
+def load_grafana_links(run_dir: Path, skip: bool = False) -> dict:
+    """Load grafana-links.json if present (written by push-grafana-snapshot.py).
+    
+    Args:
+        run_dir: Path to run directory
+        skip: If True, return empty dict (skip Grafana links)
+    """
+    if skip:
+        return {}
     for candidate in [run_dir / "reports" / "grafana-links.json",
                       run_dir / "grafana-links.json"]:
         if candidate.exists():
@@ -414,32 +510,93 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
     series: dict = {
         "timestamps": [],
         "listener_cpu": [],
+        "celery_cpu": [],
         "celery_queue_total": [],
         "db_connections": [],
         "memory_mb": [],
+        "valkey_mb": [],
+        "postgres_mb": [],
     }
     for snap in snapshots:
         ts = snap.get("timestamp", "")
         series["timestamps"].append(ts[:19].replace("T", " "))
+        
+        m = snap.get("metrics", {})
 
-        # Listener CPU
-        cpu = snap.get("listener_cpu_cores") or snap.get("metrics", {}).get("listener_cpu_cores")
+        # CPU - check multiple possible field names
+        cpu = (snap.get("listener_cpu_cores") or 
+               m.get("listener_cpu_cores") or 
+               m.get("pod_cpu_usage"))
         series["listener_cpu"].append(round(cpu, 3) if cpu is not None else None)
 
-        # Celery queue depth
-        queues = snap.get("celery_queues") or snap.get("metrics", {}).get("celery_queues") or {}
-        total_q = sum(queues.values()) if isinstance(queues, dict) else None
+        # Celery CPU (may not exist in all formats)
+        celery_cpu = snap.get("celery_worker_cpu_cores") or m.get("celery_worker_cpu_cores")
+        series["celery_cpu"].append(round(celery_cpu, 3) if celery_cpu is not None else None)
+
+        # Celery queue depth - check multiple formats
+        queues = snap.get("celery_queues") or m.get("celery_queues") or {}
+        if isinstance(queues, dict) and queues:
+            total_q = sum(queues.values())
+        else:
+            # Try alternate field names
+            total_q = m.get("celery_queue_depth_total")
+            if isinstance(total_q, list):
+                total_q = sum(total_q) if total_q else None
         series["celery_queue_total"].append(total_q)
 
         # DB connections
-        db_conn = snap.get("db_connections") or snap.get("metrics", {}).get("db_connections")
+        db_conn = (snap.get("db_connections") or 
+                   m.get("db_connections") or 
+                   m.get("pg_connections_active"))
+        if isinstance(db_conn, list):
+            db_conn = db_conn[0] if db_conn else None
         series["db_connections"].append(db_conn)
 
-        # Memory
-        mem = snap.get("process_memory_mb") or snap.get("metrics", {}).get("process_memory_mb")
+        # Memory - convert bytes to MB if needed
+        mem = snap.get("process_memory_mb") or m.get("process_memory_mb")
+        if mem is None:
+            mem_bytes = m.get("pod_memory_usage_bytes")
+            if mem_bytes is not None:
+                mem = mem_bytes / (1024 * 1024)
         series["memory_mb"].append(round(mem, 1) if mem is not None else None)
 
+        # Valkey memory - convert bytes to MB if needed
+        valkey = snap.get("valkey_memory_mb") or m.get("valkey_memory_mb")
+        if valkey is None:
+            valkey_bytes = m.get("valkey_memory_used_bytes")
+            if valkey_bytes is not None:
+                valkey = valkey_bytes / (1024 * 1024)
+        series["valkey_mb"].append(round(valkey, 1) if valkey is not None else None)
+
+        # Postgres memory
+        pg = snap.get("postgres_memory_mb") or m.get("postgres_memory_mb")
+        series["postgres_mb"].append(round(pg, 1) if pg is not None else None)
+
     return series
+
+
+def compute_resource_summary(prom_series: dict) -> dict:
+    """Compute min/max/avg for resource metrics."""
+    def stats(values):
+        nums = [v for v in values if v is not None]
+        if not nums:
+            return {"min": None, "max": None, "avg": None}
+        return {
+            "min": round(min(nums), 2),
+            "max": round(max(nums), 2),
+            "avg": round(sum(nums) / len(nums), 2),
+        }
+    return {
+        "listener_cpu": stats(prom_series["listener_cpu"]),
+        "celery_cpu": stats(prom_series["celery_cpu"]),
+        "memory_mb": stats(prom_series["memory_mb"]),
+        "valkey_mb": stats(prom_series["valkey_mb"]),
+        "postgres_mb": stats(prom_series["postgres_mb"]),
+        "celery_queue": stats(prom_series["celery_queue_total"]),
+        "snapshot_count": len(prom_series["timestamps"]),
+        "time_start": prom_series["timestamps"][0] if prom_series["timestamps"] else None,
+        "time_end": prom_series["timestamps"][-1] if prom_series["timestamps"] else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -454,12 +611,12 @@ def js_colors(values: list[bool], true_color="#27ae60", false_color="#e74c3c") -
     return json.dumps([true_color if v else false_color for v in values])
 
 
-def render_html(run_dir: Path, output_path: Path) -> None:
+def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = True) -> None:
     session        = load_session(run_dir)
     metadata       = load_metadata(run_dir)
     junit          = parse_junit(run_dir)
     snapshots      = load_metrics_snapshots(run_dir)
-    grafana_links  = load_grafana_links(run_dir)
+    grafana_links  = load_grafana_links(run_dir, skip=skip_grafana_links)
 
     if not session:
         print(f"[WARN] No session JSON found in {run_dir}/results/ — report will be sparse")
@@ -527,6 +684,9 @@ def render_html(run_dir: Path, output_path: Path) -> None:
     has_api    = len(api_latency) > 0
     has_ing    = len(ing_throughput) > 0
     has_conc   = len(concurrent) > 0
+
+    # Resource summary from Prometheus snapshots
+    resource_summary = compute_resource_summary(prom_series) if has_prom else {}
 
     # Conditional chart card HTML blocks (built before the f-string)
     api_chart_html = (
@@ -650,6 +810,27 @@ def render_html(run_dir: Path, output_path: Path) -> None:
         f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'tasks' }} }} }} }} }});"
     ) if has_prom else ""
 
+    js_mem_chart = (
+        f"new Chart(document.getElementById('memChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
+        f" datasets: [{{ label: 'Memory (MB)', data: {prom_mem},"
+        f" borderColor: 'rgba(142,68,173,0.9)', backgroundColor: 'rgba(142,68,173,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 2 }}] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
+        f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
+        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB' }} }} }} }} }});"
+    ) if has_prom else ""
+
+    prom_valkey = js_array(prom_series["valkey_mb"])
+    js_valkey_chart = (
+        f"new Chart(document.getElementById('valkeyChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
+        f" datasets: [{{ label: 'Valkey (MB)', data: {prom_valkey},"
+        f" borderColor: 'rgba(230,126,34,0.9)', backgroundColor: 'rgba(230,126,34,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 2 }}] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
+        f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
+        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB' }} }} }} }} }});"
+    ) if has_prom else ""
+
     ocp_ver    = cluster_info.get("ocp_version", "?")
     nodes      = cluster_info.get("node_count", "?")
     storage    = cluster_info.get("storage_type", "?")
@@ -724,6 +905,32 @@ def render_html(run_dir: Path, output_path: Path) -> None:
 
   .footer {{ margin-top:32px; font-size:11px; color:var(--muted); text-align:center; }}
 
+  /* Collapsible sections */
+  details {{ margin:16px 0; }}
+  summary {{ cursor:pointer; font-weight:600; font-size:14px; padding:12px 16px; background:var(--surface); border:1px solid var(--border); border-radius:8px; list-style:none; display:flex; align-items:center; gap:8px; }}
+  summary::-webkit-details-marker {{ display:none; }}
+  summary::before {{ content:'▶'; font-size:10px; transition:transform 0.2s; }}
+  details[open] > summary::before {{ transform:rotate(90deg); }}
+  summary:hover {{ background:#f0f4f8; }}
+  details > .section-content {{ padding:16px; background:var(--surface); border:1px solid var(--border); border-top:none; border-radius:0 0 8px 8px; }}
+
+  /* Resource summary grid */
+  .resource-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin:16px 0; }}
+  .resource-card {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px; }}
+  .resource-card .label {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px; }}
+  .resource-card .values {{ display:flex; gap:16px; font-size:13px; }}
+  .resource-card .values span {{ display:flex; flex-direction:column; }}
+  .resource-card .values .v {{ font-size:18px; font-weight:700; color:var(--text); }}
+  .resource-card .values .l {{ font-size:10px; color:var(--muted); }}
+
+  /* Expandable test details */
+  .test-details {{ margin-top:8px; padding:12px; background:#f8fafc; border-radius:6px; font-size:12px; }}
+  .test-details pre {{ background:#1a1a2e; color:#e0e0e0; padding:12px; border-radius:6px; overflow-x:auto; font-size:11px; margin-top:8px; }}
+  .metrics-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; }}
+  .metric-item {{ padding:6px 10px; background:var(--surface); border:1px solid var(--border); border-radius:4px; }}
+  .metric-item .k {{ font-size:10px; color:var(--muted); }}
+  .metric-item .v {{ font-size:14px; font-weight:600; }}
+
   /* Grafana links banner */
   .grafana-bar {{ background:#1a1a2e; color:#eee; padding:10px 24px; border-radius:8px; display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }}
   .g-label {{ font-size:12px; color:#aaa; font-weight:600; text-transform:uppercase; letter-spacing:.5px; }}
@@ -772,42 +979,60 @@ def render_html(run_dir: Path, output_path: Path) -> None:
     </div>
   </div>
 
+  <!-- Resource Summary (if metrics available) -->
+  {_build_resource_summary_html(resource_summary) if has_prom else ""}
+
   <!-- KPI Scorecard -->
-  <h2>KPI Scorecard</h2>
-  {"<p style='color:var(--muted);font-size:12px;margin-bottom:8px;'>No KPI thresholds matched for this run's tests.</p>" if not all_kpi_evals else ""}
-  {_build_kpi_scorecard(all_kpi_evals, per_test_kpis) if all_kpi_evals else ""}
-
-  <!-- Charts -->
-  <h2>Test Execution</h2>
-  <div class="chart-grid">
-
-    <div class="chart-card wide">
-      <h3>Test Duration Timeline (seconds)</h3>
-      <canvas id="timelineChart"></canvas>
+  <details open>
+    <summary>KPI Scorecard ({kpi_green}/{kpi_total} passing)</summary>
+    <div class="section-content">
+      {"<p style='color:var(--muted);font-size:12px;margin-bottom:8px;'>No KPI thresholds matched for this run's tests.</p>" if not all_kpi_evals else ""}
+      {_build_kpi_scorecard(all_kpi_evals, per_test_kpis) if all_kpi_evals else ""}
     </div>
+  </details>
 
-    {api_chart_html}
+  <!-- Test Execution Charts -->
+  <details open>
+    <summary>Test Execution Charts</summary>
+    <div class="section-content">
+      <div class="chart-grid">
+        <div class="chart-card wide">
+          <h3>Test Duration Timeline (seconds)</h3>
+          <canvas id="timelineChart"></canvas>
+        </div>
+        {api_chart_html}
+        {throughput_chart_html}
+        {proc_chart_html}
+        {conc_chart_html}
+      </div>
+    </div>
+  </details>
 
-    {throughput_chart_html}
+  <!-- Resource Metrics Charts (if available) -->
+  {f'''<details open>
+    <summary>Resource Metrics Over Time ({len(snapshots)} snapshots)</summary>
+    <div class="section-content">
+      <div class="chart-grid">
+        {cpu_chart_html}
+        {queue_chart_html}
+        <div class="chart-card"><h3>Memory Usage (MB)</h3><canvas id="memChart"></canvas></div>
+        <div class="chart-card"><h3>Valkey Memory (MB)</h3><canvas id="valkeyChart"></canvas></div>
+      </div>
+    </div>
+  </details>''' if has_prom else ""}
 
-    {proc_chart_html}
-
-    {conc_chart_html}
-
-    {cpu_chart_html}
-
-    {queue_chart_html}
-
-  </div>
-
-  <!-- Full Results Table -->
-  <h2>All Test Results</h2>
-  <table class="results-table">
-    <thead><tr><th>Test</th><th>Status</th><th>Duration</th><th>Key Metrics</th><th>KPI</th><th>Error</th></tr></thead>
-    <tbody>
-    {"".join(_result_row(r, per_test_kpis.get(r["test_name"], [])) for r in results)}
-    </tbody>
-  </table>
+  <!-- All Test Results -->
+  <details open>
+    <summary>All Test Results ({passed}/{total} passed)</summary>
+    <div class="section-content">
+      <table class="results-table">
+        <thead><tr><th>Test</th><th>Status</th><th>Duration</th><th>Key Metrics</th><th>KPI</th><th style="width:30px"></th></tr></thead>
+        <tbody>
+        {"".join(_result_row_expandable(r, per_test_kpis.get(r["test_name"], [])) for r in results)}
+        </tbody>
+      </table>
+    </div>
+  </details>
 
   <div class="footer">Generated by generate-perf-run-report.py · {generated_at}</div>
 </div>
@@ -851,6 +1076,23 @@ new Chart(document.getElementById('timelineChart'), {{
 {js_cpu_chart}
 
 {js_queue_chart}
+
+{js_mem_chart}
+
+{js_valkey_chart}
+
+// Toggle expandable test details
+function toggleDetails(id) {{
+  const row = document.getElementById('details-' + id);
+  const btn = event.target;
+  if (row.style.display === 'none') {{
+    row.style.display = 'table-row';
+    btn.textContent = '▼';
+  }} else {{
+    row.style.display = 'none';
+    btn.textContent = '▶';
+  }}
+}}
 </script>
 </body>
 </html>"""
@@ -858,6 +1100,64 @@ new Chart(document.getElementById('timelineChart'), {{
     output_path.write_text(html, encoding="utf-8")
     print(f"[OK] Run report written to: {output_path}")
     print(f"     {len(results)} tests · {passed}/{total} passed · {dur_min} min")
+
+
+def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
+    """Build an expandable table row with full metrics in a details element."""
+    name   = r["test_name"].replace("test_perf_", "").replace("_baseline", "")
+    passed = r.get("passed", True)
+    badge  = '<span class="badge pass">PASS</span>' if passed else '<span class="badge fail">FAIL</span>'
+    dur_s  = round(sum(t["duration_seconds"] for t in r.get("timings", [])), 1)
+    dur    = f"{dur_s}s" if dur_s < 120 else f"{dur_s/60:.1f}min"
+    m      = r.get("metrics") or {}
+    err    = r.get("error_message") or ""
+    
+    # Quick metrics summary
+    bits = []
+    upload = m.get("upload") or {}
+    if upload.get("upload_mb_per_second"):
+        bits.append(f'{upload["upload_mb_per_second"]:.3f} MB/s')
+    if "upload_throughput_mb_s" in m:
+        bits.append(f'{m["upload_throughput_mb_s"]:.3f} MB/s')
+    if "aggregate_p95" in m:
+        bits.append(f'p95={round(m["aggregate_p95"]*1000,1)}ms')
+    if "requests_per_second" in m:
+        bits.append(f'{m["requests_per_second"]:.1f} req/s')
+    metrics_str = " · ".join(bits) if bits else "—"
+    
+    kpi_badges = ""
+    if kpis:
+        kpi_parts = [f'{_kpi_status_icon(e["status"])}' for e in kpis]
+        kpi_badges = " ".join(kpi_parts)
+    
+    # Build expandable details with full metrics
+    metrics_json = json.dumps(m, indent=2) if m else "{}"
+    timings_html = ""
+    if r.get("timings"):
+        timing_items = [f'<div class="metric-item"><div class="k">{t["name"]}</div><div class="v">{t["duration_seconds"]:.1f}s</div></div>' 
+                        for t in r.get("timings", [])]
+        timings_html = f'<div style="margin-top:12px;"><strong>Timings:</strong><div class="metrics-grid" style="margin-top:8px;">{"".join(timing_items)}</div></div>'
+    
+    row_id = name.replace("[", "_").replace("]", "_").replace(" ", "_")
+    
+    return f'''<tr>
+      <td><strong>{name}</strong></td>
+      <td>{badge}</td>
+      <td>{dur}</td>
+      <td>{metrics_str}</td>
+      <td>{kpi_badges}</td>
+      <td><button onclick="toggleDetails('{row_id}')" style="border:none;background:none;cursor:pointer;font-size:14px;">▶</button></td>
+    </tr>
+    <tr id="details-{row_id}" style="display:none;">
+      <td colspan="6" style="padding:0;border:none;">
+        <div class="test-details">
+          {f'<div style="color:var(--fail);margin-bottom:8px;"><strong>Error:</strong> {err}</div>' if err else ''}
+          {timings_html}
+          <div style="margin-top:12px;"><strong>Full Metrics:</strong><pre>{metrics_json}</pre></div>
+        </div>
+      </td>
+    </tr>
+'''
 
 
 def _result_row(r: dict, kpis: list[dict] | None = None) -> str:
@@ -910,7 +1210,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate visual HTML report for a single perf run")
     parser.add_argument("--run-dir", required=True, help="Path to perf run directory")
     parser.add_argument("--output", default=None, help="Output HTML path (default: <run-dir>/reports/perf-run-report.html)")
+    parser.add_argument("--skip-grafana-links", action="store_true", default=True,
+                        help="Skip Grafana links in report (default: True)")
+    parser.add_argument("--grafana-links", action="store_true",
+                        help="Include Grafana links in report (overrides --skip-grafana-links)")
     args = parser.parse_args()
+    
+    # --grafana-links overrides --skip-grafana-links
+    skip_grafana = args.skip_grafana_links and not args.grafana_links
 
     run_dir = Path(args.run_dir).resolve()
     if not run_dir.exists():
@@ -924,7 +1231,7 @@ def main() -> None:
         reports_dir.mkdir(exist_ok=True)
         output_path = reports_dir / "perf-run-report.html"
 
-    render_html(run_dir, output_path)
+    render_html(run_dir, output_path, skip_grafana_links=skip_grafana)
 
 
 if __name__ == "__main__":

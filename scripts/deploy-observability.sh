@@ -506,6 +506,109 @@ EOF
     log_success "valkey-exporter deployed"
 }
 
+# Deploy celery-exporter for Celery task metrics
+deploy_celery_exporter() {
+    if [[ "$SKIP_EXPORTERS" == "true" ]]; then
+        log_info "Skipping exporter deployment"
+        return 0
+    fi
+    
+    if [[ -z "$VALKEY_HOST" ]]; then
+        log_warning "Valkey host not set, skipping celery-exporter"
+        return 0
+    fi
+    
+    log_header "Deploying celery-exporter"
+    
+    local broker_url="redis://${VALKEY_HOST}:${VALKEY_PORT:-6379}/0"
+    log_info "Using broker: ${broker_url}"
+    
+    cat <<EOF | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-exporter
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: celery-exporter
+    app.kubernetes.io/component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: celery-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: celery-exporter
+        app.kubernetes.io/component: monitoring
+    spec:
+      containers:
+        - name: celery-exporter
+          image: docker.io/danihodovic/celery-exporter:0.10.10
+          args:
+            - --broker-url=${broker_url}
+            - --retry-interval=5
+          ports:
+            - name: metrics
+              containerPort: 9808
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: celery-exporter
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: celery-exporter
+    app.kubernetes.io/component: monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: celery-exporter
+  ports:
+    - name: metrics
+      port: 9808
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: celery-exporter
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: celery-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: celery-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+EOF
+    
+    log_success "celery-exporter deployed"
+}
+
 # Deploy Grafana via Operator
 deploy_grafana() {
     if [[ "$SKIP_GRAFANA" == "true" ]]; then
@@ -900,6 +1003,7 @@ print_summary() {
         fi
         if [[ -n "$VALKEY_HOST" ]]; then
             echo "  ✓ valkey-exporter"
+            echo "  ✓ celery-exporter"
             echo "    - Target: ${VALKEY_HOST}:${VALKEY_PORT}"
         fi
     fi
@@ -935,6 +1039,7 @@ main() {
     enable_user_workload_monitoring
     deploy_postgres_exporter
     deploy_valkey_exporter
+    deploy_celery_exporter
     deploy_grafana
     
     print_summary

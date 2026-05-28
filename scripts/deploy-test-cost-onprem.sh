@@ -52,6 +52,8 @@ set -euo pipefail
 #   --collect-metrics         Collect Prometheus metrics during performance tests
 #   --upload-metrics          Upload metrics to S3 after tests (requires S3_BUCKET to be set)
 #   --metrics-interval SECS   Metrics collection interval in seconds (default: 30)
+#   --grafana-links           Enable Grafana snapshot/dashboard links (disabled by default)
+#   --skip-grafana-links      Explicitly skip Grafana links (default behavior)
 #
 #   Other:
 #   --save-versions [FILE]    Save deployment version info to JSON file (default: version_info.json)
@@ -179,6 +181,7 @@ SKIP_KAFKA=false
 SKIP_HELM=false
 SKIP_TLS=false
 SKIP_TEST=false
+SKIP_GRAFANA_LINKS=${SKIP_GRAFANA_LINKS:-true}  # Skip Grafana snapshot/links (default: skip, local Grafana rarely accessible)
 
 # Color codes for output
 RED='\033[0;31m'
@@ -1366,22 +1369,27 @@ run_performance_tests() {
         fi
 
         # Link Grafana dashboard if available (non-fatal if cluster is down or Grafana not deployed)
-        local grafana_script="${scripts_dir}/push-grafana-snapshot.py"
-        if [[ -f "${grafana_script}" ]] && command -v python3 &>/dev/null; then
-            log_info "Linking Grafana dashboard (if cluster is up)..."
-            if python3 "${grafana_script}" \
-                --run-dir "${run_dir}" \
-                ${GRAFANA_URL:+--grafana-url "${GRAFANA_URL}"} \
-                ${GRAFANA_USER:+--grafana-user "${GRAFANA_USER}"} \
-                ${GRAFANA_PASSWORD:+--grafana-pass "${GRAFANA_PASSWORD}"} \
-                --namespace "${GRAFANA_NAMESPACE:-grafana}" 2>/dev/null; then
-                local links_file="${run_dir}/reports/grafana-links.json"
-                if [[ -f "${links_file}" ]]; then
-                    local snap_url
-                    snap_url=$(python3 -c "import json; d=json.load(open('${links_file}')); print(d.get('snapshot_url',''))" 2>/dev/null)
-                    [[ -n "${snap_url}" ]] && log_success "Grafana snapshot: ${snap_url}"
+        # Skip in CI with SKIP_GRAFANA_LINKS=true since local Grafana won't be accessible
+        if [[ "${SKIP_GRAFANA_LINKS}" != "true" ]]; then
+            local grafana_script="${scripts_dir}/push-grafana-snapshot.py"
+            if [[ -f "${grafana_script}" ]] && command -v python3 &>/dev/null; then
+                log_info "Linking Grafana dashboard (if cluster is up)..."
+                if python3 "${grafana_script}" \
+                    --run-dir "${run_dir}" \
+                    ${GRAFANA_URL:+--grafana-url "${GRAFANA_URL}"} \
+                    ${GRAFANA_USER:+--grafana-user "${GRAFANA_USER}"} \
+                    ${GRAFANA_PASSWORD:+--grafana-pass "${GRAFANA_PASSWORD}"} \
+                    --namespace "${GRAFANA_NAMESPACE:-grafana}" 2>/dev/null; then
+                    local links_file="${run_dir}/reports/grafana-links.json"
+                    if [[ -f "${links_file}" ]]; then
+                        local snap_url
+                        snap_url=$(python3 -c "import json; d=json.load(open('${links_file}')); print(d.get('snapshot_url',''))" 2>/dev/null)
+                        [[ -n "${snap_url}" ]] && log_success "Grafana snapshot: ${snap_url}"
+                    fi
                 fi
             fi
+        else
+            log_info "Skipping Grafana links (SKIP_GRAFANA_LINKS=true)"
         fi
     fi
 
@@ -1670,6 +1678,14 @@ main() {
                     VERSION_INFO_FILE="$2"
                     shift
                 fi
+                shift
+                ;;
+            --grafana-links)
+                SKIP_GRAFANA_LINKS=false
+                shift
+                ;;
+            --skip-grafana-links)
+                SKIP_GRAFANA_LINKS=true
                 shift
                 ;;
             --help|-h)

@@ -212,6 +212,8 @@ METRIC_NAMES=(
     celery_task_success_rate
     celery_task_failure_rate
     celery_task_duration_p95
+    celery_workers_up
+    celery_tasks_active
     # Database metrics
     pg_connections_active
     pg_connections_max
@@ -245,12 +247,14 @@ METRIC_QUERIES=(
     "sum(rate(celery_task_received_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "sum(rate(celery_task_succeeded_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "sum(rate(celery_task_failed_total{namespace=\"${NAMESPACE}\"}[5m]))"
-    "histogram_quantile(0.95, sum(rate(celery_task_runtime_seconds_bucket{namespace=\"${NAMESPACE}\"}[5m])) by (le))"
-    "pg_stat_activity_count{namespace=\"${NAMESPACE}\"}"
-    "pg_settings_max_connections{namespace=\"${NAMESPACE}\"}"
-    "pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} / (pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"koku\"} + pg_stat_database_blks_read{namespace=\"${NAMESPACE}\", datname=\"koku\"} + 0.0001) * 100"
-    "pg_database_size_bytes{namespace=\"${NAMESPACE}\", datname=\"koku\"}"
-    "pg_locks_count{namespace=\"${NAMESPACE}\", mode=\"ExclusiveLock\"}"
+    "histogram_quantile(0.95, sum(rate(celery_task_runtime_bucket{namespace=\"${NAMESPACE}\"}[5m])) by (le))"
+    "sum(celery_worker_up{namespace=\"${NAMESPACE}\"})"
+    "sum(celery_worker_tasks_active{namespace=\"${NAMESPACE}\"})"
+    "sum(pg_stat_activity_count{namespace=\"${NAMESPACE}\"})"
+    "max(pg_settings_max_connections{namespace=\"${NAMESPACE}\"})"
+    "pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} / (pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} + pg_stat_database_blks_read{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} + 0.0001) * 100"
+    "pg_database_size_bytes{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"}"
+    "sum(pg_locks_count{namespace=\"${NAMESPACE}\"})"
     "redis_memory_used_bytes{namespace=\"${NAMESPACE}\"}"
     "redis_connected_clients{namespace=\"${NAMESPACE}\"}"
     "rate(redis_commands_processed_total{namespace=\"${NAMESPACE}\"}[5m])"
