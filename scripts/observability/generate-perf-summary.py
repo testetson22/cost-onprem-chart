@@ -452,11 +452,14 @@ def update_s3_index(run_dir: Path, summary: dict,
     # Upload via aws cli / mc
     try:
         endpoint_arg = f"--endpoint-url {s3_endpoint}" if s3_endpoint else ""
-        cmd = f"aws s3 cp {tmp} s3://{s3_bucket}/{index_key} {endpoint_arg} --no-progress"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                env={**os.environ, "AWS_ACCESS_KEY_ID": aws_key,
-                                     "AWS_SECRET_ACCESS_KEY": aws_secret},
-                                timeout=30)
+        # Support public buckets (no credentials) and self-signed certs
+        no_sign = "--no-sign-request" if os.environ.get("S3_NO_SIGN_REQUEST", "true").lower() == "true" else ""
+        no_ssl  = "--no-verify-ssl" if os.environ.get("S3_NO_VERIFY_SSL", "true").lower() == "true" else ""
+        cmd = f"aws s3 cp {tmp} s3://{s3_bucket}/{index_key} {endpoint_arg} {no_sign} {no_ssl} --no-progress"
+        env = {**os.environ}
+        if aws_key and aws_secret and not no_sign:
+            env.update({"AWS_ACCESS_KEY_ID": aws_key, "AWS_SECRET_ACCESS_KEY": aws_secret})
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, timeout=30)
         tmp.unlink(missing_ok=True)
         if result.returncode == 0:
             print(f"[OK] Index updated: s3://{s3_bucket}/{index_key}")

@@ -1177,7 +1177,12 @@ upload_perf_results_to_s3() {
     log_info "Uploading to s3://${S3_BUCKET}/${s3_prefix}/"
 
     if command -v aws &>/dev/null; then
-        aws s3 sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" ${endpoint_arg} --no-progress
+        # Use --no-sign-request for public buckets (no credentials needed)
+        # Use --no-verify-ssl for self-signed certificates on internal MinIO endpoints
+        local aws_extra_args=""
+        [[ "${S3_NO_SIGN_REQUEST:-true}" == "true" ]] && aws_extra_args+=" --no-sign-request"
+        [[ "${S3_NO_VERIFY_SSL:-true}" == "true" ]] && aws_extra_args+=" --no-verify-ssl"
+        aws s3 sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" ${endpoint_arg} ${aws_extra_args} --no-progress
     elif command -v mc &>/dev/null; then
         if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
             mc alias set s3upload "${S3_ENDPOINT:-https://s3.amazonaws.com}" \
@@ -1349,15 +1354,15 @@ run_performance_tests() {
         log_info "Results: ${output_info}"
     fi
 
-    # Stop metrics collection and upload if requested
+    # Stop metrics collection
     stop_metrics_collection
-    upload_perf_results_to_s3
 
-    # Generate visual run report if we have a structured output directory
+    # Generate reports BEFORE uploading so they're included in the S3 upload
     if [[ -n "${TEST_RUN_ID:-}" ]]; then
         local run_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}"
         local scripts_dir="$(dirname "${BASH_SOURCE[0]}")/observability"
 
+        # Generate visual HTML run report
         local run_report_script="${scripts_dir}/generate-perf-run-report.py"
         if [[ -f "${run_report_script}" ]] && command -v python3 &>/dev/null; then
             log_info "Generating visual run report..."
@@ -1392,6 +1397,9 @@ run_performance_tests() {
             log_info "Skipping Grafana links (SKIP_GRAFANA_LINKS=true)"
         fi
     fi
+
+    # Upload results to S3 AFTER generating all reports
+    upload_perf_results_to_s3
 
     return ${test_result}
 }

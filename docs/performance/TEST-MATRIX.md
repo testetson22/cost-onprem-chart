@@ -78,7 +78,7 @@ Tests API response times under various conditions.
 | **API-003** | Cost model CRUD | `iterations` | `10` (via `PERF_API_003_ITERATIONS`) |
 | **API-004** | Source pagination | `page_size` | `10`, `50`, `100` |
 | **API-005** | Complex group-by | `group_by_dims` | `[project]`, `[project,node]`, `[project,cluster]` (API max: 2 dims) |
-| **API-006** | Tag filtering | `tag_count` | `1`, `5`, `10` (uses real tags from tags API; skips if insufficient tags) |
+| **API-006** | Tag filtering | `tag_count` | `1`, `5`, ~~`10`~~ (10-tag variant skipped due to NISE label issue; see `docs/proposals/nise-tag-filtering-tests.md`) |
 
 ### API Test Matrix
 
@@ -97,7 +97,7 @@ Tests API response times under various conditions.
 
 | Test | 1 tag | 5 tags | 10 tags | Notes |
 |------|-------|--------|---------|-------|
-| API-006 filters | ✓ | ✓ | ✓ | Filter complexity |
+| API-006 filters | ✓ | ✓ | ⊘ | 10-tag skipped (NISE issue) |
 
 ### Environment Variables
 

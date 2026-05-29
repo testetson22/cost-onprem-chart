@@ -913,6 +913,278 @@ def perf_cleanup(cluster_config: ClusterConfig, rh_identity_header: str):
 
 
 # =============================================================================
+# Tag Test Data Fixture
+# =============================================================================
+
+@pytest.fixture(scope="function")
+def labeled_nise_source(
+    cluster_config: ClusterConfig,
+    gateway_url: str,
+    ingress_url: str,
+    rh_identity_header: str,
+    jwt_token,
+    perf_cleanup,
+    ensure_tags_enabled,
+):
+    """Create a NISE source with labeled data for tag filtering tests.
+    
+    This fixture:
+    1. Registers a new source
+    2. Generates and uploads NISE data with pod labels
+    3. Waits for processing to complete
+    4. Ensures tags are enabled
+    5. Returns info about available tags
+    6. Cleans up the source after test
+    
+    The NISE profile includes labels like:
+    - environment:performance
+    - app:perf-baseline-c00-app
+    - tier:web|api|worker|db
+    
+    Usage:
+        def test_tag_filtering(self, labeled_nise_source, ...):
+            available_tags = labeled_nise_source["available_tags"]
+            # ... test with tags ...
+    """
+    import subprocess
+    import tempfile
+    import requests
+    from datetime import timedelta
+    from pathlib import Path
+    
+    from e2e_helpers import (
+        generate_cluster_id,
+        register_source,
+        upload_with_retry,
+        wait_for_provider,
+        wait_for_processing_complete,
+    )
+    from utils import create_upload_package_from_files
+    from .profiles import get_profile_nise_yaml
+    
+    # Get required pods
+    namespace = cluster_config.namespace
+    helm_release = cluster_config.helm_release_name
+    
+    ingress_pod = get_pod_by_label(namespace, "app.kubernetes.io/component=ingress")
+    if not ingress_pod:
+        pytest.skip("Ingress pod not found - cannot create labeled source")
+    
+    # Internal API URL for source registration
+    koku_api_url = f"http://{helm_release}-koku-api.{namespace}.svc.cluster.local:8000/api/cost-management/v1"
+    
+    # Create unique source
+    cluster_id = generate_cluster_id()
+    source_name = f"perf-tag-{cluster_id[-8:]}"
+    
+    print(f"\n[labeled_nise_source] Creating source {source_name} with labeled data")
+    
+    # Register source (requires namespace, pod, api_url, header, cluster_id, org_id, source_name)
+    source = register_source(
+        namespace,
+        ingress_pod,
+        koku_api_url,
+        rh_identity_header,
+        cluster_id,
+        "org1234567",
+        source_name,
+    )
+    
+    # Track for cleanup
+    perf_cleanup.track(
+        source_id=source.source_id,
+        cluster_id=cluster_id,
+        source_name=source_name,
+    )
+    
+    # Generate NISE data with labels
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=1)
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Generate YAML with labels
+        yaml_content = get_profile_nise_yaml("baseline", start_date, end_date, cluster_id, 0)
+        yaml_path = os.path.join(temp_dir, "static_report.yml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
+        
+        # Run NISE
+        nise_output = os.path.join(temp_dir, "nise_output")
+        os.makedirs(nise_output, exist_ok=True)
+        
+        result = subprocess.run(
+            ["nise", "report", "ocp",
+             "--static-report-file", yaml_path,
+             "--ocp-cluster-id", cluster_id,
+             "-w"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=nise_output,
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"NISE failed: {result.stderr}")
+        
+        # Collect generated files
+        csv_files = list(Path(nise_output).rglob("*.csv"))
+        pod_usage_files = [str(f) for f in csv_files if "pod_usage" in f.name.lower()]
+        node_label_files = [str(f) for f in csv_files if "node_label" in f.name.lower()]
+        namespace_label_files = [str(f) for f in csv_files if "namespace_label" in f.name.lower()]
+        
+        print(f"[labeled_nise_source] Generated {len(csv_files)} CSV files, {len(pod_usage_files)} with pod data")
+        
+        # Create upload package
+        package_path = create_upload_package_from_files(
+            pod_usage_files=pod_usage_files,
+            ros_usage_files=[],
+            cluster_id=cluster_id,
+            start_date=start_date,
+            end_date=end_date,
+            node_label_files=node_label_files if node_label_files else None,
+            namespace_label_files=namespace_label_files if namespace_label_files else None,
+        )
+        
+        # Upload - ingress requires JWT auth, not RH-Identity
+        session = requests.Session()
+        session.verify = False
+        
+        response = upload_with_retry(
+            session,
+            f"{ingress_url}/v1/upload",
+            package_path,
+            jwt_token.authorization_header,
+            max_retries=3,
+        )
+        
+        print(f"[labeled_nise_source] Upload status: {response.status_code}")
+    
+    # Wait for full processing including summarization (tags require summarized data)
+    db_pod = get_pod_by_label(namespace, "app.kubernetes.io/component=database")
+    if db_pod:
+        # Step 1: Wait for provider to be created (manifest entry)
+        print("[labeled_nise_source] Waiting for provider to be created...")
+        wait_for_provider(
+            namespace,
+            db_pod,
+            cluster_id,
+            timeout=120,
+        )
+        
+        # Step 2: Wait for processing to complete (including summarization)
+        print("[labeled_nise_source] Waiting for data processing and summarization...")
+        result = wait_for_processing_complete(
+            namespace,
+            db_pod,
+            cluster_id,
+            poll_interval=10,
+            max_wait_seconds=300,
+        )
+        print(f"[labeled_nise_source] Processing result: complete={result.get('complete')}, elapsed={result.get('elapsed_s', '?')}s")
+    else:
+        # Fallback: just wait a fixed time
+        print("[labeled_nise_source] DB pod not found, waiting 90s for processing...")
+        time.sleep(90)
+    
+    # Tags are discovered during Celery summarization tasks, which run asynchronously
+    # after the manifest is marked complete. Poll for our NISE tags to appear.
+    from conftest import enable_tags_via_api
+    auth_header = {"Authorization": f"Bearer {jwt_token.access_token}"}
+    
+    # Core NISE tags we expect to see (must be present for test to pass)
+    # Using NATO-style arbitrary names to avoid reserved word issues
+    core_nise_tags = ["tagone", "tagtwo", "tagthree"]
+    
+    # All NISE tags we'll try to enable
+    nise_tag_keys = [
+        # Pod labels (10) - NATO-style arbitrary names
+        "tagone", "tagtwo", "tagthree", "tagfour", "tagfive",
+        "tagsix", "tagseven", "tageight", "tagnine", "tagten",
+        # Namespace labels (2)
+        "nslabel1", "nslabel2",
+        # Node labels (3)
+        "nodelabel1", "nodelabel2", "nodelabel3",
+    ]
+    
+    # Poll until our core NISE tags are discoverable (max 120s)
+    max_tag_wait = 120
+    poll_interval = 10
+    tag_wait_start = time.time()
+    discovered_tags = []
+    
+    print(f"[labeled_nise_source] Waiting for NISE tags to be discovered (max {max_tag_wait}s)...")
+    
+    while time.time() - tag_wait_start < max_tag_wait:
+        # Try to enable tags - this will tell us which ones exist
+        enable_result = enable_tags_via_api(gateway_url, auth_header, nise_tag_keys)
+        discovered_tags = enable_result.get('enabled', []) + enable_result.get('already_enabled', [])
+        
+        # Check if our core tags are present
+        core_found = [t for t in core_nise_tags if t in discovered_tags]
+        elapsed = round(time.time() - tag_wait_start, 1)
+        
+        print(f"[labeled_nise_source] {elapsed}s — discovered {len(discovered_tags)} tags, core: {core_found}")
+        
+        if len(core_found) >= len(core_nise_tags):
+            print(f"[labeled_nise_source] Core tags discovered in {elapsed}s")
+            break
+        
+        time.sleep(poll_interval)
+    else:
+        # Timeout - continue anyway but log warning
+        print(f"[labeled_nise_source] Warning: tag discovery timed out after {max_tag_wait}s")
+    
+    # Final enable attempt for all tags
+    print(f"[labeled_nise_source] Final tag enablement ({len(nise_tag_keys)} keys)...")
+    enable_result = enable_tags_via_api(gateway_url, auth_header, nise_tag_keys)
+    print(f"[labeled_nise_source] Enabled: {enable_result.get('enabled', [])}")
+    if enable_result.get('already_enabled'):
+        print(f"[labeled_nise_source] Already enabled: {enable_result.get('already_enabled', [])}")
+    if enable_result.get('not_found'):
+        print(f"[labeled_nise_source] Not found: {enable_result.get('not_found', [])}")
+    
+    # Query available tags - gateway requires JWT auth, not RH-Identity
+    session = requests.Session()
+    session.verify = False
+    session.headers["Authorization"] = f"Bearer {jwt_token.access_token}"
+    
+    tags_response = session.get(
+        f"{gateway_url}/cost-management/v1/tags/openshift/",
+        timeout=30,
+    )
+    
+    available_tags = []
+    if tags_response.status_code == 200:
+        tag_data = tags_response.json().get("data", [])
+        for entry in tag_data:
+            if isinstance(entry, dict) and "key" in entry:
+                available_tags.append(entry["key"])
+            elif isinstance(entry, str):
+                available_tags.append(entry)
+    
+    print(f"[labeled_nise_source] Available tags: {available_tags}")
+    
+    yield {
+        "source_id": source.source_id,
+        "source_name": source_name,
+        "cluster_id": cluster_id,
+        "available_tags": available_tags,
+        # Expected NISE labels (from profiles.py with label_ prefix stripped)
+        # Using NATO-style arbitrary names to avoid reserved word issues
+        # Pod labels (10): tagone-tagten
+        # Namespace labels (2): nslabel1, nslabel2
+        # Node labels (3): nodelabel1-3
+        # Total: 15 unique tag keys
+        "expected_labels": [
+            "tagone", "tagtwo", "tagthree", "tagfour", "tagfive",
+            "tagsix", "tagseven", "tageight", "tagnine", "tagten",
+        ],
+    }
+    
+    # Cleanup handled by perf_cleanup fixture
+
+
+# =============================================================================
 # Queue Depth Helpers
 # =============================================================================
 
