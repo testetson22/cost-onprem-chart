@@ -43,7 +43,7 @@ Tests data upload and processing capacity.
 | **ING-003** | Concurrent uploads | `concurrent_sources` | `2`, `5`, `10` |
 | **ING-004** | Large file upload (50MB+) | `target_size_mb` | `50`, `100` |
 | **ING-005** | High frequency uploads | - | (configurable via env) |
-| **ING-006** | Processing window validation | `profile_name` | cumulative per `PERF_PROFILE`: baseline adds `baseline`, small adds `small`, etc. |
+| **ING-006** | Processing window validation | `profile_name` | **Opt-in** via `ING_006_ENABLED=true` (SC-4 SLA validation) |
 
 ### Ingestion Test Matrix
 
@@ -54,7 +54,7 @@ Tests data upload and processing capacity.
 | ING-003 | - | 2/5/10 concurrent | - | - | - | Concurrency limits |
 | ING-004 | - | - | - | 50MB | 100MB | Large file uploads |
 | ING-005 | - | ✓ | - | - | - | Sustained load |
-| ING-006 | - | ✓ | ✓ | ✓ | - | 6-hour window |
+| ING-006 | ⊘ | ⊘ | ⊘ | ⊘ | - | Opt-in: `ING_006_ENABLED=true` |
 
 ### Environment Variables
 
@@ -63,6 +63,7 @@ Tests data upload and processing capacity.
 | `PERF_ING_005_DURATION_MINUTES` | 15 | High-frequency test duration |
 | `PERF_ING_005_INTERVAL_SECONDS` | 300 | Upload interval |
 | `PERF_INGESTION_BURST_DAYS` | 30 | Default burst duration |
+| `ING_006_ENABLED` | `false` | **Required** - Enable SC-4 processing window test (~1 hour) |
 | `PERF_ING_006_UPLOADS` | 2 (baseline profile) / 4 (small+) | Daily uploads to simulate |
 
 ---
@@ -170,10 +171,13 @@ Tests long-running stability and resource trends.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `SOAK_TESTS` | `false` | **Required** - Set to `true` to enable soak tests |
 | `SOAK_DURATION_HOURS` | 1 | Test duration |
 | `SOAK_UPLOAD_INTERVAL_MINUTES` | 15 | Upload frequency |
 | `SOAK_QUERY_INTERVAL_MINUTES` | 5 | Query frequency |
 | `SOAK_METRICS_INTERVAL_SECONDS` | 60 | Metrics collection |
+
+**Note:** Soak tests are **opt-in** and independent of `PERF_PROFILE`. They require explicit `SOAK_TESTS=true` because they run for hours and need pre-validated data setup.
 
 ### Soak Duration Recommendations
 
@@ -183,6 +187,38 @@ Tests long-running stability and resource trends.
 | Standard | 1h | Nightly |
 | Extended | 4h | Weekly |
 | Full soak | 24h | Release qualification |
+
+---
+
+## Quick Reference: Flags → Actions
+
+Example command:
+```bash
+S3_BUCKET="eco-bucket-perf-scale" \
+S3_PREFIX="cost-onprem-performance/" \
+S3_ENDPOINT="https://minio-s3-..." \
+./scripts/deploy-test-cost-onprem.sh \
+  --skip-deploy --perf-only --perf-profile small --collect-metrics --upload-metrics
+```
+
+| Flag / Env Var | Effect |
+|----------------|--------|
+| `--skip-deploy` | Skip Helm install, use existing deployment |
+| `--perf-only` | Run only performance tests (skip E2E/IQE) |
+| `--perf-profile small` | Use `small` profile: ING-002, ING-004, ING-005, ING-006, extended SCALE/ROS tests |
+| `--collect-metrics` | Capture Prometheus snapshots during tests |
+| `--upload-metrics` | Sync results to S3 after tests complete |
+| `S3_BUCKET` | Target bucket for uploads |
+| `S3_ENDPOINT` | Custom S3 endpoint (MinIO, ODF, etc.) |
+| `SOAK_TESTS=true` | Enable soak tests (opt-in, adds ~4 hours) |
+| `ING_006_ENABLED=true` | Enable ING-006 processing window test (opt-in, adds ~1 hour) |
+
+| Profile | Tests Run | Skipped | Duration |
+|---------|-----------|---------|----------|
+| `baseline` | ING-001, API-*, SCALE-001[5], ROS-001/003 | ING-002/004/005/006, SOAK-* | ~30-50 min |
+| `small` | Above + ING-002/004/005, extended SCALE/ROS | ING-006, SOAK-* | ~2 hours |
+| `small` + `ING_006_ENABLED=true` | Above + ING-006 (SC-4 window validation) | SOAK-* | ~3 hours |
+| `small` + `SOAK_TESTS=true` | Above + SOAK-001/002/003/004 | ING-006 | ~6 hours |
 
 ---
 
@@ -216,7 +252,7 @@ PERF_PROFILE=medium pytest -m performance --timeout=28800 -v
 
 ### Profile-Specific
 ```bash
-# Small profile
+# Small profile (excludes soak tests by default)
 PERF_PROFILE=small pytest -m performance -v
 
 # Medium profile (longer timeouts)
@@ -224,6 +260,18 @@ PERF_PROFILE=medium pytest -m performance --timeout=14400 -v
 
 # Large profile (stress testing)
 PERF_PROFILE=large pytest -m performance --timeout=28800 -v
+```
+
+### Soak Tests (opt-in, separate from profiles)
+```bash
+# Run soak tests with 1-hour duration (default)
+SOAK_TESTS=true pytest -m soak -v
+
+# Run soak tests with custom duration
+SOAK_TESTS=true SOAK_DURATION_HOURS=4 pytest -m soak --timeout=18000 -v
+
+# Combine with performance tests (not recommended - very long runtime)
+PERF_PROFILE=small SOAK_TESTS=true pytest -m performance --timeout=28800 -v
 ```
 
 ---

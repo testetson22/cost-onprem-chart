@@ -34,6 +34,22 @@ from .conftest import (
 
 
 # =============================================================================
+# Profile-Aware Thresholds
+# =============================================================================
+_ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
+
+# API-005 P95 latency thresholds by profile.
+# Larger profiles have more data, causing longer query times for complex group-by.
+_API_005_P95_THRESHOLDS = {
+    "baseline": 10.0,   # 10s for minimal data
+    "small":    15.0,   # 15s for 15 nodes, 10 namespaces
+    "medium":   20.0,   # 20s for larger datasets
+    "large":    25.0,   # 25s for production-scale data
+}
+API_005_P95_THRESHOLD = _API_005_P95_THRESHOLDS.get(_ACTIVE_PROFILE, 10.0)
+
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -452,7 +468,10 @@ class TestAPILatency:
             "success_rate": result["success_rate"],
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = result["success_rate"] >= 0.95
+        perf_result.passed = (
+            result["success_rate"] >= 0.95 and
+            result["latencies"]["p95"] < 3.0
+        )
         
         perf_collector.add_result(perf_result)
         
@@ -508,15 +527,18 @@ class TestAPILatency:
             "success_rate": result["success_rate"],
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = result["success_rate"] >= 0.90
+        perf_result.passed = (
+            result["success_rate"] >= 0.90 and
+            result["latencies"]["p95"] < API_005_P95_THRESHOLD
+        )
         
         perf_collector.add_result(perf_result)
         
         assert result["success_rate"] >= 0.90, (
             f"Success rate {result['success_rate']:.0%} below 90% threshold"
         )
-        assert result["latencies"]["p95"] < 10.0, (
-            f"P95 latency for {len(group_by_dims)}-dim group_by exceeds 10s"
+        assert result["latencies"]["p95"] < API_005_P95_THRESHOLD, (
+            f"P95 latency for {len(group_by_dims)}-dim group_by exceeds {API_005_P95_THRESHOLD}s ({_ACTIVE_PROFILE} profile)"
         )
     
     @pytest.mark.parametrize("tag_count", [
@@ -600,7 +622,10 @@ class TestAPILatency:
             "success_rate": result["success_rate"],
         }
         perf_result.timings = perf_timer.get_timings()
-        perf_result.passed = result["success_rate"] >= 0.95
+        perf_result.passed = (
+            result["success_rate"] >= 0.95 and
+            result["latencies"]["p95"] < 5.0
+        )
         
         perf_collector.add_result(perf_result)
         

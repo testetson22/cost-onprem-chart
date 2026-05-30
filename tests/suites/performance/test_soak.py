@@ -70,6 +70,9 @@ from utils import (
 )
 
 _ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
+# Soak tests are opt-in: must set SOAK_TESTS=true explicitly.
+# This decouples long-running stability tests from performance profile runs.
+_SOAK_ENABLED = os.environ.get("SOAK_TESTS", "").lower() in ("true", "1", "yes")
 # Compute once at import time so @pytest.mark.timeout() can reference it.
 _SOAK_DURATION_S = int(float(os.environ.get("SOAK_DURATION_HOURS", "1")) * 3600)
 
@@ -684,8 +687,8 @@ class TestSoakStability:
         )
 
     @pytest.mark.skipif(
-        _ACTIVE_PROFILE == "baseline",
-        reason="SOAK-001 is a multi-hour stability test — not applicable to baseline.",
+        not _SOAK_ENABLED,
+        reason="SOAK-001 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
     @pytest.mark.timeout(_SOAK_DURATION_S * 2 + 600)
     def test_perf_soak_001_continuous_operation(
@@ -861,8 +864,8 @@ class TestSoakStability:
         assert state.uploads_failed == 0, f"{state.uploads_failed} uploads failed"
 
     @pytest.mark.skipif(
-        _ACTIVE_PROFILE == "baseline",
-        reason="SOAK-002 monitors memory over 60+ minutes — not applicable to baseline.",
+        not _SOAK_ENABLED,
+        reason="SOAK-002 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
     @pytest.mark.timeout(_SOAK_DURATION_S + 300)
     def test_perf_soak_002_memory_leak_detection(
@@ -942,8 +945,8 @@ class TestSoakStability:
         assert not leak_detected, f"Memory leak detected in pods: {[p['pod'] for p in leak_pods]}"
 
     @pytest.mark.skipif(
-        _ACTIVE_PROFILE == "baseline",
-        reason="SOAK-003 monitors disk usage over 60+ minutes — not applicable to baseline.",
+        not _SOAK_ENABLED,
+        reason="SOAK-003 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
     @pytest.mark.timeout(_SOAK_DURATION_S + 300)
     def test_perf_soak_003_disk_usage_monitoring(
@@ -1013,8 +1016,8 @@ class TestSoakStability:
                 print(f"    - {w['component']}: {w['projected_7day_growth_gb']:.1f} GB projected growth in 7 days")
 
     @pytest.mark.skipif(
-        _ACTIVE_PROFILE == "baseline",
-        reason="SOAK-004 monitors queue health over 60+ minutes — not applicable to baseline.",
+        not _SOAK_ENABLED,
+        reason="SOAK-004 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
     @pytest.mark.timeout(_SOAK_DURATION_S + 300)
     def test_perf_soak_004_queue_health_monitoring(

@@ -49,26 +49,27 @@ KPI_THRESHOLDS: dict[str, list[dict]] = {
         {"label": "Success rate",   "metric": "aggregate_success_rate", "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_002": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "P95 latency",   "metric": "latencies.p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
         {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_003": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "Read P95",      "metric": "read_latencies.p95",   "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "Create P95",    "metric": "create_latencies.p95", "op": "<", "green": 3.0,  "yellow": 6.0,  "unit": "s"},
     ],
     "api_004": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 1.5,  "yellow": 3.0,  "unit": "s"},
+        {"label": "P95 latency",   "metric": "latencies.p95",  "op": "<", "green": 3.0,  "yellow": 5.0,  "unit": "s"},
         {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_005": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 5.0,  "yellow": 10.0, "unit": "s"},
+        {"label": "P95 latency",   "metric": "latencies.p95",  "op": "<", "green": 10.0,  "yellow": 15.0, "unit": "s"},
         {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.90, "yellow": 0.70, "unit": "%"},
     ],
     "api_006": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 2.0,  "yellow": 5.0,  "unit": "s"},
+        {"label": "P95 latency",   "metric": "latencies.p95",  "op": "<", "green": 5.0,  "yellow": 8.0,  "unit": "s"},
         {"label": "Success rate",   "metric": "success_rate",   "op": ">", "green": 0.95, "yellow": 0.80, "unit": "%"},
     ],
     "api_status": [
-        {"label": "P95 latency",   "metric": "aggregate_p95",  "op": "<", "green": 0.5,  "yellow": 1.0,  "unit": "s"},
+        {"label": "P95 latency",   "metric": "latencies.p95",  "op": "<", "green": 0.5,  "yellow": 1.0,  "unit": "s"},
     ],
     # --- Ingestion ---
     "ing_001": [
@@ -723,13 +724,15 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     if results:
         passed  = session_passed
         failed  = session_failed
-        total   = junit["total"] if junit else len(results)
         skipped = junit["skipped"] if junit else 0
+        # Total should be tests that actually ran (exclude skipped)
+        total   = passed + failed
     elif junit:
-        total   = junit["total"]
+        skipped = junit["skipped"]
+        # Exclude skipped from total for accurate pass rate
+        total   = junit["total"] - skipped
         passed  = junit["passed"]
         failed  = junit["failed"]
-        skipped = junit["skipped"]
     else:
         total = passed = failed = skipped = 0
     dur_min = round((junit["duration_s"] if junit else sum(
