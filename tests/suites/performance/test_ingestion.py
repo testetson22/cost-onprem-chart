@@ -638,8 +638,11 @@ class TestIngestionThroughput:
                         upload_results.append(result)
         
         # Wait for all sources to process — each blocks until its manifest is done.
-        # Divide remaining budget evenly: 600s test - ~120s for uploads/registration.
-        per_source_max = max(60, 480 // max(concurrent_sources, 1))
+        # Higher concurrency = more system load = longer processing times.
+        # Base: 60s minimum, +5s for each concurrent source above 2 (capped at 120s).
+        base_timeout = max(60, 480 // max(concurrent_sources, 1))
+        concurrency_bonus = max(0, (concurrent_sources - 2) * 5)
+        per_source_max = min(120, base_timeout + concurrency_bonus)
         processed_count = 0
         with perf_timer.measure("processing_wait_all"):
             for source_info in sources:

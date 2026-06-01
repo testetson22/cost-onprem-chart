@@ -37,8 +37,19 @@ from .conftest import (
     PerformanceResult,
 )
 from .test_ingestion import generate_and_upload_data
+from .profiles import PROFILES
 
 _ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
+
+
+def _get_profile_workload_count(profile_name: str) -> int:
+    """Calculate total workload (pod) count for a profile."""
+    profile = PROFILES.get(profile_name, PROFILES["baseline"])
+    return (
+        profile["namespaces_per_cluster"]
+        * profile["pods_per_namespace"]
+        * profile["clusters"]
+    )
 
 
 # =============================================================================
@@ -452,17 +463,18 @@ class TestROSPerformance:
         rh_identity_header: str,
     ):
         """PERF-ROS-002: Multi-workload scale test.
-        
+
         Measures:
-        - Time to process 50 workloads concurrently
+        - Time to process workloads from active profile concurrently
         - Kruize memory usage under load
         - ROS event queue depth
-        
-        Expected: All 50 workloads processed within 15 minutes
+
+        Expected: All profile workloads processed within 15 minutes
         """
         cluster_id = generate_cluster_id()
         source_name = f"perf-ros-002-{uuid.uuid4().hex[:8]}"
-        num_workloads = 50
+        # Use workload count from active profile (pods = workloads for Kruize)
+        num_workloads = _get_profile_workload_count(_ACTIVE_PROFILE)
         
         # Capture initial Kruize memory
         initial_heap = get_kruize_heap_usage(cluster_config.namespace)
@@ -486,7 +498,7 @@ class TestROSPerformance:
             source_name=source_name,
         )
         
-        # Generate and upload 50 workloads
+        # Generate and upload workloads based on active profile
         end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=7)
         
@@ -498,7 +510,7 @@ class TestROSPerformance:
                 end_date=end_date,
                 ingress_url=gateway_url + "/ingress",
                 jwt_token=jwt_token,
-                profile_name="baseline",
+                profile_name=_ACTIVE_PROFILE,
             )
         
         assert upload_result.get("upload_status") == 202, f"Upload failed: {upload_result}"
@@ -753,17 +765,18 @@ class TestROSPerformance:
         rh_identity_header: str,
     ):
         """PERF-ROS-004: Kruize memory pressure test.
-        
+
         Measures:
-        - Kruize heap usage with high workload count
+        - Kruize heap usage with profile workload count
         - Memory stability under sustained load
         - OOM risk assessment
-        
+
         Expected: No OOM, heap stays within limits
         """
         cluster_id = generate_cluster_id()
         source_name = f"perf-ros-004-{uuid.uuid4().hex[:8]}"
-        num_workloads = 100  # High workload count to stress Kruize
+        # Use workload count from active profile
+        num_workloads = _get_profile_workload_count(_ACTIVE_PROFILE)
         
         # Get Kruize pod limits
         kruize_pod = get_pod_by_label(cluster_config.namespace, "app.kubernetes.io/component=ros-optimization")
@@ -813,7 +826,7 @@ class TestROSPerformance:
         monitor.start()
         
         try:
-            # Generate and upload high workload count
+            # Generate and upload workloads based on active profile
             end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=7)
             
@@ -825,7 +838,7 @@ class TestROSPerformance:
                     end_date=end_date,
                     ingress_url=gateway_url + "/ingress",
                     jwt_token=jwt_token,
-                    profile_name="baseline",
+                    profile_name=_ACTIVE_PROFILE,
                 )
 
             assert upload_result.get("upload_status") == 202, f"Upload failed: {upload_result}"

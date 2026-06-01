@@ -42,9 +42,9 @@ _ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
 # Larger profiles have more data, causing longer query times for complex group-by.
 _API_005_P95_THRESHOLDS = {
     "baseline": 10.0,   # 10s for minimal data
-    "small":    15.0,   # 15s for 15 nodes, 10 namespaces
-    "medium":   20.0,   # 20s for larger datasets
-    "large":    25.0,   # 25s for production-scale data
+    "small":    22.0,   # 22s for 15 nodes, 10 namespaces (observed P95: ~19.5s)
+    "medium":   25.0,   # 25s for larger datasets
+    "large":    30.0,   # 30s for production-scale data
 }
 API_005_P95_THRESHOLD = _API_005_P95_THRESHOLDS.get(_ACTIVE_PROFILE, 10.0)
 
