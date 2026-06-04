@@ -1391,9 +1391,12 @@ apply_perf_profile_config() {
         chart_ref="cost-onprem-chart/cost-onprem"
     fi
 
+    # --no-hooks skips pre/post-upgrade hook jobs (e.g. rbac-migrate).
+    # Profile config only changes resource limits and timeouts — no schema migrations.
     log_info "Applying resource/timeout overrides via helm upgrade..."
     if ! helm upgrade "${release}" "${chart_ref}" \
             --reuse-values \
+            --no-hooks \
             --namespace "${namespace}" \
             --set "resources.kruize.requests.cpu=${kruize_cpu_req}" \
             --set "resources.kruize.limits.cpu=${kruize_cpu_lim}" \
@@ -1406,10 +1409,10 @@ apply_perf_profile_config() {
             --set "jwtAuth.envoy.ingressPerTryTimeout=${ingress_per_try_timeout}" \
             --set "gatewayRoute.annotations.haproxy\\.router\\.openshift\\.io/timeout=${haproxy_timeout}" \
             --wait --timeout 5m 2>&1; then
-        log_error "helm upgrade for perf config failed"
-        return 1
+        log_warning "helm upgrade for profile config failed — continuing with oc scale only; resource limits may not match profile"
+    else
+        log_success "Resource/timeout overrides applied"
     fi
-    log_success "Resource/timeout overrides applied"
 
     # -------------------------------------------------------------------------
     # Phase 2: oc scale — replica counts (faster than helm upgrade)
