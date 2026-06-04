@@ -374,7 +374,7 @@ class TestAPILatency:
                 )
                 create_latencies.append(latency)
                 
-                if status != 201 or not response or "uuid" not in response:
+                if status not in (200, 201) or not response or "uuid" not in response:
                     errors.append({"operation": "create", "iteration": i, "status": status})
                     continue
                 

@@ -43,7 +43,7 @@ Tests data upload and processing capacity.
 | **ING-003** | Concurrent uploads | `concurrent_sources` | `2`, `5`, `10` |
 | **ING-004** | Large file upload (50MB+) | `target_size_mb` | `50`, `100` |
 | **ING-005** | High frequency uploads | - | (configurable via env) |
-| **ING-006** | Processing window validation | `profile_name` | **Opt-in** via `ING_006_ENABLED=true` (SC-4 SLA validation) |
+| **ING-006** | Processing window validation | `profile_name` | Runs for small/medium/large profiles (SC-4 SLA validation) |
 
 ### Ingestion Test Matrix
 
@@ -54,7 +54,7 @@ Tests data upload and processing capacity.
 | ING-003 | - | 2/5/10 concurrent | - | - | - | Concurrency limits |
 | ING-004 | - | - | - | 50MB | 100MB | Large file uploads |
 | ING-005 | - | ✓ | - | - | - | Sustained load |
-| ING-006 | ⊘ | ⊘ | ⊘ | ⊘ | - | Opt-in: `ING_006_ENABLED=true` |
+| ING-006 | - | ✓ | ✓ | ✓ | - | SC-4 window validation |
 
 ### Environment Variables
 
@@ -63,7 +63,6 @@ Tests data upload and processing capacity.
 | `PERF_ING_005_DURATION_MINUTES` | 15 | High-frequency test duration |
 | `PERF_ING_005_INTERVAL_SECONDS` | 300 | Upload interval |
 | `PERF_INGESTION_BURST_DAYS` | 30 | Default burst duration |
-| `ING_006_ENABLED` | `false` | **Required** - Enable SC-4 processing window test (~1 hour) |
 | `PERF_ING_006_UPLOADS` | 2 (baseline profile) / 4 (small+) | Daily uploads to simulate |
 
 ---
@@ -211,14 +210,12 @@ S3_ENDPOINT="https://minio-s3-..." \
 | `S3_BUCKET` | Target bucket for uploads |
 | `S3_ENDPOINT` | Custom S3 endpoint (MinIO, ODF, etc.) |
 | `SOAK_TESTS=true` | Enable soak tests (opt-in, adds ~4 hours) |
-| `ING_006_ENABLED=true` | Enable ING-006 processing window test (opt-in, adds ~1 hour) |
 
 | Profile | Tests Run | Skipped | Duration |
 |---------|-----------|---------|----------|
 | `baseline` | ING-001, API-*, SCALE-001[5], ROS-001/003 | ING-002/004/005/006, SOAK-* | ~30-50 min |
-| `small` | Above + ING-002/004/005, extended SCALE/ROS | ING-006, SOAK-* | ~2 hours |
-| `small` + `ING_006_ENABLED=true` | Above + ING-006 (SC-4 window validation) | SOAK-* | ~3 hours |
-| `small` + `SOAK_TESTS=true` | Above + SOAK-001/002/003/004 | ING-006 | ~6 hours |
+| `small` | Above + ING-002/004/005/006, extended SCALE/ROS | SOAK-* | ~2 hours |
+| `small` + `SOAK_TESTS=true` | Above + SOAK-001/002/003/004 | — | ~6 hours |
 
 ---
 

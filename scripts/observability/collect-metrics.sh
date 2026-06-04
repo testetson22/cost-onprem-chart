@@ -206,14 +206,16 @@ METRIC_NAMES=(
     api_latency_p99
     api_error_rate
     # Celery/Processing metrics
-    celery_queue_depth_total
-    celery_queue_depth_by_queue
+    # Note: celery_queue_length is unreliable with Redis/Valkey due to worker
+    # prefetch (tasks are pulled from broker immediately, so LLEN is always 0).
+    # Instead we track active tasks, throughput, and task runtime.
+    celery_tasks_active
     celery_task_rate
     celery_task_success_rate
     celery_task_failure_rate
     celery_task_duration_p95
     celery_workers_up
-    celery_tasks_active
+    celery_active_process_count
     # Database metrics
     pg_connections_active
     pg_connections_max
@@ -249,14 +251,13 @@ METRIC_QUERIES=(
     "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
     "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"${NAMESPACE}\", job=~\".*koku.*\"}[5m])) by (le))"
     "sum(rate(http_requests_total{namespace=\"${NAMESPACE}\", job=~\".*koku.*\", status=~\"5..\"}[5m]))"
-    "sum(celery_queue_length{namespace=\"${NAMESPACE}\"})"
-    "celery_queue_length{namespace=\"${NAMESPACE}\"}"
+    "sum(celery_worker_tasks_active{namespace=\"${NAMESPACE}\"})"
     "sum(rate(celery_task_received_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "sum(rate(celery_task_succeeded_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "sum(rate(celery_task_failed_total{namespace=\"${NAMESPACE}\"}[5m]))"
     "histogram_quantile(0.95, sum(rate(celery_task_runtime_bucket{namespace=\"${NAMESPACE}\"}[5m])) by (le))"
     "sum(celery_worker_up{namespace=\"${NAMESPACE}\"})"
-    "sum(celery_worker_tasks_active{namespace=\"${NAMESPACE}\"})"
+    "sum(celery_active_process_count{namespace=\"${NAMESPACE}\"})"
     "sum(pg_stat_activity_count{namespace=\"${NAMESPACE}\"})"
     "max(pg_settings_max_connections{namespace=\"${NAMESPACE}\"})"
     "pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} / (pg_stat_database_blks_hit{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} + pg_stat_database_blks_read{namespace=\"${NAMESPACE}\", datname=\"costonprem_koku\"} + 0.0001) * 100"

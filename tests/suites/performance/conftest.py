@@ -28,6 +28,37 @@ from conftest import ClusterConfig, DatabaseConfig
 from utils import run_oc_command, get_pod_by_label
 
 
+# ---------------------------------------------------------------------------
+# Test ordering — run ROS tests before ingestion tests (PERF-FINDING-013)
+# ---------------------------------------------------------------------------
+# The ros-processor cannot skip FK-errored Kafka events.  If ingestion tests
+# run first and their cleanup deletes sources before the ROS queue drains,
+# poison pills block the queue for all subsequent ROS tests.  Running the ROS
+# suite earlier avoids this entirely.
+# ---------------------------------------------------------------------------
+_PERF_FILE_ORDER = [
+    "test_api_latency",
+    "test_ros",
+    "test_ingestion",
+    "test_scale",
+    "test_soak",
+]
+
+
+def pytest_collection_modifyitems(items: list) -> None:
+    """Sort performance test items by the preferred file execution order."""
+
+    def _sort_key(item: pytest.Item) -> tuple:
+        fname = Path(item.fspath).stem
+        try:
+            idx = _PERF_FILE_ORDER.index(fname)
+        except ValueError:
+            idx = len(_PERF_FILE_ORDER)
+        return (idx, item.fspath, item.name)
+
+    items.sort(key=_sort_key)
+
+
 # =============================================================================
 # Centralized Performance Test Configuration
 # =============================================================================
@@ -799,6 +830,48 @@ class PerfCleanupTracker:
             source_name=source_name,
         ))
     
+    def _wait_for_ros_drain(self):
+        """Wait for the ROS processor Kafka consumer lag to reach zero.
+
+        The ros-processor is a Go-based Kafka consumer on ``hccm.ros.events``.
+        If we delete sources before it has consumed the corresponding events,
+        it hits FK constraint errors that poison the queue.  We must wait for
+        the queue to fully drain before deleting any sources.
+
+        The timeout scales with the number of tracked resources — more sources
+        means more ROS events to process (~3s per workload via Kruize API).
+        We also track whether lag is making progress; if lag stalls completely
+        for ``stall_timeout`` seconds we give up (processor may be stuck on
+        an unrelated error).
+        """
+        try:
+            from suites.performance.test_ros import get_ros_queue_depth
+        except ImportError:
+            return
+
+        num_resources = len(self.resources)
+        max_timeout = max(120, num_resources * 60)
+        stall_timeout = 90
+
+        start = time.time()
+        prev_lag = None
+        last_progress_time = start
+        while time.time() - start < max_timeout:
+            lag = get_ros_queue_depth(self.namespace)
+            if lag is not None and lag == 0:
+                return
+            if lag is not None:
+                if lag != prev_lag:
+                    print(f"  [ros-drain] lag={lag}, waiting…")
+                    if prev_lag is not None and lag < prev_lag:
+                        last_progress_time = time.time()
+                    prev_lag = lag
+                elif time.time() - last_progress_time > stall_timeout:
+                    print(f"  [ros-drain] lag stalled at {lag} for {stall_timeout}s, giving up")
+                    return
+            time.sleep(5)
+        print(f"  [ros-drain] drained to lag={prev_lag} (timeout {max_timeout}s)")
+
     def cleanup(self, rh_identity_header: str):
         """Clean up all tracked resources.
 
@@ -816,6 +889,12 @@ class PerfCleanupTracker:
             return
         
         print(f"\n[PERF CLEANUP] Cleaning {len(self.resources)} tracked resources...")
+        
+        # Wait for the ROS processor to consume any pending Kafka events
+        # before deleting sources.  Ingestion tests produce ROS events as a
+        # side-effect; deleting the source first removes FK targets that the
+        # ros-processor needs, poisoning its Kafka queue with permanent errors.
+        self._wait_for_ros_drain()
         
         # Get pods for cleanup operations
         ingress_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=ingress")

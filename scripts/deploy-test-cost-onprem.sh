@@ -45,10 +45,12 @@ set -euo pipefail
 #   --include-ui              Include UI tests (requires Playwright system dependencies)
 #   --run-perf                Run performance tests after deployment (FLPATH-4036)
 #   --perf-profile PROFILE    Performance profile: baseline, small, medium, large (default: baseline)
+#   --perf-suite SUITES       Performance suite(s): all, api, ros, ingestion, scale, soak
+#                             Comma-separated for multiple (e.g., ros,ingestion). Default: all
 #   --perf-only               Run only performance tests (skip deployment and chart tests)
 #
 #   Observability options (FLPATH-4061):
-#   --deploy-observability    Deploy postgres_exporter and valkey-exporter for metrics
+#   --deploy-observability    Deploy postgres_exporter, valkey-exporter, and celery-exporter for metrics
 #   --collect-metrics         Collect Prometheus metrics during performance tests
 #   --upload-metrics          Upload metrics to S3 after tests (requires S3_BUCKET to be set)
 #   --metrics-interval SECS   Metrics collection interval in seconds (default: 30)
@@ -132,6 +134,7 @@ IQE_MARKER="${IQE_MARKER:-cost_ocp_on_prem}"
 IQE_PROFILE="${IQE_PROFILE:-stable}"
 RUN_PERF="${RUN_PERF:-false}"
 PERF_PROFILE="${PERF_PROFILE:-baseline}"
+PERF_SUITE="${PERF_SUITE:-all}"
 PERF_ONLY="${PERF_ONLY:-false}"
 DEPLOY_OBSERVABILITY="${DEPLOY_OBSERVABILITY:-false}"
 COLLECT_METRICS="${COLLECT_METRICS:-false}"
@@ -1066,7 +1069,12 @@ start_metrics_collection() {
             fi
         fi
         
-        TEST_RUN_ID="${chart_version}-${PERF_PROFILE}-${epoch_time}"
+        if [[ "${PERF_SUITE}" != "all" ]]; then
+            local suite_slug="${PERF_SUITE//,/+}"
+            TEST_RUN_ID="${chart_version}-${PERF_PROFILE}-${suite_slug}-${epoch_time}"
+        else
+            TEST_RUN_ID="${chart_version}-${PERF_PROFILE}-${epoch_time}"
+        fi
     fi
 
     # Create unified output directory structure
@@ -1204,6 +1212,15 @@ upload_perf_results_to_s3() {
 
     log_success "Uploaded to s3://${S3_BUCKET}/${s3_prefix}/"
 
+    # Upload tarball alongside the directory if it exists
+    local tarball_path="${test_run_dir}.tar.gz"
+    if [[ -f "${tarball_path}" ]] && command -v aws &>/dev/null; then
+        local tarball_s3_key="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}.tar.gz"
+        aws s3 cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" ${endpoint_arg} ${aws_extra_args} --no-progress 2>/dev/null \
+            && log_success "Tarball uploaded: s3://${S3_BUCKET}/${tarball_s3_key}" \
+            || log_warning "Could not upload tarball to S3 (non-fatal)"
+    fi
+
     # Update the bucket-level index.json so Grafana can list all runs
     if [[ -f "${summary_script}" ]] && command -v python3 &>/dev/null; then
         S3_ENDPOINT="${S3_ENDPOINT:-}" S3_BUCKET="${S3_BUCKET}" \
@@ -1251,6 +1268,7 @@ generate_metadata_json() {
   "test_run_id": "${TEST_RUN_ID}",
   "chart_version": "${chart_version}",
   "perf_profile": "${PERF_PROFILE}",
+  "perf_suite": "${PERF_SUITE}",
   "listener_cpu_limit": "${LISTENER_CPU:-default}",
   "namespace": "${NAMESPACE}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -1272,6 +1290,200 @@ EOF
 }
 
 ################################################################################
+# Per-Profile Cluster Configuration
+################################################################################
+
+# apply_perf_profile_config: Brings the live cluster into the correct state for
+# the given PERF_PROFILE before tests run.  Called unconditionally at the start
+# of run_performance_tests() — whether this is a fresh deploy or --skip-deploy.
+#
+# Two-phase approach:
+#   Phase 1 — helm upgrade --reuse-values --set …
+#     Applies all values.yaml-driven settings that differ from chart defaults:
+#       · resource limits (cpu/memory) for kruize, ros-processor, listener
+#       · ingress max upload size
+#       · HAProxy route timeout (via annotation override)
+#       · Envoy ingress route timeouts (via templated values)
+#     This issues a single Helm release revision so changes are tracked.
+#
+#   Phase 2 — oc scale
+#     Replica counts are set directly (idempotent, faster than helm upgrade).
+#     Kruize is always kept at replicas=1 (scaling degrades throughput,
+#     see PERF-FINDING-014).
+#
+# Profile matrix (validated through medium-profile perf runs):
+#   baseline/small : replicas=1, chart resource defaults
+#   medium         : replicas=2 for processor/listener/ocp-worker/summary-worker;
+#                    raised resources, 200MB upload, 180s timeouts
+#   large          : replicas=3 (same resource overrides as medium)
+apply_perf_profile_config() {
+    local release="${HELM_RELEASE_NAME:-cost-onprem}"
+    local namespace="${NAMESPACE:-cost-onprem}"
+
+    # -------------------------------------------------------------------------
+    # Build profile-specific settings
+    # -------------------------------------------------------------------------
+    local ros_processor_replicas=1
+    local listener_replicas=1
+    local ocp_worker_replicas=1
+    local summary_worker_replicas=1
+
+    # Resource overrides (from chart defaults — see FINDINGS for recommendations)
+    local kruize_cpu_req="500m"   kruize_cpu_lim="1000m"
+    local ros_mem_req="1Gi"       ros_mem_lim="1Gi"
+    local listener_mem_req="300Mi" listener_mem_lim="600Mi"
+    local max_upload_size="104857600"   # 100MB chart default
+    local haproxy_timeout="30s"
+    local ingress_timeout="30s"   ingress_per_try_timeout="30s"
+
+    case "${PERF_PROFILE}" in
+        medium|large)
+            # Replica scaling
+            if [[ "${PERF_PROFILE}" == "medium" ]]; then
+                ros_processor_replicas=2
+                listener_replicas=2
+                ocp_worker_replicas=2
+                summary_worker_replicas=2
+            else
+                ros_processor_replicas=3
+                listener_replicas=3
+                ocp_worker_replicas=3
+                summary_worker_replicas=3
+            fi
+            # Resource overrides required to avoid OOMKills / CPU throttling
+            # (PERF-FINDING-006, 007, 008 — recommended for production too)
+            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            ros_mem_req="2Gi";          ros_mem_lim="4Gi"
+            listener_mem_req="1Gi";     listener_mem_lim="2Gi"
+            # Upload / timeout overrides required for large payloads
+            # (PERF-FINDING-001, 009 — recommended for production too)
+            max_upload_size="209715200"   # 200MB
+            haproxy_timeout="180s"
+            ingress_timeout="180s";       ingress_per_try_timeout="180s"
+            ;;
+        baseline|small|*)
+            # Chart defaults already set above
+            ;;
+    esac
+
+    log_step "Applying per-profile cluster config for profile: ${PERF_PROFILE}"
+    log_info "  replicas (processor/listener/ocp/summary) = ${ros_processor_replicas}/${listener_replicas}/${ocp_worker_replicas}/${summary_worker_replicas}"
+    log_info "  kruize replicas                           = 1 (always)"
+    log_info "  kruize cpu req/lim                        = ${kruize_cpu_req}/${kruize_cpu_lim}"
+    log_info "  ros-processor memory req/lim              = ${ros_mem_req}/${ros_mem_lim}"
+    log_info "  listener memory req/lim                   = ${listener_mem_req}/${listener_mem_lim}"
+    log_info "  ingress max upload size                   = ${max_upload_size}"
+    log_info "  haproxy/envoy ingress timeout             = ${haproxy_timeout}"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "DRY RUN: Would run helm upgrade --reuse-values --set <all overrides above>"
+        log_info "DRY RUN: Would scale: processor=${ros_processor_replicas} listener=${listener_replicas} ocp=${ocp_worker_replicas} summary=${summary_worker_replicas} kruize=1"
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Phase 1: helm upgrade — apply resource/timeout/size overrides
+    # -------------------------------------------------------------------------
+    local chart_ref
+    if [[ "${USE_LOCAL_CHART:-false}" == "true" ]]; then
+        chart_ref="${PROJECT_ROOT}/cost-onprem"
+    else
+        chart_ref="cost-onprem-chart/cost-onprem"
+    fi
+
+    log_info "Applying resource/timeout overrides via helm upgrade..."
+    if ! helm upgrade "${release}" "${chart_ref}" \
+            --reuse-values \
+            --namespace "${namespace}" \
+            --set "resources.kruize.requests.cpu=${kruize_cpu_req}" \
+            --set "resources.kruize.limits.cpu=${kruize_cpu_lim}" \
+            --set "resources.rosProcessor.requests.memory=${ros_mem_req}" \
+            --set "resources.rosProcessor.limits.memory=${ros_mem_lim}" \
+            --set "costManagement.listener.resources.requests.memory=${listener_mem_req}" \
+            --set "costManagement.listener.resources.limits.memory=${listener_mem_lim}" \
+            --set "ingress.upload.maxUploadSize=${max_upload_size}" \
+            --set "jwtAuth.envoy.ingressTimeout=${ingress_timeout}" \
+            --set "jwtAuth.envoy.ingressPerTryTimeout=${ingress_per_try_timeout}" \
+            --set "gatewayRoute.annotations.haproxy\\.router\\.openshift\\.io/timeout=${haproxy_timeout}" \
+            --wait --timeout 5m 2>&1; then
+        log_error "helm upgrade for perf config failed"
+        return 1
+    fi
+    log_success "Resource/timeout overrides applied"
+
+    # -------------------------------------------------------------------------
+    # Phase 2: oc scale — replica counts (faster than helm upgrade)
+    # -------------------------------------------------------------------------
+    local scale_failed=false
+    _scale_deploy() {
+        local name="$1" replicas="$2"
+        if oc scale deployment "${name}" --replicas="${replicas}" -n "${namespace}" 2>/dev/null; then
+            log_info "  scaled ${name} → ${replicas}"
+        else
+            log_warning "  could not scale ${name} (may not exist yet)"
+            scale_failed=true
+        fi
+    }
+
+    _scale_deploy "${release}-ros-processor"          "${ros_processor_replicas}"
+    _scale_deploy "${release}-koku-listener"          "${listener_replicas}"
+    _scale_deploy "${release}-celery-worker-ocp"      "${ocp_worker_replicas}"
+    _scale_deploy "${release}-celery-worker-summary"  "${summary_worker_replicas}"
+    _scale_deploy "${release}-kruize"                 "1"
+
+    if [[ "${scale_failed}" == "true" ]]; then
+        log_warning "One or more deployments could not be scaled — verify cluster state before running tests"
+        return 1
+    fi
+
+    # Wait for replica rollouts
+    log_info "Waiting for replica rollouts..."
+    local rollout_ok=true
+    for deploy in \
+        "${release}-ros-processor" \
+        "${release}-koku-listener" \
+        "${release}-celery-worker-ocp" \
+        "${release}-celery-worker-summary" \
+        "${release}-kruize"; do
+        if ! oc rollout status deployment "${deploy}" -n "${namespace}" --timeout=3m 2>/dev/null; then
+            log_warning "  rollout timeout for ${deploy}"
+            rollout_ok=false
+        fi
+    done
+    [[ "${rollout_ok}" == "true" ]] && log_success "Rollouts complete" || log_warning "Some rollouts timed out"
+
+    # -------------------------------------------------------------------------
+    # Verify replica counts
+    # -------------------------------------------------------------------------
+    log_info "Verifying deployed replica counts..."
+    local verified=true
+    _verify_replicas() {
+        local deploy_name="$1" expected="$2"
+        local actual
+        actual=$(oc get deployment "${deploy_name}" -n "${namespace}" \
+                    -o jsonpath='{.spec.replicas}' 2>/dev/null)
+        if [[ "${actual}" == "${expected}" ]]; then
+            log_info "  ✓ ${deploy_name}: ${actual} replica(s)"
+        else
+            log_warning "  ✗ ${deploy_name}: expected ${expected}, got '${actual}'"
+            verified=false
+        fi
+    }
+
+    _verify_replicas "${release}-ros-processor"          "${ros_processor_replicas}"
+    _verify_replicas "${release}-koku-listener"          "${listener_replicas}"
+    _verify_replicas "${release}-celery-worker-ocp"      "${ocp_worker_replicas}"
+    _verify_replicas "${release}-celery-worker-summary"  "${summary_worker_replicas}"
+    _verify_replicas "${release}-kruize"                 "1"
+
+    if [[ "${verified}" == "true" ]]; then
+        log_success "All replica counts verified for ${PERF_PROFILE} profile"
+    else
+        log_warning "Some replica counts did not match — tests may not reflect expected scaling"
+    fi
+}
+
+################################################################################
 # Performance Test Execution (FLPATH-4036)
 ################################################################################
 
@@ -1288,6 +1500,11 @@ run_performance_tests() {
 
     # Export performance profile for tests
     export PERF_PROFILE="${PERF_PROFILE}"
+
+    # Apply profile-specific replica scaling before tests run.
+    # This ensures the cluster matches the expected topology for the profile
+    # whether this is a fresh deployment or a --skip-deploy run.
+    apply_perf_profile_config
 
     # Listener CPU boost — always applied for perf tests unless explicitly disabled.
     # The listener is the principal processing bottleneck: at the chart default (300m)
@@ -1322,7 +1539,21 @@ run_performance_tests() {
     start_metrics_collection
 
     # Build pytest arguments for performance tests
-    local perf_args=("--performance")
+    local perf_args=()
+    if [[ "${PERF_SUITE}" == "all" ]]; then
+        perf_args+=("--performance")
+    else
+        IFS=',' read -ra suites <<< "${PERF_SUITE}"
+        for suite in "${suites[@]}"; do
+            case "${suite}" in
+                api)       perf_args+=("--perf-api") ;;
+                ros)       perf_args+=("--perf-ros") ;;
+                ingestion) perf_args+=("--perf-ingestion") ;;
+                scale)     perf_args+=("--perf-scale") ;;
+                soak)      perf_args+=("--perf-soak") ;;
+            esac
+        done
+    fi
     if [[ "${VERBOSE}" == "true" ]]; then
         perf_args+=("-v")
     fi
@@ -1362,6 +1593,10 @@ run_performance_tests() {
         local run_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}"
         local scripts_dir="$(dirname "${BASH_SOURCE[0]}")/observability"
 
+        # Write metadata.json unconditionally so the HTML report can read perf_suite,
+        # profile, and cluster info regardless of whether --upload-metrics is set.
+        generate_metadata_json
+
         # Generate visual HTML run report
         local run_report_script="${scripts_dir}/generate-perf-run-report.py"
         if [[ -f "${run_report_script}" ]] && command -v python3 &>/dev/null; then
@@ -1395,6 +1630,20 @@ run_performance_tests() {
             fi
         else
             log_info "Skipping Grafana links (SKIP_GRAFANA_LINKS=true)"
+        fi
+    fi
+
+    # Create tarball of the full run directory for easy sharing
+    if [[ -n "${TEST_RUN_ID:-}" ]]; then
+        local run_dir="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}"
+        local tarball="${PERF_OUTPUT_DIR}/${TEST_RUN_ID}.tar.gz"
+        log_info "Creating run archive..."
+        if tar -czf "${tarball}" -C "${PERF_OUTPUT_DIR}" "${TEST_RUN_ID}" 2>/dev/null; then
+            local tar_size
+            tar_size=$(du -h "${tarball}" | cut -f1)
+            log_success "Archive: ${tarball} (${tar_size})"
+        else
+            log_warning "Could not create tarball (non-fatal)"
         fi
     fi
 
@@ -1516,12 +1765,13 @@ print_summary() {
     [[ "${SKIP_TLS}" == "false" ]] && echo "  ✓ Setup TLS Certificates" || echo "  ✗ Setup TLS Certificates (SKIPPED)"
     [[ "${SKIP_TEST}" == "false" ]] && echo "  ✓ Run Chart Tests" || echo "  ✗ Run Chart Tests (SKIPPED)"
     if [[ "${DEPLOY_OBSERVABILITY}" == "true" ]]; then
-        echo "  ✓ Deploy Observability (postgres_exporter, valkey-exporter)"
+        echo "  ✓ Deploy Observability (postgres_exporter, valkey-exporter, celery-exporter)"
     else
         echo "  ✗ Deploy Observability (OPTIONAL)"
     fi
     if [[ "${PERF_ONLY}" == "true" ]] || [[ "${RUN_PERF}" == "true" ]]; then
         local perf_opts="profile: ${PERF_PROFILE}"
+        [[ "${PERF_SUITE}" != "all" ]] && perf_opts="${perf_opts}, suite: ${PERF_SUITE}"
         [[ "${COLLECT_METRICS}" == "true" ]] && perf_opts="${perf_opts}, collect-metrics: ${METRICS_INTERVAL}s"
         [[ "${UPLOAD_METRICS}" == "true" ]] && perf_opts="${perf_opts}, upload-to-s3"
         echo "  ✓ Run Performance Tests (${perf_opts})"
@@ -1631,6 +1881,10 @@ main() {
                 PERF_PROFILE="$2"
                 shift 2
                 ;;
+            --perf-suite)
+                PERF_SUITE="$2"
+                shift 2
+                ;;
             --perf-only)
                 PERF_ONLY=true
                 SKIP_RHBK=true
@@ -1717,6 +1971,18 @@ main() {
             log_error "Cannot use --chart-version with --use-local-chart"
             exit 1
         fi
+    fi
+
+    # Validate --perf-suite values
+    if [[ "${PERF_SUITE}" != "all" ]]; then
+        IFS=',' read -ra _suites <<< "${PERF_SUITE}"
+        for _s in "${_suites[@]}"; do
+            case "${_s}" in
+                api|ros|ingestion|scale|soak) ;;
+                *) log_error "Invalid --perf-suite value: ${_s} (valid: all, api, ros, ingestion, scale, soak)"
+                   exit 1 ;;
+            esac
+        done
     fi
 
     # In tests-only / skip-deploy mode, skip all deployment steps

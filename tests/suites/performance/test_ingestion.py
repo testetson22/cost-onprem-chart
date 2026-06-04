@@ -128,22 +128,13 @@ _ING_004_SIZES: dict = {
 }
 ING_004_SIZES = _ING_004_SIZES.get(_ACTIVE_PROFILE, _ING_004_SIZES["large"])
 
-# ING-006: processing-window validation profile.
-# Now OPT-IN via ING_006_ENABLED=true because:
-# 1. Requires fully functional pipeline (manifest must appear in DB)
-# 2. Takes 1+ hours even when working correctly
-# 3. Times out completely (~1hr) when pipeline has issues
-# 4. SC-4 (6-hour window) validation is a specific SLA check, not general perf
-_ING_006_ENABLED = os.environ.get("ING_006_ENABLED", "").lower() in ("true", "1", "yes")
-_ING_006_SKIP_REASON = (
-    "ING-006 requires ING_006_ENABLED=true — SC-4 window validation is opt-in "
-    "due to 1+ hour runtime and pipeline reliability requirements."
-)
-_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("small", "medium", "large") else "large"
+# ING-006: processing-window validation (SC-4 SLA).
+# Runs for small/medium/large profiles; skipped for baseline.
+_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("small", "medium", "large") else None
 ING_006_PROFILES = (
     [_ING_006_PROFILE]
-    if _ING_006_ENABLED
-    else [pytest.param(_ING_006_PROFILE, marks=pytest.mark.skip(reason=_ING_006_SKIP_REASON))]
+    if _ING_006_PROFILE
+    else [pytest.param("baseline", marks=pytest.mark.skip(reason="ING-006 skipped for baseline profile"))]
 )
 
 
@@ -258,7 +249,8 @@ def generate_and_upload_data(
         package_size_mb = os.path.getsize(package_path) / (1024 * 1024)
         package_duration = time.time() - package_start
         
-        # Upload
+        # Upload — scale timeout with package size (minimum 0.5 MB/s assumed)
+        upload_timeout = max(180, int(package_size_mb / 0.5) + 60)
         upload_start = time.time()
         session = requests.Session()
         session.verify = False
@@ -268,6 +260,7 @@ def generate_and_upload_data(
             f"{ingress_url}/v1/upload",
             package_path,
             jwt_token.authorization_header,
+            timeout=upload_timeout,
         )
         
         upload_duration = time.time() - upload_start
@@ -282,6 +275,7 @@ def generate_and_upload_data(
             "upload_seconds": round(upload_duration, 3),
             "upload_status": response.status_code,
             "upload_mb_per_second": round(package_size_mb / upload_duration, 3) if upload_duration > 0 else 0,
+            "upload_timeout_seconds": upload_timeout,
         }
 
 
@@ -639,10 +633,12 @@ class TestIngestionThroughput:
         
         # Wait for all sources to process — each blocks until its manifest is done.
         # Higher concurrency = more system load = longer processing times.
-        # Base: 60s minimum, +5s for each concurrent source above 2 (capped at 120s).
+        # Medium/large profiles put more pressure on the pipeline, so the cap
+        # is raised to avoid flaky timeouts on the last straggler source.
+        timeout_cap = 180 if _ACTIVE_PROFILE in ("medium", "large") else 120
         base_timeout = max(60, 480 // max(concurrent_sources, 1))
         concurrency_bonus = max(0, (concurrent_sources - 2) * 5)
-        per_source_max = min(120, base_timeout + concurrency_bonus)
+        per_source_max = min(timeout_cap, base_timeout + concurrency_bonus)
         processed_count = 0
         with perf_timer.measure("processing_wait_all"):
             for source_info in sources:

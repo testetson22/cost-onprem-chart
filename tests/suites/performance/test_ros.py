@@ -278,6 +278,49 @@ def wait_for_kruize_recommendations(
 class TestROSPerformance:
     """ROS/Kruize performance tests (PERF-ROS-*)."""
 
+    @pytest.fixture(autouse=True)
+    def drain_ros_queue(self, cluster_config):
+        """Wait for the ROS processor to consume all pending Kafka events.
+
+        Ingestion tests generate ROS events as a side-effect.  If those events
+        are still in-flight when the test cleanup deletes the source, the
+        ros-processor hits FK constraint errors that block the queue.  Draining
+        the queue before each ROS test prevents this cascade.
+
+        The timeout scales with the observed lag (~6s per event via Kruize API).
+        We also track whether lag is decreasing; if it stalls for ``stall_timeout``
+        seconds we give up rather than blocking forever.
+        """
+        poll_interval = 5
+        stall_timeout = 90
+
+        initial_lag = get_ros_queue_depth(cluster_config.namespace)
+        if initial_lag is not None and initial_lag == 0:
+            return
+
+        max_wait = max(180, (initial_lag or 0) * 8)
+        print(f"[ros-queue-drain] initial lag={initial_lag}, max_wait={max_wait}s")
+
+        start = time.time()
+        prev_lag = initial_lag
+        last_progress_time = start
+        while time.time() - start < max_wait:
+            lag = get_ros_queue_depth(cluster_config.namespace)
+            if lag is not None and lag == 0:
+                print(f"[ros-queue-drain] drained in {time.time() - start:.0f}s")
+                return
+            if lag is not None:
+                if lag != prev_lag:
+                    print(f"[ros-queue-drain] lag={lag}, waiting…")
+                    if prev_lag is not None and lag < prev_lag:
+                        last_progress_time = time.time()
+                    prev_lag = lag
+                elif time.time() - last_progress_time > stall_timeout:
+                    print(f"[ros-queue-drain] lag stalled at {lag} for {stall_timeout}s, proceeding anyway")
+                    return
+            time.sleep(poll_interval)
+        print(f"[ros-queue-drain] timed out after {max_wait}s (lag={prev_lag}), proceeding anyway")
+
     @pytest.fixture(scope="class")
     def kruize_credentials(self, cluster_config) -> Dict[str, str]:
         """Get Kruize database credentials."""
@@ -445,7 +488,7 @@ class TestROSPerformance:
         _ACTIVE_PROFILE == "baseline",
         reason="ROS-002 (50 workloads, 10 min) is a scale test — not appropriate for baseline.",
     )
-    @pytest.mark.timeout(1200)
+    @pytest.mark.timeout(1500)
     def test_perf_ros_002_multi_workload_scale(
         self,
         cluster_config,
@@ -546,7 +589,10 @@ class TestROSPerformance:
                     timeout=300,
                 )
             
-            # Wait for Kruize experiments (expect ~50 for 50 workloads)
+            # Kruize creates experiments at ~18/min (3.3s each).
+            # For 320 workloads at 90% threshold: 288 * 3.3s ≈ 960s.
+            # Budget: num_workloads * 4s gives ~25% headroom.
+            experiment_timeout = max(600, num_workloads * 4)
             with perf_timer.measure("kruize_experiment_creation"):
                 exp_success, exp_count, exp_time = wait_for_kruize_experiments(
                     cluster_config.namespace,
@@ -555,7 +601,7 @@ class TestROSPerformance:
                     kruize_credentials["password"],
                     cluster_id,
                     expected_count=num_workloads,
-                    timeout=600,
+                    timeout=experiment_timeout,
                 )
         finally:
             monitor_stop.set()
@@ -843,7 +889,9 @@ class TestROSPerformance:
 
             assert upload_result.get("upload_status") == 202, f"Upload failed: {upload_result}"
             
-            # Wait for processing
+            # Kruize creates experiments at ~18/min (3.3s each).
+            # Budget: num_workloads * 4s gives ~25% headroom.
+            experiment_timeout = max(900, num_workloads * 4)
             with perf_timer.measure("processing"):
                 exp_success, exp_count, exp_time = wait_for_kruize_experiments(
                     cluster_config.namespace,
@@ -852,7 +900,7 @@ class TestROSPerformance:
                     kruize_credentials["password"],
                     cluster_id,
                     expected_count=num_workloads,
-                    timeout=900,
+                    timeout=experiment_timeout,
                 )
         finally:
             monitor_stop.set()

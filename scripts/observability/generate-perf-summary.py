@@ -231,6 +231,7 @@ def build_summary(run_dir: Path) -> dict:
         "timestamp":     metadata.get("created_at") or (results[0].get("timestamp") if results else ""),
         "chart_version": metadata.get("chart_version") or (results[0].get("chart_version") if results else "unknown"),
         "profile":       metadata.get("perf_profile") or (results[0].get("profile") if results else "unknown"),
+        "perf_suite":    metadata.get("perf_suite", "all"),
         "total_tests":   junit.get("total", len(results)),
         "passed":        junit.get("passed", sum(1 for r in results if r.get("passed"))),
         "failed":        junit.get("failed", sum(1 for r in results if not r.get("passed"))),
@@ -266,6 +267,11 @@ def build_summary(run_dir: Path) -> dict:
             "listener_cpu_cores": round(m.get("listener_cpu_cores", 0), 4),
             "api_p95_ms": round(m.get("aggregate_p95", 0) * 1000, 1),
             "within_window": int(m.get("within_window", -1)),
+            # ROS throughput (populated for ROS tests, 0 for others)
+            "experiment_count": m.get("experiment_count", 0),
+            "experiment_rate_per_min": round(
+                m.get("experiment_count", 0) / max(m.get("experiment_creation_time_sec") or m.get("processing_time_sec") or 1, 0.001) * 60, 1
+            ) if m.get("experiment_count") and (m.get("experiment_creation_time_sec") or m.get("processing_time_sec")) else 0,
         })
 
     # API latency rows — one row per endpoint per iteration count
@@ -351,6 +357,36 @@ def build_summary(run_dir: Path) -> dict:
             "chart_version":       r.get("chart_version", run_meta["chart_version"]),
         })
 
+    # ROS throughput rows — one row per ROS test
+    ros_rows = []
+    for r in results:
+        test_name = r.get("test_name", "")
+        if "_ros_" not in test_name and not test_name.startswith("ros_"):
+            continue
+        m = r.get("metrics") or {}
+        timings = {t["name"]: round(t["duration_seconds"], 2) for t in r.get("timings", [])}
+        exp_count = m.get("experiment_count")
+        workload_count = m.get("workload_count")
+        exp_time = m.get("experiment_creation_time_sec") or m.get("processing_time_sec")
+        rate_per_min = round(exp_count / exp_time * 60, 1) if exp_count and exp_time and exp_time > 0 else 0
+        secs_per_exp = round(exp_time / exp_count, 2) if exp_count and exp_time and exp_count > 0 else 0
+        ros_rows.append({
+            "run_id":              run_id,
+            "test":                r["test_name"].replace("test_perf_", "")[:50],
+            "passed":              1 if r.get("passed") else 0,
+            "profile":             r.get("profile", run_meta["profile"]),
+            "workload_count":      workload_count or 0,
+            "experiment_count":    exp_count or 0,
+            "experiment_time_s":   round(exp_time, 1) if exp_time else 0,
+            "rate_per_min":        rate_per_min,
+            "seconds_per_exp":     secs_per_exp,
+            "peak_memory_mb":      round(m.get("peak_memory_mb", 0), 1),
+            "kruize_restarts":     m.get("kruize_restarts", 0),
+            "recommendation_count": m.get("recommendation_count", 0),
+            "error":               (r.get("error_message") or "")[:120],
+            "chart_version":       r.get("chart_version", run_meta["chart_version"]),
+        })
+
     # KPI evaluation (import thresholds from the report generator)
     kpi_violations = 0
     kpi_warnings = 0
@@ -390,6 +426,7 @@ def build_summary(run_dir: Path) -> dict:
         "tests":     test_rows,
         "api":       api_rows,
         "ingestion": ing_rows,
+        "ros":       ros_rows,
         "resources": resources,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -495,7 +532,7 @@ def main() -> None:
     r = summary["run"]
     print(f"[OK] {out}")
     print(f"     {r['total_tests']} tests · {r['passed']}/{r['total_tests']} passed · {r['duration_min']} min")
-    print(f"     {len(summary['api'])} API rows · {len(summary['ingestion'])} ingestion rows")
+    print(f"     {len(summary['api'])} API rows · {len(summary['ingestion'])} ingestion rows · {len(summary['ros'])} ROS rows")
 
     if args.update_index:
         s3_endpoint = os.environ.get("S3_ENDPOINT", "")

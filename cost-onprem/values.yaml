@@ -70,6 +70,7 @@ ros:
 
   # Processor Component - Processes uploaded data
   processor:
+    replicas: 1
     metricsPort: 9000
     logLevel: INFO
     serviceName: ros-processor
@@ -240,7 +241,6 @@ costManagement:
   # ---------------------------------------------------------------------------
   listener:
     enabled: true
-    # On-prem: 1 replica to fit cluster constraints (SaaS uses 2)
     replicas: 1
     resources:
       # Aligned with SaaS Clowder configuration
@@ -438,6 +438,8 @@ costManagement:
 # -----------------------------------------------------------------------------
 # Kruize is used exclusively by ROS for workload optimization recommendations
 kruize:
+  replicas: 1
+
   image:
     repository: quay.io/redhat-services-prod/kruize-autotune-tenant/autotune
     tag: "5eeae99"
@@ -706,6 +708,16 @@ kafka:
   # SASL/TLS support requires upstream application changes (see docs/operations/configuration.md).
   securityProtocol: "PLAINTEXT"
 
+  # SASL authentication (optional — leave mechanism empty to disable)
+  sasl:
+    mechanism: ""              # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    existingSecret: ""         # K8s Secret with keys: username, password
+
+  # TLS configuration (optional)
+  tls:
+    enabled: false
+    caCertSecret: ""           # K8s Secret with key: ca.crt
+
 # -----------------------------------------------------------------------------
 # Shared Infrastructure - Cache (Valkey)
 # -----------------------------------------------------------------------------
@@ -737,9 +749,20 @@ valkey:
   # For password-protected Redis instances (e.g., ElastiCache, Redis Enterprise)
   auth:
     enabled: false
-    # Name of the Secret containing key: 'redis-password'
-    # Required when auth.enabled is true.
+    # Name of the Secret containing key 'redis-password' (required when auth.enabled is true).
+    # The Secret may also contain key 'redis-username' for Redis 6+ ACL authentication.
+    # When 'redis-username' is absent, the default Redis user is used.
     secretName: ""
+
+  # TLS configuration for external Redis/Valkey (only used when deploy is false)
+  # For TLS-encrypted Redis connections (e.g., ElastiCache in-transit encryption,
+  # Redis Enterprise TLS, Azure Cache for Redis)
+  tls:
+    enabled: false
+    # Name of the Secret containing key 'ca.crt' with the CA certificate.
+    # When set, certificate verification is enforced (ssl.CERT_REQUIRED).
+    # When empty, TLS is used but certificates are not verified (ssl.CERT_NONE).
+    caCertSecretName: ""
 
   # Persistence configuration for Celery chord callback reliability
   # Persistent storage is always enabled when deploying bundled Valkey.
@@ -828,7 +851,12 @@ jwtAuth:
       tag: "2.6"
       pullPolicy: IfNotPresent
 
+    replicas: 1
     port: 9080
+
+    # Route-level timeouts for the ingress (file upload) endpoint.
+    ingressTimeout: "30s"
+    ingressPerTryTimeout: "10s"
     servicePort: 80  # Service port exposed to other components (nginx, etc.)
     adminPort: 9901
     logLevel: info
@@ -988,9 +1016,18 @@ resources:
       memory: "512Mi"
       cpu: "500m"
 
-  # Standard application services (ROS API, Processor, Poller, Housekeeper)
+  # Standard application services (ROS API, Ingress, Poller, Housekeeper)
   # Aligned with SaaS Clowder configuration (ros-ocp-backend/clowdapp.yaml)
   application:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+
+  # ROS Processor needs more memory than other application services.
+  rosProcessor:
     requests:
       memory: "1Gi"
       cpu: "500m"

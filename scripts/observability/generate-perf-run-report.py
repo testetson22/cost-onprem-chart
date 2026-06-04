@@ -74,10 +74,12 @@ KPI_THRESHOLDS: dict[str, list[dict]] = {
     # --- Ingestion ---
     "ing_001": [
         {"label": "Processing done", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
+        {"label": "Upload speed",    "metric": "upload.upload_mb_per_second", "op": ">", "green": 0.5, "yellow": 0.2, "unit": "MB/s"},
     ],
     "ing_002": [
         {"label": "Processing done", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
         {"label": "Throughput",      "metric": "processing_throughput_mb_s", "op": ">", "green": 0.1, "yellow": 0.05, "unit": "MB/s"},
+        {"label": "Upload speed",    "metric": "upload.upload_mb_per_second", "op": ">", "green": 0.5, "yellow": 0.2, "unit": "MB/s"},
     ],
     "ing_003": [
         {"label": "All processed", "metric": "processing_completed", "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
@@ -97,14 +99,19 @@ KPI_THRESHOLDS: dict[str, list[dict]] = {
         {"label": "E2E time",         "metric": "total_e2e_time_sec",     "op": "<", "green": 120, "yellow": 300, "unit": "s"},
     ],
     "ros_002": [
-        {"label": "Experiments (90%)", "metric": "experiment_count",       "op": ">", "green": 45, "yellow": 25, "unit": ""},
+        {"label": "Experiments (90%)", "metric": "experiment_count",       "op": ">", "green": 45, "yellow": 25, "unit": "",
+         "profile_thresholds": {"baseline": {"green": 2, "yellow": 1}, "small": {"green": 45, "yellow": 25}, "medium": {"green": 180, "yellow": 100}, "large": {"green": 900, "yellow": 500}}},
+        {"label": "Throughput", "metric": "experiment_creation_rate_per_min", "op": ">", "green": 15, "yellow": 10, "unit": "exp/min"},
     ],
     "ros_003": [
         {"label": "Refresh done",     "metric": "refresh_complete",        "op": "==", "green": 1, "yellow": 1, "unit": "bool"},
-        {"label": "Speedup ratio",    "metric": "speedup_ratio",          "op": ">=", "green": 1.0, "yellow": 0.5, "unit": "x"},
+        {"label": "Speedup ratio",    "metric": "speedup_ratio",          "op": ">=", "green": 1.0, "yellow": 0.5, "unit": "x",
+         "profile_thresholds": {"baseline": {"green": 0.8, "yellow": 0.5}, "small": {"green": 0.9, "yellow": 0.5}}},
     ],
     "ros_004": [
-        {"label": "Experiments (80%)", "metric": "experiment_count",       "op": ">", "green": 80, "yellow": 50, "unit": ""},
+        {"label": "Experiments (80%)", "metric": "experiment_count",       "op": ">", "green": 80, "yellow": 50, "unit": "",
+         "profile_thresholds": {"baseline": {"green": 2, "yellow": 1}, "small": {"green": 40, "yellow": 25}, "medium": {"green": 160, "yellow": 100}, "large": {"green": 800, "yellow": 500}}},
+        {"label": "Throughput", "metric": "experiment_creation_rate_per_min", "op": ">", "green": 15, "yellow": 10, "unit": "exp/min"},
     ],
     # --- Scale ---
     "scale_001": [
@@ -150,11 +157,13 @@ def _resolve_metric(metrics: dict, path: str):
     return obj
 
 
-def evaluate_kpis(result: dict) -> list[dict]:
+def evaluate_kpis(result: dict, profile: str = "baseline") -> list[dict]:
     """Evaluate KPI thresholds for a single test result.
 
     Returns a list of dicts: {label, value, unit, status, green, yellow}.
     status is one of 'green', 'yellow', 'red'.
+    
+    If a check has 'profile_thresholds', uses profile-specific thresholds.
     """
     test_name = result.get("test_name", "")
     metrics = result.get("metrics") or {}
@@ -173,8 +182,10 @@ def evaluate_kpis(result: dict) -> list[dict]:
                 continue
 
             op = check["op"]
-            g = check["green"]
-            y = check["yellow"]
+            # Use profile-specific thresholds if available
+            profile_th = check.get("profile_thresholds", {}).get(profile)
+            g = profile_th["green"] if profile_th else check["green"]
+            y = profile_th["yellow"] if profile_th else check["yellow"]
 
             if op == "<":
                 status = "green" if val < g else ("yellow" if val < y else "red")
@@ -307,14 +318,25 @@ def _build_resource_summary_html(rs: dict) -> str:
           </div>
         </div>''')
     
-    # Celery Queue
-    queue = rs.get("celery_queue", {})
+    # Celery Tasks Active
+    tasks_active = rs.get("celery_tasks_active", {})
     cards.append(f'''
         <div class="resource-card">
-          <div class="label">Celery Queue Depth</div>
+          <div class="label">Celery Active Tasks</div>
           <div class="values">
-            <span><div class="v">{fmt(queue.get("max"))}</div><div class="l">Max</div></span>
-            <span><div class="v">{fmt(queue.get("avg"))}</div><div class="l">Avg</div></span>
+            <span><div class="v">{fmt(tasks_active.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(tasks_active.get("avg"))}</div><div class="l">Avg</div></span>
+          </div>
+        </div>''')
+
+    # Celery Task Rate
+    task_rate = rs.get("celery_task_rate", {})
+    cards.append(f'''
+        <div class="resource-card">
+          <div class="label">Celery Task Rate (tasks/s)</div>
+          <div class="values">
+            <span><div class="v">{fmt(task_rate.get("max"))}</div><div class="l">Max</div></span>
+            <span><div class="v">{fmt(task_rate.get("avg"))}</div><div class="l">Avg</div></span>
           </div>
         </div>''')
     
@@ -330,6 +352,141 @@ def _build_resource_summary_html(rs: dict) -> str:
         {time_range}
       </div>
     </details>'''
+
+
+def _build_throughput_summary_html(
+    ros_throughput: list[dict],
+    ing_throughput: list[dict],
+    proc_throughput: list[dict],
+    api_latency: dict,
+    concurrent: list[dict],
+) -> str:
+    """Build the Service Throughput summary section with tables and KPI context."""
+    sections = []
+
+    # --- Kruize / ROS Throughput ---
+    if ros_throughput:
+        rows = []
+        for r in ros_throughput:
+            status_cls = "pass" if r["passed"] else "fail"
+            rows.append(
+                f'<tr>'
+                f'<td>{r["label"]}</td>'
+                f'<td>{r["workloads"]}</td>'
+                f'<td>{r["experiments"]}</td>'
+                f'<td>{r["time_sec"]}s</td>'
+                f'<td><strong>{r["rate_per_min"]}</strong></td>'
+                f'<td>{r["per_exp_sec"]}s</td>'
+                f'<td><span class="badge {status_cls}">{"PASS" if r["passed"] else "FAIL"}</span></td>'
+                f'</tr>'
+            )
+        sections.append(
+            '<h4 style="margin:16px 0 8px;">Kruize Experiment Creation</h4>'
+            '<table class="results-table">'
+            '<thead><tr><th>Test</th><th>Workloads</th><th>Experiments</th>'
+            '<th>Time</th><th>Rate (exp/min)</th><th>Per Experiment</th><th>Status</th></tr></thead>'
+            '<tbody>' + "\n".join(rows) + '</tbody></table>'
+        )
+
+    # --- Ingestion Upload Throughput ---
+    if ing_throughput:
+        rows = []
+        for r in ing_throughput:
+            status_cls = "pass" if r["passed"] else "fail"
+            rows.append(
+                f'<tr>'
+                f'<td>{r["label"]}</td>'
+                f'<td>{r["size_mb"]} MB</td>'
+                f'<td><strong>{r["throughput"]}</strong></td>'
+                f'<td>{r["upload_s"]}s</td>'
+                f'<td>{r["processing_s"]}{"s" if r["processing_s"] < 120 else " min"}</td>'
+                f'<td><span class="badge {status_cls}">{"PASS" if r["passed"] else "FAIL"}</span></td>'
+                f'</tr>'
+            )
+        sections.append(
+            '<h4 style="margin:16px 0 8px;">Ingestion Upload & Processing</h4>'
+            '<table class="results-table">'
+            '<thead><tr><th>Test</th><th>Size</th><th>Upload (MB/s)</th>'
+            '<th>Upload Time</th><th>Processing</th><th>Status</th></tr></thead>'
+            '<tbody>' + "\n".join(rows) + '</tbody></table>'
+        )
+
+    # --- Processing Rate ---
+    if proc_throughput:
+        rows = []
+        for r in proc_throughput:
+            status_cls = "pass" if r["passed"] else "fail"
+            rows.append(
+                f'<tr>'
+                f'<td>{r["label"]}</td>'
+                f'<td>{r["size_mb"]} MB</td>'
+                f'<td>{r["processing_sec"]}s</td>'
+                f'<td><strong>{r["processing_rate_mb_min"]}</strong></td>'
+                f'<td><span class="badge {status_cls}">{"PASS" if r["passed"] else "FAIL"}</span></td>'
+                f'</tr>'
+            )
+        sections.append(
+            '<h4 style="margin:16px 0 8px;">End-to-End Processing Rate</h4>'
+            '<table class="results-table">'
+            '<thead><tr><th>Test</th><th>Size</th><th>Processing Time</th>'
+            '<th>Rate (MB/min)</th><th>Status</th></tr></thead>'
+            '<tbody>' + "\n".join(rows) + '</tbody></table>'
+        )
+
+    # --- API Request Rate ---
+    if api_latency:
+        rows = []
+        for label, v in api_latency.items():
+            status_cls = "pass" if v["passed"] else "fail"
+            rows.append(
+                f'<tr>'
+                f'<td>{label}</td>'
+                f'<td>{v["p50"]}ms</td>'
+                f'<td>{v["p95"]}ms</td>'
+                f'<td>{v["p99"]}ms</td>'
+                f'<td><span class="badge {status_cls}">{"PASS" if v["passed"] else "FAIL"}</span></td>'
+                f'</tr>'
+            )
+        sections.append(
+            '<h4 style="margin:16px 0 8px;">API Response Latency</h4>'
+            '<table class="results-table">'
+            '<thead><tr><th>Endpoint</th><th>P50</th><th>P95</th><th>P99</th><th>Status</th></tr></thead>'
+            '<tbody>' + "\n".join(rows) + '</tbody></table>'
+        )
+
+    # --- Concurrent Upload Scaling ---
+    if concurrent:
+        rows = []
+        for r in concurrent:
+            status_cls = "pass" if r["passed"] else "fail"
+            rows.append(
+                f'<tr>'
+                f'<td>{r["concurrent"]}</td>'
+                f'<td><strong>{r["throughput"]}</strong></td>'
+                f'<td>{r["total_mb"]} MB</td>'
+                f'<td>{r["upload_s"]}s</td>'
+                f'<td>{r["processing_s"]}s</td>'
+                f'<td><span class="badge {status_cls}">{"PASS" if r["passed"] else "FAIL"}</span></td>'
+                f'</tr>'
+            )
+        sections.append(
+            '<h4 style="margin:16px 0 8px;">Concurrent Upload Scaling</h4>'
+            '<table class="results-table">'
+            '<thead><tr><th>Sources</th><th>Throughput (MB/s)</th><th>Total Size</th>'
+            '<th>Upload Time</th><th>Processing</th><th>Status</th></tr></thead>'
+            '<tbody>' + "\n".join(rows) + '</tbody></table>'
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        '<details open>'
+        '<summary>Service Throughput</summary>'
+        '<div class="section-content">'
+        + "\n".join(sections) +
+        '</div></details>'
+    )
 
 
 def _make_row_id(name: str) -> str:
@@ -536,6 +693,54 @@ def extract_ingestion_throughput(results: list[dict]) -> list[dict]:
     return rows
 
 
+def extract_ros_throughput(results: list[dict]) -> list[dict]:
+    """Extract Kruize experiment creation throughput from ROS tests."""
+    rows = []
+    for r in results:
+        name = r.get("test_name", "")
+        if "ros" not in name:
+            continue
+        m = r.get("metrics") or {}
+        exp_count = m.get("experiment_count")
+        workload_count = m.get("workload_count")
+        exp_time = m.get("experiment_creation_time_sec") or m.get("processing_time_sec")
+        if exp_count is not None and exp_time and exp_time > 0:
+            rate = exp_count / exp_time * 60
+            rows.append({
+                "label": name.replace("test_perf_", "").replace("_baseline", "")[:30],
+                "experiments": exp_count,
+                "workloads": workload_count or 0,
+                "time_sec": round(exp_time, 1),
+                "rate_per_min": round(rate, 1),
+                "per_exp_sec": round(exp_time / exp_count, 1) if exp_count > 0 else 0,
+                "passed": r.get("passed", True),
+            })
+    return rows
+
+
+def extract_processing_throughput(results: list[dict]) -> list[dict]:
+    """Extract end-to-end processing throughput for ingestion tests."""
+    rows = []
+    for r in results:
+        name = r.get("test_name", "")
+        if "ing" not in name:
+            continue
+        m = r.get("metrics") or {}
+        timings = {t["name"]: t["duration_seconds"] for t in r.get("timings", [])}
+        upload = m.get("upload") or {}
+        size_mb = upload.get("package_size_mb") or m.get("actual_size_mb") or m.get("total_upload_mb", 0)
+        proc_time = timings.get("processing_wait", timings.get("processing_wait_all", timings.get("summary_table_wait", 0)))
+        if proc_time and proc_time > 0 and size_mb > 0:
+            rows.append({
+                "label": name.replace("test_perf_", "").replace("_baseline", "")[:35],
+                "size_mb": round(size_mb, 1),
+                "processing_sec": round(proc_time, 1),
+                "processing_rate_mb_min": round(size_mb / proc_time * 60, 2),
+                "passed": r.get("passed", True),
+            })
+    return rows
+
+
 def extract_concurrent_scaling(results: list[dict]) -> list[dict]:
     """ING-003: throughput vs concurrent sources."""
     rows = []
@@ -573,14 +778,64 @@ def extract_test_timeline(results: list[dict]) -> list[dict]:
     return rows
 
 
-def extract_prometheus_series(snapshots: list[dict]) -> dict:
-    """Extract time-series data from Prometheus metric snapshots."""
+def extract_test_windows(results: list[dict]) -> list[dict]:
+    """Extract test execution windows (start/end times) for resource correlation."""
+    from datetime import datetime
+    windows = []
+    for r in results:
+        timings = r.get("timings", [])
+        if not timings:
+            continue
+        # Get earliest start and latest end from all timing phases
+        starts = [t.get("start_time") for t in timings if t.get("start_time")]
+        ends = [t.get("end_time") for t in timings if t.get("end_time")]
+        if not starts or not ends:
+            continue
+        windows.append({
+            "name": r["test_name"].replace("test_perf_", "").replace("_baseline", "")[:25],
+            "start": min(starts),
+            "end": max(ends),
+            "passed": r.get("passed", True),
+        })
+    return windows
+
+
+def find_active_test(timestamp: str, test_windows: list[dict]) -> str | None:
+    """Find which test was running at a given timestamp."""
+    from datetime import datetime
+    try:
+        # Parse the metrics timestamp (format: "2026-05-31T22:07:38Z" or similar)
+        ts = timestamp.replace("Z", "+00:00")
+        if "+" not in ts and len(ts) == 19:
+            ts += "+00:00"
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    
+    for w in test_windows:
+        try:
+            start = datetime.fromisoformat(w["start"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(w["end"].replace("Z", "+00:00"))
+            if start <= dt <= end:
+                return w["name"]
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def extract_prometheus_series(snapshots: list[dict], test_windows: list[dict] | None = None) -> dict:
+    """Extract time-series data from Prometheus metric snapshots.
+    
+    If test_windows is provided, includes which test was active at each timestamp.
+    """
     series: dict = {
         "timestamps": [],
+        "active_tests": [],  # Which test was running at each timestamp
         "listener_cpu": [],
         "celery_cpu": [],
         "postgres_cpu": [],
-        "celery_queue_total": [],
+        "celery_tasks_active": [],
+        "celery_task_rate": [],
         "db_connections": [],
         "memory_mb": [],
         "valkey_mb": [],
@@ -589,6 +844,10 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
     for snap in snapshots:
         ts = snap.get("timestamp", "")
         series["timestamps"].append(ts[:19].replace("T", " "))
+        
+        # Find which test was running at this timestamp
+        active = find_active_test(ts, test_windows) if test_windows else None
+        series["active_tests"].append(active)
         
         m = snap.get("metrics", {})
 
@@ -608,16 +867,19 @@ def extract_prometheus_series(snapshots: list[dict]) -> dict:
                   m.get("postgres_cpu_cores"))
         series["postgres_cpu"].append(round(pg_cpu, 4) if pg_cpu is not None else None)
 
-        # Celery queue depth - check multiple formats
-        queues = snap.get("celery_queues") or m.get("celery_queues") or {}
-        if isinstance(queues, dict) and queues:
-            total_q = sum(queues.values())
-        else:
-            # Try alternate field names
-            total_q = m.get("celery_queue_depth_total")
-            if isinstance(total_q, list):
-                total_q = sum(total_q) if total_q else None
-        series["celery_queue_total"].append(total_q)
+        # Celery task activity from celery-exporter
+        tasks_active = m.get("celery_tasks_active")
+        if tasks_active is None:
+            # Legacy field name fallback
+            tasks_active = m.get("celery_queue_depth_total")
+        if isinstance(tasks_active, list):
+            tasks_active = sum(tasks_active) if tasks_active else None
+        series["celery_tasks_active"].append(tasks_active)
+
+        task_rate = m.get("celery_task_rate")
+        if isinstance(task_rate, list):
+            task_rate = task_rate[0] if task_rate else None
+        series["celery_task_rate"].append(round(float(task_rate), 3) if task_rate is not None else None)
 
         # DB connections
         db_conn = (snap.get("db_connections") or 
@@ -669,7 +931,8 @@ def compute_resource_summary(prom_series: dict) -> dict:
         "memory_mb": stats(prom_series["memory_mb"]),
         "valkey_mb": stats(prom_series["valkey_mb"]),
         "postgres_mb": stats(prom_series["postgres_mb"]),
-        "celery_queue": stats(prom_series["celery_queue_total"]),
+        "celery_tasks_active": stats(prom_series["celery_tasks_active"]),
+        "celery_task_rate": stats(prom_series["celery_task_rate"], decimals=3),
         "snapshot_count": len(prom_series["timestamps"]),
         "time_start": prom_series["timestamps"][0] if prom_series["timestamps"] else None,
         "time_end": prom_series["timestamps"][-1] if prom_series["timestamps"] else None,
@@ -701,17 +964,30 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     else:
         results = session.get("results", [])
 
+    # Compute derived throughput metrics for any service that has raw timing data
+    for r in results:
+        m = r.get("metrics") or {}
+        exp_count = m.get("experiment_count")
+        exp_time = m.get("experiment_creation_time_sec") or m.get("processing_time_sec")
+        if exp_count and exp_time and exp_time > 0:
+            m["experiment_creation_rate_per_min"] = round(exp_count / exp_time * 60, 1)
+            m["seconds_per_experiment"] = round(exp_time / exp_count, 2) if exp_count > 0 else None
+
     # Extract all chart data
     api_latency     = extract_api_latency(results)
     ing_throughput  = extract_ingestion_throughput(results)
     concurrent      = extract_concurrent_scaling(results)
+    ros_throughput  = extract_ros_throughput(results)
+    proc_throughput = extract_processing_throughput(results)
     timeline        = extract_test_timeline(results)
-    prom_series     = extract_prometheus_series(snapshots)
+    test_windows    = extract_test_windows(results)
+    prom_series     = extract_prometheus_series(snapshots, test_windows)
 
     # KPIs
     run_id       = run_dir.name
     chart_ver    = metadata.get("chart_version", session.get("results", [{}])[0].get("chart_version", "unknown") if results else "unknown")
     profile      = metadata.get("perf_profile", results[0].get("profile", "unknown") if results else "unknown")
+    suite        = metadata.get("perf_suite", "all")
     ts_raw       = metadata.get("created_at", session.get("timestamp", "") if session else "")
     ts_str       = ts_raw[:19].replace("T", " ") + " UTC" if ts_raw else "unknown"
     cluster_info = metadata.get("cluster_info", results[0].get("cluster_info", {}) if results else {})
@@ -745,11 +1021,17 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
         max(len([r for r in ing_throughput if r["throughput"] > 0]), 1), 3
     )
 
-    # KPI evaluation
+    # Avg Kruize experiment throughput (exp/min)
+    avg_ros_rate = round(
+        sum(r["rate_per_min"] for r in ros_throughput if r["rate_per_min"] > 0) /
+        max(len([r for r in ros_throughput if r["rate_per_min"] > 0]), 1), 1
+    ) if ros_throughput else 0
+
+    # KPI evaluation (using profile-aware thresholds)
     all_kpi_evals: list[dict] = []
     per_test_kpis: dict[str, list[dict]] = {}
     for r in results:
-        evals = evaluate_kpis(r)
+        evals = evaluate_kpis(r, profile=profile)
         if evals:
             all_kpi_evals.extend(evals)
             per_test_kpis[r["test_name"]] = evals
@@ -763,6 +1045,8 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     has_api    = len(api_latency) > 0
     has_ing    = len(ing_throughput) > 0
     has_conc   = len(concurrent) > 0
+    has_ros    = len(ros_throughput) > 0
+    has_proc   = len(proc_throughput) > 0
 
     # Resource summary from Prometheus snapshots
     resource_summary = compute_resource_summary(prom_series) if has_prom else {}
@@ -788,14 +1072,29 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
         '<canvas id="concChart"></canvas></div>'
     ) if has_conc else ""
 
+    ros_chart_html = (
+        '<div class="chart-card"><h3>Kruize Experiment Throughput</h3>'
+        '<canvas id="rosChart"></canvas></div>'
+    ) if has_ros else ""
+
+    proc_chart_html2 = (
+        '<div class="chart-card"><h3>Processing Rate (MB/min)</h3>'
+        '<canvas id="procRateChart"></canvas></div>'
+    ) if has_proc else ""
+
     cpu_chart_html = (
-        '<div class="chart-card wide"><h3>Listener CPU (cores) over time</h3>'
+        '<div class="chart-card wide"><h3>CPU Usage (cores) over time — hover for active test</h3>'
         '<canvas id="cpuChart"></canvas></div>'
     ) if has_prom else ""
 
-    queue_chart_html = (
-        '<div class="chart-card"><h3>Celery Queue Depth over time</h3>'
-        '<canvas id="queueChart"></canvas></div>'
+    memory_chart_html = (
+        '<div class="chart-card"><h3>Memory Usage (MB) over time</h3>'
+        '<canvas id="memoryChart"></canvas></div>'
+    ) if has_prom else ""
+
+    celery_chart_html = (
+        '<div class="chart-card"><h3>Celery Task Activity — hover for active test</h3>'
+        '<canvas id="celeryChart"></canvas></div>'
     ) if has_prom else ""
 
     # Chart.js data blobs
@@ -817,10 +1116,25 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     conc_tput     = js_array([r["throughput"] for r in concurrent])
     conc_proc     = js_array([r["processing_s"] for r in concurrent])
 
+    ros_labels    = js_array([r["label"] for r in ros_throughput])
+    ros_rates     = js_array([r["rate_per_min"] for r in ros_throughput])
+    ros_exps      = js_array([r["experiments"] for r in ros_throughput])
+    ros_colors    = js_colors([r["passed"] for r in ros_throughput])
+
+    proc_rate_labels = js_array([r["label"] for r in proc_throughput])
+    proc_rate_values = js_array([r["processing_rate_mb_min"] for r in proc_throughput])
+    proc_rate_colors = js_colors([r["passed"] for r in proc_throughput])
+
     prom_ts    = js_array(prom_series["timestamps"])
     prom_cpu   = js_array(prom_series["listener_cpu"])
-    prom_queue = js_array(prom_series["celery_queue_total"])
+    prom_celery_cpu = js_array(prom_series["celery_cpu"])
+    prom_pg_cpu = js_array(prom_series["postgres_cpu"])
+    prom_active_tests = js_array(prom_series["active_tests"])
     prom_mem   = js_array(prom_series["memory_mb"])
+    prom_valkey_mb = js_array(prom_series["valkey_mb"])
+    prom_pg_mb = js_array(prom_series["postgres_mb"])
+    prom_celery_active = js_array(prom_series["celery_tasks_active"])
+    prom_celery_rate = js_array(prom_series["celery_task_rate"])
 
     # Conditional JS blocks built before the f-string
     js_api_chart = (
@@ -869,46 +1183,87 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
         f" grid: {{ drawOnChartArea: false }} }} }} }} }});"
     ) if has_conc else ""
 
-    js_cpu_chart = (
-        f"new Chart(document.getElementById('cpuChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
-        f" datasets: [{{ label: 'Listener CPU (cores)', data: {prom_cpu},"
+    js_ros_chart = (
+        f"new Chart(document.getElementById('rosChart'), {{ type: 'bar', data: {{ labels: {ros_labels},"
+        f" datasets: ["
+        f" {{ label: 'Rate (exp/min)', data: {ros_rates}, backgroundColor: {ros_colors}, borderRadius: 3, yAxisID: 'y' }},"
+        f" {{ label: 'Experiments', data: {ros_exps}, type: 'line',"
         f" borderColor: 'rgba(41,128,185,0.9)', backgroundColor: 'rgba(41,128,185,0.1)',"
-        f" tension: 0.3, fill: true, pointRadius: 2 }}] }},"
+        f" tension: 0.3, pointRadius: 4, yAxisID: 'y1' }}"
+        f" ] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ position: 'top' }} }},"
+        f" scales: {{ x: {{ ticks: {{ font: {{ size: 9 }} }} }},"
+        f" y: {{ position: 'left', grid: {{ color: gridColor }}, title: {{ display: true, text: 'exp/min' }} }},"
+        f" y1: {{ position: 'right', grid: {{ drawOnChartArea: false }}, title: {{ display: true, text: 'count' }} }} }} }} }});"
+    ) if has_ros else ""
+
+    js_proc_rate_chart = (
+        f"new Chart(document.getElementById('procRateChart'), {{ type: 'bar', data: {{ labels: {proc_rate_labels},"
+        f" datasets: [{{ label: 'MB/min', data: {proc_rate_values}, backgroundColor: {proc_rate_colors}, borderRadius: 3 }}] }},"
         f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
+        f" scales: {{ x: {{ ticks: {{ font: {{ size: 9 }} }} }},"
+        f" y: {{ grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB/min' }} }} }} }} }});"
+    ) if has_proc else ""
+
+    # CPU chart with all three series and active test tooltip
+    js_cpu_chart = (
+        f"const activeTests = {prom_active_tests};"
+        f"new Chart(document.getElementById('cpuChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
+        f" datasets: ["
+        f" {{ label: 'Listener', data: {prom_cpu},"
+        f" borderColor: 'rgba(41,128,185,0.9)', backgroundColor: 'rgba(41,128,185,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }},"
+        f" {{ label: 'Celery Workers', data: {prom_celery_cpu},"
+        f" borderColor: 'rgba(230,126,34,0.9)', backgroundColor: 'rgba(230,126,34,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }},"
+        f" {{ label: 'Postgres', data: {prom_pg_cpu},"
+        f" borderColor: 'rgba(39,174,96,0.9)', backgroundColor: 'rgba(39,174,96,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }}"
+        f" ] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ position: 'top' }},"
+        f" tooltip: {{ callbacks: {{ afterLabel: function(ctx) {{ const test = activeTests[ctx.dataIndex]; return test ? 'Test: ' + test : ''; }} }} }} }},"
         f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
         f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'cores' }} }} }} }} }});"
     ) if has_prom else ""
 
-    js_queue_chart = (
-        f"new Chart(document.getElementById('queueChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
-        f" datasets: [{{ label: 'Queue depth', data: {prom_queue},"
+    # Memory chart with listener, Valkey, and Postgres series
+    js_memory_chart = (
+        f"new Chart(document.getElementById('memoryChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
+        f" datasets: ["
+        f" {{ label: 'Listener', data: {prom_mem},"
+        f" borderColor: 'rgba(41,128,185,0.9)', backgroundColor: 'rgba(41,128,185,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }},"
+        f" {{ label: 'Postgres', data: {prom_pg_mb},"
+        f" borderColor: 'rgba(39,174,96,0.9)', backgroundColor: 'rgba(39,174,96,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }},"
+        f" {{ label: 'Valkey', data: {prom_valkey_mb},"
+        f" borderColor: 'rgba(155,89,182,0.9)', backgroundColor: 'rgba(155,89,182,0.1)',"
+        f" tension: 0.3, fill: true, pointRadius: 1 }}"
+        f" ] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ position: 'top' }},"
+        f" tooltip: {{ callbacks: {{ afterLabel: function(ctx) {{ const test = activeTests[ctx.dataIndex]; return test ? 'Test: ' + test : ''; }} }} }} }},"
+        f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
+        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB' }} }} }} }} }});"
+    ) if has_prom else ""
+
+    # Celery task activity chart (active tasks + task rate on dual Y axis)
+    js_celery_chart = (
+        f"new Chart(document.getElementById('celeryChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
+        f" datasets: ["
+        f" {{ label: 'Active Tasks', data: {prom_celery_active},"
         f" borderColor: 'rgba(231,76,60,0.9)', backgroundColor: 'rgba(231,76,60,0.1)',"
-        f" tension: 0.2, fill: true, pointRadius: 2 }}] }},"
-        f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
+        f" tension: 0.3, fill: true, pointRadius: 1, yAxisID: 'y' }},"
+        f" {{ label: 'Task Rate (tasks/s)', data: {prom_celery_rate},"
+        f" borderColor: 'rgba(46,204,113,0.9)', backgroundColor: 'rgba(46,204,113,0.1)',"
+        f" tension: 0.3, fill: false, pointRadius: 1, borderDash: [4,2], yAxisID: 'y1' }}"
+        f" ] }},"
+        f" options: {{ responsive: true, plugins: {{ legend: {{ position: 'top' }},"
+        f" tooltip: {{ callbacks: {{ afterLabel: function(ctx) {{ const test = activeTests[ctx.dataIndex]; return test ? 'Test: ' + test : ''; }} }} }} }},"
         f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
-        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'tasks' }} }} }} }} }});"
+        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'active tasks' }}, position: 'left' }},"
+        f" y1: {{ min: 0, grid: {{ drawOnChartArea: false }}, title: {{ display: true, text: 'tasks/s' }}, position: 'right' }} }} }} }});"
     ) if has_prom else ""
 
-    js_mem_chart = (
-        f"new Chart(document.getElementById('memChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
-        f" datasets: [{{ label: 'Memory (MB)', data: {prom_mem},"
-        f" borderColor: 'rgba(142,68,173,0.9)', backgroundColor: 'rgba(142,68,173,0.1)',"
-        f" tension: 0.3, fill: true, pointRadius: 2 }}] }},"
-        f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
-        f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
-        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB' }} }} }} }} }});"
-    ) if has_prom else ""
-
-    prom_valkey = js_array(prom_series["valkey_mb"])
-    js_valkey_chart = (
-        f"new Chart(document.getElementById('valkeyChart'), {{ type: 'line', data: {{ labels: {prom_ts},"
-        f" datasets: [{{ label: 'Valkey (MB)', data: {prom_valkey},"
-        f" borderColor: 'rgba(230,126,34,0.9)', backgroundColor: 'rgba(230,126,34,0.1)',"
-        f" tension: 0.3, fill: true, pointRadius: 2 }}] }},"
-        f" options: {{ responsive: true, plugins: {{ legend: {{ display: false }} }},"
-        f" scales: {{ x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9 }} }} }},"
-        f" y: {{ min: 0, grid: {{ color: gridColor }}, title: {{ display: true, text: 'MB' }} }} }} }} }});"
-    ) if has_prom else ""
 
     ocp_ver    = cluster_info.get("ocp_version", "?")
     nodes      = cluster_info.get("node_count", "?")
@@ -931,6 +1286,12 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
             '<span class="g-label">Grafana:</span> '
             + " ".join(g_parts) + '</div>'
         )
+
+    suite_banner = (
+        f'<div style="background:var(--yellow-bg,#fff3cd);border:1px solid var(--yellow-border,#ffc107);'
+        f'padding:6px 12px;border-radius:4px;font-size:12px;margin:4px 0 8px;">'
+        f'Partial run: <strong>{suite}</strong> suite only</div>'
+    ) if suite != "all" else ""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1024,10 +1385,12 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
 
   <h1>Performance Run Report</h1>
   {grafana_banner}
+  {suite_banner}
   <div class="meta-row">
     <span><strong>Run:</strong> {run_id}</span>
     <span><strong>Chart:</strong> {chart_ver}</span>
     <span><strong>Profile:</strong> {profile}</span>
+    <span><strong>Suite:</strong> {suite}</span>
     <span><strong>Cluster:</strong> OCP {ocp_ver} · {nodes} nodes · {storage}</span>
     <span><strong>Started:</strong> {ts_str}</span>
     <span><strong>Generated:</strong> {generated_at}</span>
@@ -1051,6 +1414,7 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
       <div class="n">{avg_throughput} MB/s</div>
       <div class="l">Avg upload throughput</div>
     </div>
+    {f'<div class="kpi"><div class="n">{avg_ros_rate} exp/min</div><div class="l">Avg Kruize throughput</div></div>' if has_ros else ""}
     {f'<div class="kpi"><div class="n">{len(snapshots)}</div><div class="l">Metrics snapshots</div></div>' if has_prom else ""}
     <div class="kpi" style="border-color:var(--kpi-{overall_kpi})">
       <div class="n" style="color:var(--kpi-{overall_kpi})">{kpi_green}/{kpi_total}</div>
@@ -1070,6 +1434,9 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     </div>
   </details>
 
+  <!-- Service Throughput -->
+  {_build_throughput_summary_html(ros_throughput, ing_throughput, proc_throughput, api_latency, concurrent)}
+
   <!-- Test Execution Charts -->
   <details open>
     <summary>Test Execution Charts</summary>
@@ -1083,6 +1450,8 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
         {throughput_chart_html}
         {proc_chart_html}
         {conc_chart_html}
+        {ros_chart_html}
+        {proc_chart_html2}
       </div>
     </div>
   </details>
@@ -1093,9 +1462,8 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     <div class="section-content">
       <div class="chart-grid">
         {cpu_chart_html}
-        {queue_chart_html}
-        <div class="chart-card"><h3>Memory Usage (MB)</h3><canvas id="memChart"></canvas></div>
-        <div class="chart-card"><h3>Valkey Memory (MB)</h3><canvas id="valkeyChart"></canvas></div>
+        {memory_chart_html}
+        {celery_chart_html}
       </div>
     </div>
   </details>''' if has_prom else ""}
@@ -1152,13 +1520,15 @@ new Chart(document.getElementById('timelineChart'), {{
 
 {js_conc_chart}
 
+{js_ros_chart}
+
+{js_proc_rate_chart}
+
 {js_cpu_chart}
 
-{js_queue_chart}
+{js_memory_chart}
 
-{js_mem_chart}
-
-{js_valkey_chart}
+{js_celery_chart}
 
 // Toggle expandable test details
 function toggleDetails(id) {{
@@ -1242,6 +1612,13 @@ def _result_row_expandable(r: dict, kpis: list[dict] | None = None) -> str:
         bits.append(f'p95={round(m["aggregate_p95"]*1000,1)}ms')
     if "requests_per_second" in m:
         bits.append(f'{m["requests_per_second"]:.1f} req/s')
+    # ROS throughput
+    exp_count = m.get("experiment_count")
+    exp_time = m.get("experiment_creation_time_sec") or m.get("processing_time_sec")
+    if exp_count is not None and exp_time and exp_time > 0:
+        rate = exp_count / exp_time * 60
+        wl = m.get("workload_count", "?")
+        bits.append(f'{exp_count}/{wl} exp · {rate:.1f}/min')
     metrics_str = " · ".join(bits) if bits else "—"
     
     kpi_badges = ""
@@ -1307,6 +1684,10 @@ def _result_row(r: dict, kpis: list[dict] | None = None) -> str:
         bits.append(f'{m["concurrent_sources"]} concurrent')
     if "within_window" in m:
         bits.append(f'6h window: {"✅" if m["within_window"] else "❌"}')
+    # ROS throughput
+    if "experiment_creation_rate_per_min" in m:
+        wl = m.get("workload_count", "?")
+        bits.append(f'{m.get("experiment_count", "?")}/{wl} exp · {m["experiment_creation_rate_per_min"]:.1f}/min')
     metrics_str = " · ".join(bits) if bits else "—"
 
     kpi_badges = ""
