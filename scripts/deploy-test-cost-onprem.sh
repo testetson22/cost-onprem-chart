@@ -1337,31 +1337,40 @@ apply_perf_profile_config() {
     local ingress_timeout="30s"   ingress_per_try_timeout="30s"
 
     case "${PERF_PROFILE}" in
-        medium|large)
-            # Replica scaling
-            if [[ "${PERF_PROFILE}" == "medium" ]]; then
-                ros_processor_replicas=2
-                listener_replicas=2
-                ocp_worker_replicas=2
-                summary_worker_replicas=2
-            else
-                ros_processor_replicas=3
-                listener_replicas=3
-                ocp_worker_replicas=3
-                summary_worker_replicas=3
-            fi
-            # Resource overrides required to avoid OOMKills / CPU throttling
-            # (PERF-FINDING-006, 007, 008 — recommended for production too)
+        small)
+            # Small customer profile (1 cluster, 15 nodes, up to 10 concurrent sources).
+            # Default single-replica pipeline can't drain 5+ sources in time.
+            listener_replicas=2
+            ocp_worker_replicas=2
+            summary_worker_replicas=2
+            # Kruize CPU bump prevents liveness probe failures under ROS load
+            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            ;;
+        medium)
+            ros_processor_replicas=2
+            listener_replicas=2
+            ocp_worker_replicas=2
+            summary_worker_replicas=2
             kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
-            # Upload / timeout overrides required for large payloads
-            # (PERF-FINDING-001, 009 — recommended for production too)
             max_upload_size="209715200"   # 200MB
             haproxy_timeout="180s"
             ingress_timeout="180s";       ingress_per_try_timeout="180s"
             ;;
-        baseline|small|*)
+        large)
+            ros_processor_replicas=3
+            listener_replicas=3
+            ocp_worker_replicas=3
+            summary_worker_replicas=3
+            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            ros_mem_req="2Gi";          ros_mem_lim="4Gi"
+            listener_mem_req="1Gi";     listener_mem_lim="2Gi"
+            max_upload_size="209715200"   # 200MB
+            haproxy_timeout="180s"
+            ingress_timeout="180s";       ingress_per_try_timeout="180s"
+            ;;
+        baseline|*)
             # Chart defaults already set above
             ;;
     esac

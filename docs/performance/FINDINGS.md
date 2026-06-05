@@ -149,6 +149,40 @@ Kruize's serial experiment creation path.
 
 ---
 
+### PERF-FINDING-018: Default Pipeline Replicas Insufficient for Concurrent Source Processing
+
+**Status**: Open — rightsizing data  
+**Severity**: Medium  
+**Date**: 2026-06-05  
+
+**Problem**:
+The chart ships with 1 replica each for koku-listener, celery-worker-ocp, and celery-worker-summary. At the `small` customer profile (1 cluster, 15 nodes), the pipeline cannot process 5+ concurrent source uploads within expected timeframes. Sources that complete upload sit in the queue waiting for the single worker to process them sequentially.
+
+**Evidence** (Jenkins `small` profile run, `0-2-20-rc5-small-1780611992`):
+
+| Test | Sources | Processed | Result |
+|------|---------|-----------|--------|
+| `ing_003[2]` | 2 | 2/2 | PASSED |
+| `ing_003[5]` | 5 | 4/5 | FAILED |
+| `ing_003[10]` | 10 | 8/10 | FAILED |
+
+Processing was not timing out due to data size — the uploads themselves completed. The bottleneck is serial processing through the single-replica pipeline.
+
+**Impact**:
+Any deployment handling more than a few sources uploading in overlapping windows will experience processing delays proportional to queue depth. This applies to production deployments with multiple clusters reporting, not just test workloads.
+
+**Recommended Configuration** (concurrent source handling):
+
+| Concurrent Sources | listener | ocp-worker | summary-worker |
+|--------------------|----------|------------|----------------|
+| 1–3 | 1 | 1 | 1 |
+| 4–10 | 2 | 2 | 2 |
+| 11–20 | 3 | 3 | 3 |
+
+**Applied**: `deploy-test-cost-onprem.sh` scales listener, ocp-worker, and summary-worker to 2 replicas for the `small` profile and above.
+
+---
+
 ### PERF-FINDING-015: Processing Pipeline Scaling — Rightsizing Data for Test Profiles
 
 **Status**: Open — data collection phase  
@@ -179,9 +213,9 @@ Scale tests   | 0.016-0.305| 2101-2109 | 0.081-0.197 | 0.016-0.028 | 1553 MB
 | Profile | Expected Load | Recommended Scaling |
 |---------|--------------|---------------------|
 | baseline | 1-5 sources, small payloads | All replicas: 1 (default) |
-| small | 5-10 sources, 30-day bursts | Default replicas, increase timeouts |
-| medium | 10-20 sources, 90-day bursts, 320 workloads | Kruize: 2, ros-processor: 2, listener: 2, ocp-worker: 2 |
-| large | TBD | Kruize: 3, ros-processor: 3, listener: 2, ocp-worker: 3 |
+| small | 5-10 sources, 30-day bursts | listener: 2, ocp-worker: 2, summary-worker: 2 (see PERF-FINDING-018) |
+| medium | 10-20 sources, 90-day bursts, 320 workloads | ros-processor: 2, listener: 2, ocp-worker: 2, summary-worker: 2 |
+| large | TBD | ros-processor: 3, listener: 3, ocp-worker: 3, summary-worker: 3 |
 
 **Next steps**:
 - Re-run medium profile with over-scaled configuration
@@ -462,6 +496,7 @@ until the root cause is understood and the minimum viable configuration is estab
 | PERF-FINDING-015 | N/A (data collection) | None — informational | Establishes baselines, not a fix |
 | PERF-FINDING-016 | Informational | None — documents measured rates | Throughput catalog; drives timeout calibration |
 | PERF-FINDING-017 | Test Framework | None — only affects test harness | Dynamic upload timeout; JWT refresh needed for long uploads |
+| PERF-FINDING-018 | Under-scaled | **Medium** — default replicas can't handle concurrent sources | Pipeline serialization bottleneck at 5+ sources |
 
 ### Rightsizing Guidelines
 
@@ -663,6 +698,7 @@ guides and/or applied via the Jira linked above.
 | PERF-FINDING-015 | Profile-aware scaling baselines | Data collection | **In progress** |
 | PERF-FINDING-016 | Kruize throughput catalog and timeout calibration | Informational | **Applied** (test timeouts) |
 | PERF-FINDING-017 | Upload timeout dynamic scaling; JWT refresh for long uploads | Test Framework | **Applied** (timeout fix) |
+| PERF-FINDING-018 | Default pipeline replicas (1) can't process 5+ concurrent sources | Under-scaled | **Applied via deploy script** — recommend for product documentation |
 
 ### Test Framework (no Jira needed)
 
