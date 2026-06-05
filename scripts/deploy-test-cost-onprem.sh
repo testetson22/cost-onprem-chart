@@ -1171,22 +1171,19 @@ upload_perf_results_to_s3() {
         return 1
     fi
 
-    # Pin S3 endpoint to IPv4 if IPv6 is unreachable (common in split-site
-    # labs).  Adds a temporary /etc/hosts entry scoped to this hostname only;
-    # _s3_cleanup_hosts removes it at the end of the upload function.
-    _S3_HOSTS_PINNED=""
+    # When IPv6 is unreachable for the S3 endpoint (common in split-site labs),
+    # rewrite S3_ENDPOINT to use the IPv4 address directly.  The aws CLI will
+    # connect to the IP and --no-verify-ssl handles the hostname mismatch.
     if [[ -n "${S3_ENDPOINT:-}" ]] && [[ "$(uname)" == "Linux" ]]; then
-        local s3_host
+        local s3_host s3_ipv4
         s3_host=$(echo "${S3_ENDPOINT}" | sed 's|https\?://||;s|/.*||;s|:.*||')
-        if [[ -n "${s3_host}" ]] && ! grep -q "${s3_host}" /etc/hosts 2>/dev/null; then
+        if [[ -n "${s3_host}" ]]; then
             if curl -4 -sk --connect-timeout 3 --max-time 5 "https://${s3_host}/minio/health/live" -o /dev/null 2>/dev/null \
                && ! curl -6 -sk --connect-timeout 3 --max-time 5 "https://${s3_host}/minio/health/live" -o /dev/null 2>/dev/null; then
-                local s3_ipv4
                 s3_ipv4=$(getent ahostsv4 "${s3_host}" 2>/dev/null | awk 'NR==1{print $1}')
                 if [[ -n "${s3_ipv4}" ]]; then
-                    log_warning "IPv6 unreachable for ${s3_host}, pinning to ${s3_ipv4}"
-                    echo "${s3_ipv4} ${s3_host}" >> /etc/hosts 2>/dev/null && _S3_HOSTS_PINNED="${s3_host}" \
-                        || log_warning "Could not write /etc/hosts (not root?), S3 uploads may be slow"
+                    log_warning "IPv6 unreachable for ${s3_host}, rewriting endpoint to IPv4 (${s3_ipv4})"
+                    S3_ENDPOINT=$(echo "${S3_ENDPOINT}" | sed "s|${s3_host}|${s3_ipv4}|")
                 fi
             fi
         fi
@@ -1288,11 +1285,6 @@ upload_perf_results_to_s3() {
             || log_warning "Could not update bucket index.json (non-fatal)"
     fi
 
-    # Remove temporary /etc/hosts pin if we added one
-    if [[ -n "${_S3_HOSTS_PINNED}" ]]; then
-        sed -i "/${_S3_HOSTS_PINNED}/d" /etc/hosts 2>/dev/null
-        _S3_HOSTS_PINNED=""
-    fi
 }
 
 generate_metadata_json() {
