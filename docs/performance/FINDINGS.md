@@ -158,26 +158,25 @@ Kruize's serial experiment creation path.
 **Problem**:
 The chart ships with 1 replica each for koku-listener, celery-worker-ocp, and celery-worker-summary. At the `small` customer profile (1 cluster, 15 nodes), the pipeline cannot process 5+ concurrent source uploads within expected timeframes. Sources that complete upload sit in the queue waiting for the single worker to process them sequentially.
 
-**Evidence** (Jenkins `small` profile run, `0-2-20-rc5-small-1780611992`):
+**Evidence**:
 
-| Test | Sources | Processed | Result |
-|------|---------|-----------|--------|
-| `ing_003[2]` | 2 | 2/2 | PASSED |
-| `ing_003[5]` | 5 | 4/5 | FAILED |
-| `ing_003[10]` | 10 | 8/10 | FAILED |
+| Run | Replicas | `ing_003[2]` | `ing_003[5]` | `ing_003[10]` |
+|-----|----------|-------------|-------------|---------------|
+| `0-2-20-rc5-small-1780611992` | 1 | PASSED (2/2) | FAILED (4/5) | FAILED (8/10) |
+| `0-2-20-rc5-small-1780670464` | 2 | PASSED (2/2) | PASSED (5/5) | FAILED (9/10) |
 
-Processing was not timing out due to data size — the uploads themselves completed. The bottleneck is serial processing through the single-replica pipeline.
+Scaling to 2 replicas resolved the 5-source case and improved the 10-source case (8→9), but 10 concurrent sources remains at the boundary. Processing is not timing out due to data size — uploads complete successfully. The bottleneck is serial task processing through the pipeline workers.
 
 **Impact**:
 Any deployment handling more than a few sources uploading in overlapping windows will experience processing delays proportional to queue depth. This applies to production deployments with multiple clusters reporting, not just test workloads.
 
 **Recommended Configuration** (concurrent source handling):
 
-| Concurrent Sources | listener | ocp-worker | summary-worker |
-|--------------------|----------|------------|----------------|
-| 1–3 | 1 | 1 | 1 |
-| 4–10 | 2 | 2 | 2 |
-| 11–20 | 3 | 3 | 3 |
+| Concurrent Sources | listener | ocp-worker | summary-worker | Evidence |
+|--------------------|----------|------------|----------------|----------|
+| 1–3 | 1 | 1 | 1 | 2/2 passes at 1 replica |
+| 4–10 | 2 | 2 | 2 | 5/5 passes; 9/10 at boundary |
+| 10+ | 3 | 3 | 3 | Not yet validated |
 
 **Applied**: `deploy-test-cost-onprem.sh` scales listener, ocp-worker, and summary-worker to 2 replicas for the `small` profile and above.
 
