@@ -1182,10 +1182,28 @@ upload_perf_results_to_s3() {
     local endpoint_arg=""
     [[ -n "${S3_ENDPOINT:-}" ]] && endpoint_arg="--endpoint-url ${S3_ENDPOINT}"
 
+    # Ensure boto3 is available for s3-upload.py.  Try the test venv first
+    # (already has boto3 in requirements.txt), then fall back to pip install.
+    local _s3_python=""
+    if [[ -f "${s3_upload_script}" ]]; then
+        local _venv_python="$(dirname "${BASH_SOURCE[0]}")/../tests/.venv/bin/python"
+        if [[ -x "${_venv_python}" ]] && "${_venv_python}" -c "import boto3" 2>/dev/null; then
+            _s3_python="${_venv_python}"
+        elif command -v python3 &>/dev/null && python3 -c "import boto3" 2>/dev/null; then
+            _s3_python="python3"
+        elif command -v python3 &>/dev/null; then
+            log_info "Installing boto3 for S3 uploads..."
+            python3 -m pip install --user boto3 --quiet 2>/dev/null \
+                || python3 -m pip install boto3 --quiet --break-system-packages 2>/dev/null \
+                || true
+            python3 -c "import boto3" 2>/dev/null && _s3_python="python3"
+        fi
+    fi
+
     # Preflight: verify we can list the target bucket
     log_info "S3 preflight: checking s3://${S3_BUCKET}/..."
-    if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
-        if timeout 30 python3 "${s3_upload_script}" ls "s3://${S3_BUCKET}/" ${endpoint_arg} &>/dev/null; then
+    if [[ -n "${_s3_python}" ]]; then
+        if timeout 30 "${_s3_python}" "${s3_upload_script}" ls "s3://${S3_BUCKET}/" ${endpoint_arg} &>/dev/null; then
             log_info "S3 preflight OK (s3-upload.py, IPv4-safe)"
         else
             log_error "S3 preflight FAILED: cannot access s3://${S3_BUCKET}/ (check S3_ENDPOINT, credentials, bucket name)"
@@ -1209,9 +1227,9 @@ upload_perf_results_to_s3() {
     # Upload entire directory recursively
     log_info "Uploading to s3://${S3_BUCKET}/${s3_prefix}/"
 
-    if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
+    if [[ -n "${_s3_python}" ]]; then
         timeout "${upload_timeout}" \
-            python3 "${s3_upload_script}" sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" \
+            "${_s3_python}" "${s3_upload_script}" sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" \
             ${endpoint_arg} \
             || upload_rc=$?
     elif command -v aws &>/dev/null; then
@@ -1233,9 +1251,9 @@ upload_perf_results_to_s3() {
     local tarball_path="${test_run_dir}.tar.gz"
     if [[ ${upload_rc} -eq 0 ]] && [[ -f "${tarball_path}" ]]; then
         local tarball_s3_key="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}.tar.gz"
-        if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
+        if [[ -n "${_s3_python}" ]]; then
             timeout "${upload_timeout}" \
-                python3 "${s3_upload_script}" cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" \
+                "${_s3_python}" "${s3_upload_script}" cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" \
                 ${endpoint_arg} 2>/dev/null \
                 && log_success "Tarball uploaded: s3://${S3_BUCKET}/${tarball_s3_key}" \
                 || log_warning "Could not upload tarball to S3 (non-fatal)"
