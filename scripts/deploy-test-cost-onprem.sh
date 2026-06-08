@@ -1164,44 +1164,6 @@ upload_perf_results_to_s3() {
         return 0
     fi
 
-    # Preflight: verify S3 client is installed and can reach the bucket
-    if ! command -v aws &>/dev/null && ! command -v mc &>/dev/null && ! command -v s3cmd &>/dev/null; then
-        log_error "No S3 client found (aws, mc, or s3cmd). Cannot upload results."
-        log_error "Install one: pip install awscli, or uv tool install awscli"
-        return 1
-    fi
-
-    # When IPv6 is unreachable for the S3 endpoint (common in split-site labs),
-    # rewrite S3_ENDPOINT to use the IPv4 address directly.  The aws CLI will
-    # connect to the IP and --no-verify-ssl handles the hostname mismatch.
-    if [[ -n "${S3_ENDPOINT:-}" ]] && [[ "$(uname)" == "Linux" ]]; then
-        local s3_host s3_ipv4
-        s3_host=$(echo "${S3_ENDPOINT}" | sed 's|https\?://||;s|/.*||;s|:.*||')
-        if [[ -n "${s3_host}" ]]; then
-            if curl -4 -sk --connect-timeout 3 --max-time 5 "https://${s3_host}/minio/health/live" -o /dev/null 2>/dev/null \
-               && ! curl -6 -sk --connect-timeout 3 --max-time 5 "https://${s3_host}/minio/health/live" -o /dev/null 2>/dev/null; then
-                s3_ipv4=$(getent ahostsv4 "${s3_host}" 2>/dev/null | awk 'NR==1{print $1}')
-                if [[ -n "${s3_ipv4}" ]]; then
-                    log_warning "IPv6 unreachable for ${s3_host}, rewriting endpoint to IPv4 (${s3_ipv4})"
-                    S3_ENDPOINT=$(echo "${S3_ENDPOINT}" | sed "s|${s3_host}|${s3_ipv4}|")
-                fi
-            fi
-        fi
-    fi
-
-    if command -v aws &>/dev/null; then
-        local preflight_args=""
-        [[ -n "${S3_ENDPOINT:-}" ]] && preflight_args+=" --endpoint-url ${S3_ENDPOINT}"
-        [[ "${S3_NO_SIGN_REQUEST:-true}" == "true" ]] && preflight_args+=" --no-sign-request"
-        [[ "${S3_NO_VERIFY_SSL:-true}" == "true" ]] && preflight_args+=" --no-verify-ssl"
-        if timeout 30 aws s3 ls "s3://${S3_BUCKET}/" ${preflight_args} --max-items 1 &>/dev/null; then
-            log_info "S3 preflight OK: can list s3://${S3_BUCKET}/"
-        else
-            log_error "S3 preflight FAILED: cannot access s3://${S3_BUCKET}/ (check S3_ENDPOINT, credentials, bucket name)"
-            return 1
-        fi
-    fi
-
     # Generate metadata.json with test run context
     generate_metadata_json
 
@@ -1213,49 +1175,50 @@ upload_perf_results_to_s3() {
             || log_warning "Could not generate perf-summary.json (non-fatal)"
     fi
 
-    # Upload entire directory recursively
     local s3_prefix="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}"
-    local endpoint_arg=""
-    if [[ -n "${S3_ENDPOINT:-}" ]]; then
-        endpoint_arg="--endpoint-url ${S3_ENDPOINT}"
-    fi
-
-    log_info "Uploading to s3://${S3_BUCKET}/${s3_prefix}/"
-
+    local s3_upload_script="$(dirname "${BASH_SOURCE[0]}")/s3-upload.py"
     local upload_rc=0
     local upload_timeout="${S3_UPLOAD_TIMEOUT:-120}"
+    local endpoint_arg=""
+    [[ -n "${S3_ENDPOINT:-}" ]] && endpoint_arg="--endpoint-url ${S3_ENDPOINT}"
 
-    if command -v aws &>/dev/null; then
+    # Preflight: verify we can list the target bucket
+    log_info "S3 preflight: checking s3://${S3_BUCKET}/..."
+    if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
+        if timeout 30 python3 "${s3_upload_script}" ls "s3://${S3_BUCKET}/" ${endpoint_arg} &>/dev/null; then
+            log_info "S3 preflight OK (s3-upload.py, IPv4-safe)"
+        else
+            log_error "S3 preflight FAILED: cannot access s3://${S3_BUCKET}/ (check S3_ENDPOINT, credentials, bucket name)"
+            return 1
+        fi
+    elif command -v aws &>/dev/null; then
         local aws_extra_args=""
         [[ "${S3_NO_SIGN_REQUEST:-true}" == "true" ]] && aws_extra_args+=" --no-sign-request"
         [[ "${S3_NO_VERIFY_SSL:-true}" == "true" ]] && aws_extra_args+=" --no-verify-ssl"
+        if timeout 30 aws s3 ls "s3://${S3_BUCKET}/" ${endpoint_arg} ${aws_extra_args} --max-items 1 &>/dev/null; then
+            log_info "S3 preflight OK (aws cli)"
+        else
+            log_error "S3 preflight FAILED: cannot access s3://${S3_BUCKET}/ (check S3_ENDPOINT, credentials, bucket name)"
+            return 1
+        fi
+    else
+        log_error "No S3 client found. Need python3 + boto3 or aws cli."
+        return 1
+    fi
+
+    # Upload entire directory recursively
+    log_info "Uploading to s3://${S3_BUCKET}/${s3_prefix}/"
+
+    if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
+        timeout "${upload_timeout}" \
+            python3 "${s3_upload_script}" sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" \
+            ${endpoint_arg} \
+            || upload_rc=$?
+    elif command -v aws &>/dev/null; then
         timeout "${upload_timeout}" \
             aws s3 sync "${test_run_dir}" "s3://${S3_BUCKET}/${s3_prefix}/" \
             ${endpoint_arg} ${aws_extra_args} --no-progress \
             || upload_rc=$?
-    elif command -v mc &>/dev/null; then
-        if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
-            mc alias set s3upload "${S3_ENDPOINT:-https://s3.amazonaws.com}" \
-                "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" --api S3v4 &>/dev/null
-            timeout "${upload_timeout}" \
-                mc mirror "${test_run_dir}" "s3upload/${S3_BUCKET}/${s3_prefix}/" \
-                || upload_rc=$?
-        else
-            timeout "${upload_timeout}" \
-                mc mirror "${test_run_dir}" "s3/${S3_BUCKET}/${s3_prefix}/" \
-                || upload_rc=$?
-        fi
-    elif command -v s3cmd &>/dev/null; then
-        local s3cmd_args=()
-        [[ -n "${S3_ENDPOINT:-}" ]] && s3cmd_args+=("--host=${S3_ENDPOINT}" "--host-bucket=${S3_ENDPOINT}/${S3_BUCKET}")
-        [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && s3cmd_args+=("--access_key=${AWS_ACCESS_KEY_ID}")
-        [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && s3cmd_args+=("--secret_key=${AWS_SECRET_ACCESS_KEY}")
-        timeout "${upload_timeout}" \
-            s3cmd sync "${test_run_dir}/" "s3://${S3_BUCKET}/${s3_prefix}/" "${s3cmd_args[@]}" \
-            || upload_rc=$?
-    else
-        log_error "No S3 client found (aws, mc, or s3cmd). Install one of them."
-        return 1
     fi
 
     if [[ ${upload_rc} -eq 124 ]]; then
@@ -1268,13 +1231,21 @@ upload_perf_results_to_s3() {
 
     # Upload tarball alongside the directory if it exists
     local tarball_path="${test_run_dir}.tar.gz"
-    if [[ ${upload_rc} -eq 0 ]] && [[ -f "${tarball_path}" ]] && command -v aws &>/dev/null; then
+    if [[ ${upload_rc} -eq 0 ]] && [[ -f "${tarball_path}" ]]; then
         local tarball_s3_key="${S3_PREFIX:-cost-onprem-performance/}${TEST_RUN_ID}.tar.gz"
-        timeout "${upload_timeout}" \
-            aws s3 cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" \
-            ${endpoint_arg} ${aws_extra_args} --no-progress 2>/dev/null \
-            && log_success "Tarball uploaded: s3://${S3_BUCKET}/${tarball_s3_key}" \
-            || log_warning "Could not upload tarball to S3 (non-fatal)"
+        if [[ -f "${s3_upload_script}" ]] && command -v python3 &>/dev/null; then
+            timeout "${upload_timeout}" \
+                python3 "${s3_upload_script}" cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" \
+                ${endpoint_arg} 2>/dev/null \
+                && log_success "Tarball uploaded: s3://${S3_BUCKET}/${tarball_s3_key}" \
+                || log_warning "Could not upload tarball to S3 (non-fatal)"
+        elif command -v aws &>/dev/null; then
+            timeout "${upload_timeout}" \
+                aws s3 cp "${tarball_path}" "s3://${S3_BUCKET}/${tarball_s3_key}" \
+                ${endpoint_arg} ${aws_extra_args} --no-progress 2>/dev/null \
+                && log_success "Tarball uploaded: s3://${S3_BUCKET}/${tarball_s3_key}" \
+                || log_warning "Could not upload tarball to S3 (non-fatal)"
+        fi
     fi
 
     # Update the bucket-level index.json so Grafana can list all runs
