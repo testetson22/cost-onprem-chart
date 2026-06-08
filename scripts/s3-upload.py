@@ -31,7 +31,10 @@ socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 import argparse
 import mimetypes
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 try:
     import boto3

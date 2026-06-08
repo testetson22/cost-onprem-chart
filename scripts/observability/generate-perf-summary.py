@@ -436,6 +436,40 @@ def build_summary(run_dir: Path) -> dict:
 # Index management
 # ---------------------------------------------------------------------------
 
+def _get_boto3_client(endpoint: str, key: str, secret: str):
+    """Build an IPv4-safe boto3 S3 client."""
+    import socket as _socket
+    _orig = _socket.getaddrinfo
+    _socket.getaddrinfo = lambda *a, **kw: [r for r in _orig(*a, **kw) if r[0] == _socket.AF_INET] or _orig(*a, **kw)
+
+    import warnings
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+    try:
+        import boto3
+        from botocore import UNSIGNED
+        from botocore.config import Config as BotoConfig
+    except ImportError:
+        return None
+
+    no_sign = os.environ.get("S3_NO_SIGN_REQUEST", "true").lower() == "true"
+    cfg = BotoConfig(
+        signature_version=UNSIGNED if (no_sign and not key) else None,
+        s3={"addressing_style": "path"},
+        connect_timeout=10,
+        read_timeout=30,
+        retries={"max_attempts": 2},
+    )
+    no_ssl = os.environ.get("S3_NO_VERIFY_SSL", "true").lower() == "true"
+    kwargs = {"config": cfg, "verify": not no_ssl}
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    if key and secret:
+        kwargs["aws_access_key_id"] = key
+        kwargs["aws_secret_access_key"] = secret
+    return boto3.client("s3", **kwargs)
+
+
 def update_s3_index(run_dir: Path, summary: dict,
                     s3_endpoint: str, s3_bucket: str, s3_prefix: str,
                     aws_key: str, aws_secret: str) -> bool:
@@ -443,13 +477,7 @@ def update_s3_index(run_dir: Path, summary: dict,
     Download the current index.json from the bucket, append/update this run's
     entry, and re-upload.  Returns True on success.
     """
-    import tempfile
-    import urllib.request
-    import urllib.error
-    import base64
-
     index_key  = f"{s3_prefix.rstrip('/')}/index.json"
-    index_url  = f"{s3_endpoint.rstrip('/')}/{s3_bucket}/{index_key}"
     resources = summary.get("resources", {})
     run_entry  = {
         "run_id":        summary["run"]["run_id"],
@@ -464,48 +492,36 @@ def update_s3_index(run_dir: Path, summary: dict,
         "summary_path":  f"{s3_prefix.rstrip('/')}/{summary['run']['run_id']}/results/perf-summary.json",
     }
 
+    client = _get_boto3_client(s3_endpoint, aws_key, aws_secret)
+    if client is None:
+        print("[WARN] boto3 not available, cannot update index.json")
+        return False
+
     # Try to load existing index
     index: dict = {"runs": [], "updated_at": ""}
     try:
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-        # TODO: add S3 auth headers for private buckets
-        with urllib.request.urlopen(index_url, context=ctx, timeout=10) as r:
-            index = json.loads(r.read())
+        resp = client.get_object(Bucket=s3_bucket, Key=index_key)
+        index = json.loads(resp["Body"].read())
     except Exception:
-        pass  # New index
+        pass  # New index or doesn't exist yet
 
     # Upsert this run
     runs = [x for x in index.get("runs", []) if x.get("run_id") != run_entry["run_id"]]
     runs.insert(0, run_entry)
     index = {"runs": runs, "updated_at": datetime.now(timezone.utc).isoformat()}
 
-    # Write locally
-    tmp = Path(tempfile.mktemp(suffix=".json"))
-    tmp.write_text(json.dumps(index, indent=2))
-
-    # Upload via aws cli / mc
+    # Upload
     try:
-        endpoint_arg = f"--endpoint-url {s3_endpoint}" if s3_endpoint else ""
-        # Support public buckets (no credentials) and self-signed certs
-        no_sign = "--no-sign-request" if os.environ.get("S3_NO_SIGN_REQUEST", "true").lower() == "true" else ""
-        no_ssl  = "--no-verify-ssl" if os.environ.get("S3_NO_VERIFY_SSL", "true").lower() == "true" else ""
-        cmd = f"aws s3 cp {tmp} s3://{s3_bucket}/{index_key} {endpoint_arg} {no_sign} {no_ssl} --no-progress"
-        env = {**os.environ}
-        if aws_key and aws_secret and not no_sign:
-            env.update({"AWS_ACCESS_KEY_ID": aws_key, "AWS_SECRET_ACCESS_KEY": aws_secret})
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, timeout=30)
-        tmp.unlink(missing_ok=True)
-        if result.returncode == 0:
-            print(f"[OK] Index updated: s3://{s3_bucket}/{index_key}")
-            return True
-        else:
-            print(f"[WARN] Index upload failed: {result.stderr[:200]}")
+        client.put_object(
+            Bucket=s3_bucket,
+            Key=index_key,
+            Body=json.dumps(index, indent=2).encode(),
+            ContentType="application/json",
+        )
+        print(f"[OK] Index updated: s3://{s3_bucket}/{index_key}")
+        return True
     except Exception as e:
         print(f"[WARN] Could not update index: {e}")
-    tmp.unlink(missing_ok=True)
     return False
 
 
