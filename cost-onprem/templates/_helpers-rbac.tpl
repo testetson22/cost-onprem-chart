@@ -98,6 +98,30 @@ Provides DB, Redis, and application configuration for non-Clowder mode.
   value: {{ include "cost-onprem.koku.valkey.host" . | quote }}
 - name: REDIS_PORT
   value: {{ include "cost-onprem.koku.valkey.port" . | quote }}
+{{- if .Values.valkey.auth.enabled }}
+{{- if not .Values.valkey.auth.secretName }}
+  {{- fail "valkey.auth.enabled is true but valkey.auth.secretName is empty. Provide the name of a Secret containing key 'redis-password'." -}}
+{{- end }}
+- name: REDIS_USERNAME
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.valkey.auth.secretName }}
+      key: redis-username
+      optional: true
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.valkey.auth.secretName }}
+      key: redis-password
+{{- end }}
+{{- if .Values.valkey.tls.enabled }}
+- name: REDIS_SSL
+  value: "True"
+{{- if .Values.valkey.tls.caCertSecretName }}
+- name: REDIS_SSL_CA_CERTS
+  value: "/etc/redis-tls/ca.crt"
+{{- end }}
+{{- end }}
 - name: DJANGO_SECRET_KEY
   valueFrom:
     secretKeyRef:
@@ -196,6 +220,20 @@ user exists, the template fails with an actionable error.
 {{- if not $found -}}
   {{- "7890123" -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Keycloak-to-RBAC sync CronJob name.
+*/}}
+{{- define "cost-onprem.rbac.keycloakSync.name" -}}
+{{- printf "%s-rbac-keycloak-sync" (include "cost-onprem.fullname" .) -}}
+{{- end -}}
+
+{{/*
+Keycloak-to-RBAC sync ConfigMap name.
+*/}}
+{{- define "cost-onprem.rbac.keycloakSync.configmapName" -}}
+{{- printf "%s-rbac-sync-script" (include "cost-onprem.fullname" .) -}}
 {{- end -}}
 
 {{/*

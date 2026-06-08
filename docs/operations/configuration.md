@@ -828,24 +828,80 @@ Use an existing Redis-compatible cache instead of the bundled Valkey Deployment.
 
 1. A Redis 7+ or Valkey 8+ instance accessible from the OpenShift cluster
 2. (Optional) Authentication credentials if the instance is password-protected
+3. (Optional) TLS certificate if the instance uses encrypted connections
+
+**Required Redis configuration:**
+- `maxmemory-policy`: `allkeys-lru` (recommended) — Koku uses Redis for caching and as a Celery broker; LRU eviction prevents OOM
+- Persistence: Recommended for Celery result backend reliability (RDB snapshots or AOF), but not strictly required
+- Redis 7+ or Valkey 8+ for compatibility with the redis-py client
 
 **Configuration:**
 
 ```yaml
-# values.yaml
+# values.yaml — Basic external Redis with password auth
 valkey:
   deploy: false
   host: "my-redis.example.com"
   port: 6379
   auth:
     enabled: true
-    secretName: "my-redis-credentials"  # Secret with key: redis-password
+    secretName: "my-redis-credentials"  # Secret with keys: redis-password, redis-username (optional)
+```
+
+```yaml
+# values.yaml — External Redis with password auth + TLS
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6380
+  auth:
+    enabled: true
+    secretName: "my-redis-credentials"  # Secret with keys: redis-password, redis-username (optional)
+  tls:
+    enabled: true
+    caCertSecretName: "my-redis-ca"     # Secret with key: ca.crt
+```
+
+```yaml
+# values.yaml — External Redis with TLS only (no password)
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6380
+  tls:
+    enabled: true
+    caCertSecretName: ""  # Empty = TLS without certificate verification
 ```
 
 When `valkey.deploy: false`:
 - The chart skips the Valkey Deployment, Service, and PVC
 - Koku and Celery components connect to the external Redis host
-- If `auth.enabled`, a `REDIS_PASSWORD` environment variable is injected into all consumers (requires `auth.secretName`)
+- If `auth.enabled`, `REDIS_PASSWORD` (and optionally `REDIS_USERNAME`) environment variables are injected into all consumers (requires `auth.secretName`)
+- If `tls.enabled`, `REDIS_SSL=True` is set and the connection uses `rediss://` scheme
+- If `tls.caCertSecretName` is provided, the CA certificate is mounted at `/etc/redis-tls/ca.crt` and certificate verification is enforced (`ssl.CERT_REQUIRED`); without it, TLS is used but certificates are not verified (`ssl.CERT_NONE`)
+
+**Creating the auth Secret:**
+
+```bash
+# Password only (default Redis user):
+kubectl create secret generic my-redis-credentials \
+  --from-literal=redis-password='YOUR_REDIS_PASSWORD' \
+  -n cost-onprem
+
+# Password + username (Redis 6+ ACL authentication):
+kubectl create secret generic my-redis-credentials \
+  --from-literal=redis-password='YOUR_REDIS_PASSWORD' \
+  --from-literal=redis-username='YOUR_REDIS_USERNAME' \
+  -n cost-onprem
+```
+
+**Creating the TLS CA cert Secret:**
+
+```bash
+kubectl create secret generic my-redis-ca \
+  --from-file=ca.crt=/path/to/redis-ca.crt \
+  -n cost-onprem
+```
 
 **Consumers:** Koku API, MASU, Kafka Listener, Migration Job, Celery Beat, and all Celery Workers. ROS components do not use Valkey.
 
@@ -911,15 +967,13 @@ Or set it in your values file directly.
 
 Use an existing Kafka cluster instead of the bundled AMQ Streams deployment.
 
-> **Known Limitation:** Only **PLAINTEXT** Kafka connections are currently supported. Both Koku and ROS backends do not read SASL/TLS configuration from environment variables in on-prem (non-Clowder) mode. Upstream application changes are required before chart-level SASL/TLS support can be added.
-
 **Prerequisites:**
 
-1. Apache Kafka 3.x or later accessible from the OpenShift cluster with a **PLAINTEXT** listener
+1. Apache Kafka 3.x or later accessible from the OpenShift cluster
 2. All five topics listed above must exist (or `auto.create.topics.enable` must be set to `true`)
 3. Bootstrap servers reachable from the `cost-onprem` namespace over the network
 
-**Configuration:**
+**Configuration (PLAINTEXT):**
 
 ```yaml
 # values.yaml
@@ -927,6 +981,47 @@ kafka:
   bootstrapServers: "my-kafka-broker1:9092,my-kafka-broker2:9092"
   securityProtocol: "PLAINTEXT"
 ```
+
+**Configuration (SASL/TLS):**
+
+For authenticated connections (SASL_SSL, SASL_PLAINTEXT), provide credentials via a
+Kubernetes Secret and optionally a CA certificate Secret:
+
+```bash
+# Create the SASL credentials Secret
+kubectl create secret generic kafka-sasl-credentials \
+  --from-literal=username=my-kafka-user \
+  --from-literal=password=my-kafka-password \
+  -n cost-onprem
+
+# (Optional) Create the TLS CA certificate Secret
+kubectl create secret generic kafka-ca-cert \
+  --from-file=ca.crt=/path/to/ca-certificate.pem \
+  -n cost-onprem
+```
+
+```yaml
+# values.yaml
+kafka:
+  bootstrapServers: "my-kafka-broker1:9093,my-kafka-broker2:9093"
+  securityProtocol: "SASL_SSL"
+
+  sasl:
+    mechanism: "SCRAM-SHA-512"       # PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512
+    existingSecret: "kafka-sasl-credentials"  # Secret with keys: username, password
+
+  tls:
+    enabled: true
+    caCertSecret: "kafka-ca-cert"    # Secret with key: ca.crt
+```
+
+| Value | Description | Required |
+|-------|-------------|----------|
+| `kafka.securityProtocol` | `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, or `SASL_SSL` | Yes |
+| `kafka.sasl.mechanism` | SASL mechanism (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) | Only for SASL |
+| `kafka.sasl.existingSecret` | Name of a Secret containing `username` and `password` keys | Only for SASL |
+| `kafka.tls.enabled` | Mount the CA certificate into pods | Only for TLS |
+| `kafka.tls.caCertSecret` | Name of a Secret containing a `ca.crt` key | Only for TLS |
 
 **Install script behavior:** Setting `KAFKA_BOOTSTRAP_SERVERS` tells the install script to skip AMQ Streams operator verification:
 

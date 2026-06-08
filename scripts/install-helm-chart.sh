@@ -22,6 +22,8 @@
 #   S3_BUCKET_INGRESS / S3_BUCKET_KOKU / S3_BUCKET_ROS - Override individual bucket names (override prefix)
 #   SKIP_S3_SETUP   - Skip S3 bucket creation entirely (default: false)
 #   S3_CLI_IMAGE    - Container image with AWS CLI for bucket creation (default: amazon/aws-cli:latest)
+#   HELM_FORCE_CONFLICTS - When true, pass --force-conflicts to helm upgrade (SSA field ownership;
+#                          use after kubectl set / oc set image on chart-managed resources)
 #
 # Examples:
 #   # Default (clean output with successes/warnings/errors only)
@@ -1304,6 +1306,12 @@ deploy_helm_chart() {
         helm_cmd="$helm_cmd ${HELM_EXTRA_ARGS[*]}"
     fi
 
+    # Reconcile server-side apply conflicts (e.g. after oc set image on deployments)
+    if [ "${HELM_FORCE_CONFLICTS:-false}" = "true" ]; then
+        helm_cmd="$helm_cmd --force-conflicts"
+        echo_info "Helm upgrade: --force-conflicts (server-side apply)"
+    fi
+
     echo_info "Executing: $helm_cmd"
 
     # Execute Helm command
@@ -1330,6 +1338,39 @@ wait_for_pods() {
         --field-selector=status.phase!=Succeeded
 
     echo_success "All pods are ready"
+}
+
+# Trigger the Keycloak-to-RBAC sync CronJob and wait for its first run to
+# complete.  Only runs when rbac.keycloakSync.enabled=true in the Helm values.
+trigger_keycloak_sync() {
+    local sync_enabled
+    sync_enabled=$(get_helm_value "rbac.keycloakSync.enabled" "false")
+    if [ "$sync_enabled" != "true" ]; then
+        return 0
+    fi
+
+    local cronjob_name="${HELM_RELEASE_NAME}-rbac-keycloak-sync"
+    local job_name="${cronjob_name}-initial-$(date +%s)"
+
+    echo_info "Triggering initial Keycloak-to-RBAC user sync..."
+
+    if ! kubectl get cronjob "$cronjob_name" -n "$NAMESPACE" &>/dev/null; then
+        echo_warning "CronJob $cronjob_name not found — skipping initial sync"
+        return 0
+    fi
+
+    kubectl create job "$job_name" --from="cronjob/$cronjob_name" -n "$NAMESPACE"
+
+    echo_info "Waiting for sync job $job_name to complete (timeout 300s)..."
+    if kubectl wait --for=condition=complete "job/$job_name" \
+        -n "$NAMESPACE" --timeout=300s 2>/dev/null; then
+        echo_success "Keycloak-to-RBAC user sync completed successfully"
+        kubectl logs "job/$job_name" -n "$NAMESPACE" --tail=20 2>/dev/null || true
+    else
+        echo_warning "Sync job did not complete within 300s"
+        echo_info "Check logs: kubectl logs job/$job_name -n $NAMESPACE"
+        echo_info "The CronJob will retry automatically on schedule"
+    fi
 }
 
 # Function to show deployment status
@@ -2238,6 +2279,9 @@ main() {
     if ! wait_for_pods; then
         echo_warning "Some pods may not be ready. Continuing..."
     fi
+
+    # Trigger initial Keycloak-to-RBAC sync (if enabled) before health checks
+    trigger_keycloak_sync
 
     # Show deployment status
     show_status
