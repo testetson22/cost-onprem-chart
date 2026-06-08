@@ -1271,6 +1271,11 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
     pass_color = "#27ae60" if failed == 0 else "#e74c3c"
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    # Pre-compute style attrs that contain quotes (backslashes in f-string
+    # expressions are a SyntaxError on Python < 3.12).
+    fail_border_style = 'style="border-color:var(--fail)"' if failed > 0 else ""
+    fail_color_style = 'style="color:var(--fail)"' if failed > 0 else ""
+
     # Grafana links banner
     grafana_banner = ""
     snap_url = grafana_links.get("snapshot_url", "")
@@ -1402,8 +1407,8 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
       <div class="n" style="color:{pass_color}">{passed}/{total}</div>
       <div class="l">Tests passed</div>
     </div>
-    <div class="kpi" {"style=\"border-color:var(--fail)\"" if failed > 0 else ""}>
-      <div class="n" {"style=\"color:var(--fail)\"" if failed > 0 else ""}>{failed}</div>
+    <div class="kpi" {fail_border_style}>
+      <div class="n" {fail_color_style}>{failed}</div>
       <div class="l">Failed</div>
     </div>
     <div class="kpi">
