@@ -495,10 +495,13 @@ def render_html(runs: list[dict], runs_dir: Path, output_path: Path) -> None:
 
         meta = run["metadata"]
         cluster = meta.get("cluster_info", {})
+        storage_type = cluster.get("storage_type", "?")
+        s3_backend = cluster.get("s3_backend", "")
+        storage_str = f"{storage_type} + {s3_backend}" if s3_backend and s3_backend != "unknown" else storage_type
         cluster_info = (
             f'OCP {cluster.get("ocp_version","?")} · '
             f'{cluster.get("node_count","?")} nodes · '
-            f'{cluster.get("storage_type","?")} storage'
+            f'{storage_str} storage'
         ) if cluster else ""
 
         detail_sections.append(f"""

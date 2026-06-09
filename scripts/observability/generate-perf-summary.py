@@ -239,6 +239,7 @@ def build_summary(run_dir: Path) -> dict:
         "ocp_version":   cluster.get("ocp_version", ""),
         "node_count":    cluster.get("node_count", 0),
         "storage_type":  cluster.get("storage_type", ""),
+        "s3_backend":    cluster.get("s3_backend", ""),
         "namespace":     metadata.get("namespace", "cost-onprem"),
     }
 

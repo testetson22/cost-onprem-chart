@@ -1267,7 +1267,9 @@ def render_html(run_dir: Path, output_path: Path, skip_grafana_links: bool = Tru
 
     ocp_ver    = cluster_info.get("ocp_version", "?")
     nodes      = cluster_info.get("node_count", "?")
-    storage    = cluster_info.get("storage_type", "?")
+    storage_type = cluster_info.get("storage_type", "?")
+    s3_backend = cluster_info.get("s3_backend", "")
+    storage = f"{storage_type} + {s3_backend}" if s3_backend and s3_backend != "unknown" else storage_type
     pass_color = "#27ae60" if failed == 0 else "#e74c3c"
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 

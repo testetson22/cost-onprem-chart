@@ -218,7 +218,8 @@ class ClusterInfo:
     total_cpu_cores: int = 0
     total_memory_gib: float = 0.0
     storage_class: str = ""
-    storage_type: str = ""  # ODF, S4, hostpath, etc.
+    storage_type: str = ""  # ODF, Longhorn, HPP, etc.
+    s3_backend: str = ""  # NooBaa, S4, MinIO, etc.
     platform: str = ""  # AWS, GCP, bare-metal, etc.
     
     def to_dict(self) -> Dict[str, Any]:
@@ -438,7 +439,61 @@ def get_storage_info(namespace: str) -> Dict[str, str]:
     if result.returncode == 0:
         return {"storage_type": "HPP", "storage_class": "hpp-backend"}
     
+    # Check for Longhorn
+    result = run_oc_command([
+        "get", "storageclass", "longhorn", "-o", "name"
+    ], check=False)
+    
+    if result.returncode == 0:
+        return {"storage_type": "Longhorn", "storage_class": "longhorn"}
+    
     return {"storage_type": "unknown", "storage_class": "unknown"}
+
+
+def get_s3_backend(namespace: str) -> str:
+    """Detect S3 backend type (NooBaa, S4, MinIO, etc.)."""
+    # Check for NooBaa (ODF)
+    result = run_oc_command([
+        "get", "noobaa", "-n", "openshift-storage", "-o", "name"
+    ], check=False)
+    
+    if result.returncode == 0 and result.stdout.strip():
+        return "NooBaa"
+    
+    # Check for S4 (look for S4 storage system)
+    result = run_oc_command([
+        "get", "storagesystem", "-n", "openshift-storage",
+        "-o", "jsonpath={.items[*].metadata.name}"
+    ], check=False)
+    
+    if result.returncode == 0 and "s4" in result.stdout.lower():
+        return "S4"
+    
+    # Check for MinIO deployment
+    result = run_oc_command([
+        "get", "deployment", "-l", "app=minio", "-A",
+        "-o", "jsonpath={.items[0].metadata.name}"
+    ], check=False)
+    
+    if result.returncode == 0 and result.stdout.strip():
+        return "MinIO"
+    
+    # Check S3 endpoint from cost-onprem config
+    result = run_oc_command([
+        "get", "configmap", "-n", namespace, "-l", "app.kubernetes.io/component=aws-config",
+        "-o", "jsonpath={.items[0].data.config}"
+    ], check=False)
+    
+    if result.returncode == 0:
+        config = result.stdout.lower()
+        if "s4" in config:
+            return "S4"
+        if "noobaa" in config:
+            return "NooBaa"
+        if "minio" in config:
+            return "MinIO"
+    
+    return "unknown"
 
 
 def get_chart_version(namespace: str, release_name: str) -> str:
@@ -551,6 +606,7 @@ def cluster_info(cluster_config: ClusterConfig) -> ClusterInfo:
     """Collect cluster information for performance context."""
     node_info = get_node_info(cluster_config.namespace)
     storage_info = get_storage_info(cluster_config.namespace)
+    s3_backend = get_s3_backend(cluster_config.namespace)
     
     return ClusterInfo(
         ocp_version=get_ocp_version(cluster_config.namespace),
@@ -560,6 +616,7 @@ def cluster_info(cluster_config: ClusterConfig) -> ClusterInfo:
         total_memory_gib=node_info["memory_gib"],
         storage_class=storage_info["storage_class"],
         storage_type=storage_info["storage_type"],
+        s3_backend=s3_backend,
         platform=os.environ.get("CLUSTER_PLATFORM", "unknown"),
     )
 
