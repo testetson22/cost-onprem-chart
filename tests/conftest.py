@@ -511,6 +511,7 @@ def _get_db_host_from_app_pod(cluster_config: ClusterConfig) -> Optional[str]:
     it as an environment variable into every app pod.  Reading it back gives us
     the concrete hostname without needing to parse Helm values or sentinels.
     """
+    checked_labels = []
     for lookup in _DB_HOST_LOOKUPS:
         pod = get_pod_by_label(cluster_config.namespace, lookup.label)
         if pod:
@@ -519,6 +520,30 @@ def _get_db_host_from_app_pod(cluster_config: ClusterConfig) -> Optional[str]:
             )
             if result and result.strip():
                 return result.strip()
+            checked_labels.append(f"{lookup.label} (pod={pod}, env={lookup.env_var}: empty)")
+        else:
+            checked_labels.append(f"{lookup.label} (no pod found)")
+    
+    # Log diagnostic info when no DB host found
+    print(f"[database_config] No DB_HOST found in namespace '{cluster_config.namespace}'")
+    print(f"[database_config] Checked labels:")
+    for label_info in checked_labels:
+        print(f"  - {label_info}")
+    
+    # Also show what pods exist in the namespace for debugging
+    try:
+        result = run_oc_command([
+            "get", "pods", "-n", cluster_config.namespace,
+            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,COMPONENT:.metadata.labels.app\\.kubernetes\\.io/component",
+            "--no-headers"
+        ], check=False)
+        if result.stdout.strip():
+            print(f"[database_config] Pods in namespace '{cluster_config.namespace}':")
+            for line in result.stdout.strip().split('\n')[:20]:  # Limit to 20 pods
+                print(f"    {line}")
+    except Exception as e:
+        print(f"[database_config] Could not list pods: {e}")
+    
     return None
 
 

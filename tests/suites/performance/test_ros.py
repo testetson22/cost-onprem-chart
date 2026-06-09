@@ -99,16 +99,25 @@ def get_kruize_heap_usage(namespace: str) -> Optional[Dict[str, float]]:
     return None
 
 
-def get_ros_queue_depth(namespace: str) -> Optional[int]:
-    """Get the ROS events Kafka topic queue depth."""
-    # Kafka may be in a separate namespace
+def _get_kafka_pod_and_namespace() -> Tuple[Optional[str], str]:
+    """Get the Kafka broker pod name and namespace.
+    
+    Returns:
+        Tuple of (pod_name, namespace) or (None, namespace) if not found.
+    """
     kafka_namespace = os.environ.get("KAFKA_NAMESPACE", "kafka")
     helm_release = os.environ.get("HELM_RELEASE_NAME", "cost-onprem")
     
-    # Find Kafka broker pod dynamically
     kafka_pod = get_pod_by_label(kafka_namespace, f"app.kubernetes.io/name={helm_release}-kafka")
     if not kafka_pod:
         kafka_pod = get_pod_by_label(kafka_namespace, "strimzi.io/kind=Kafka")
+    
+    return kafka_pod, kafka_namespace
+
+
+def get_ros_queue_depth(namespace: str) -> Optional[int]:
+    """Get the ROS events Kafka topic queue depth."""
+    kafka_pod, kafka_namespace = _get_kafka_pod_and_namespace()
     
     if not kafka_pod:
         return None
@@ -136,6 +145,77 @@ def get_ros_queue_depth(namespace: str) -> Optional[int]:
         return total_lag
     except (ValueError, IndexError):
         return None
+
+
+def reset_ros_queue_offset(namespace: str) -> bool:
+    """Reset the ROS processor Kafka consumer offset to latest.
+    
+    This clears any poison pill events that are blocking the queue by
+    skipping past them. The ros-processor must be scaled down first.
+    
+    Returns:
+        True if reset succeeded, False otherwise.
+    """
+    kafka_pod, kafka_namespace = _get_kafka_pod_and_namespace()
+    if not kafka_pod:
+        print("[ros-queue-reset] Kafka pod not found, cannot reset")
+        return False
+    
+    # Step 1: Scale down ros-processor so consumer group becomes inactive
+    print("[ros-queue-reset] Scaling down ros-processor...")
+    result = run_oc_command([
+        "scale", "deployment/cost-onprem-ros-processor",
+        "-n", namespace, "--replicas=0"
+    ], check=False)
+    if result.returncode != 0:
+        print(f"[ros-queue-reset] Failed to scale down: {result.stderr}")
+        return False
+    
+    # Step 2: Wait for consumer group to become inactive (session timeout ~30s)
+    print("[ros-queue-reset] Waiting for consumer group to become inactive...")
+    time.sleep(35)
+    
+    # Step 3: Reset offset to latest
+    print("[ros-queue-reset] Resetting offset to latest...")
+    result = run_oc_command([
+        "exec", "-n", kafka_namespace,
+        kafka_pod, "--",
+        "bin/kafka-consumer-groups.sh",
+        "--bootstrap-server", "localhost:9092",
+        "--group", "ros-processor",
+        "--topic", "hccm.ros.events",
+        "--reset-offsets", "--to-latest", "--execute"
+    ], check=False)
+    
+    if result.returncode != 0:
+        print(f"[ros-queue-reset] Failed to reset offset: {result.stderr}")
+        # Scale back up anyway
+        run_oc_command([
+            "scale", "deployment/cost-onprem-ros-processor",
+            "-n", namespace, "--replicas=1"
+        ], check=False)
+        return False
+    
+    print(f"[ros-queue-reset] Offset reset output: {result.stdout.strip()}")
+    
+    # Step 4: Scale ros-processor back up
+    print("[ros-queue-reset] Scaling up ros-processor...")
+    result = run_oc_command([
+        "scale", "deployment/cost-onprem-ros-processor",
+        "-n", namespace, "--replicas=1"
+    ], check=False)
+    if result.returncode != 0:
+        print(f"[ros-queue-reset] Warning: Failed to scale up: {result.stderr}")
+        return False
+    
+    # Step 5: Wait for ros-processor to be ready
+    print("[ros-queue-reset] Waiting for ros-processor to be ready...")
+    time.sleep(15)
+    
+    # Verify queue is now empty
+    new_lag = get_ros_queue_depth(namespace)
+    print(f"[ros-queue-reset] Complete. New lag: {new_lag}")
+    return True
 
 
 def get_kruize_experiment_count(
@@ -278,6 +358,40 @@ def wait_for_kruize_recommendations(
 class TestROSPerformance:
     """ROS/Kruize performance tests (PERF-ROS-*)."""
 
+    @pytest.fixture(scope="class", autouse=True)
+    def ensure_clean_ros_queue(self, cluster_config):
+        """Ensure ROS queue is healthy at the start of the test class.
+        
+        This fixture runs once before any ROS tests. If the queue has non-zero
+        lag that isn't decreasing (poisoned), we reset it proactively rather
+        than waiting for each test's drain_ros_queue fixture to time out.
+        
+        PERF-FINDING-013: FK poison pills from prior test runs can block the
+        entire ROS queue. Resetting at suite start is more efficient.
+        """
+        initial_lag = get_ros_queue_depth(cluster_config.namespace)
+        if initial_lag is None or initial_lag == 0:
+            print(f"[ros-suite-init] Queue healthy (lag={initial_lag})")
+            return
+        
+        print(f"[ros-suite-init] Queue has lag={initial_lag}, checking if progressing...")
+        
+        # Quick check: is the lag decreasing?
+        time.sleep(15)
+        second_lag = get_ros_queue_depth(cluster_config.namespace)
+        
+        if second_lag is not None and second_lag < initial_lag:
+            # Queue is progressing, let drain_ros_queue handle individual tests
+            print(f"[ros-suite-init] Queue progressing ({initial_lag} -> {second_lag}), will drain per-test")
+            return
+        
+        # Queue is stalled - likely poisoned, reset it now
+        print(f"[ros-suite-init] Queue stalled at {second_lag}, resetting...")
+        if reset_ros_queue_offset(cluster_config.namespace):
+            print("[ros-suite-init] Queue reset successful")
+        else:
+            print("[ros-suite-init] Queue reset failed - tests may fail")
+
     @pytest.fixture(autouse=True)
     def drain_ros_queue(self, cluster_config):
         """Wait for the ROS processor to consume all pending Kafka events.
@@ -289,7 +403,7 @@ class TestROSPerformance:
 
         The timeout scales with the observed lag (~6s per event via Kruize API).
         We also track whether lag is decreasing; if it stalls for ``stall_timeout``
-        seconds we give up rather than blocking forever.
+        seconds we reset the queue offset to skip past poison pills (PERF-FINDING-013).
         """
         poll_interval = 5
         stall_timeout = 90
@@ -316,10 +430,21 @@ class TestROSPerformance:
                         last_progress_time = time.time()
                     prev_lag = lag
                 elif time.time() - last_progress_time > stall_timeout:
-                    print(f"[ros-queue-drain] lag stalled at {lag} for {stall_timeout}s, proceeding anyway")
+                    # Queue is stalled - likely poisoned with FK errors (PERF-FINDING-013)
+                    print(f"[ros-queue-drain] lag stalled at {lag} for {stall_timeout}s - resetting queue")
+                    if reset_ros_queue_offset(cluster_config.namespace):
+                        print("[ros-queue-drain] queue reset successful, proceeding")
+                    else:
+                        print("[ros-queue-drain] queue reset failed, proceeding anyway")
                     return
             time.sleep(poll_interval)
-        print(f"[ros-queue-drain] timed out after {max_wait}s (lag={prev_lag}), proceeding anyway")
+        
+        # Timed out - also try to reset the queue
+        print(f"[ros-queue-drain] timed out after {max_wait}s (lag={prev_lag}) - resetting queue")
+        if reset_ros_queue_offset(cluster_config.namespace):
+            print("[ros-queue-drain] queue reset successful, proceeding")
+        else:
+            print("[ros-queue-drain] queue reset failed, proceeding anyway")
 
     @pytest.fixture(scope="class")
     def kruize_credentials(self, cluster_config) -> Dict[str, str]:
