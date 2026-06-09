@@ -847,6 +847,7 @@ class PerfResultCollector:
 # =============================================================================
 
 from e2e_helpers import delete_source, cleanup_database_records
+from cleanup import cleanup_s3_data
 
 
 @dataclass
@@ -929,6 +930,104 @@ class PerfCleanupTracker:
             time.sleep(5)
         print(f"  [ros-drain] drained to lag={prev_lag} (timeout {max_timeout}s)")
 
+    def _get_s3_config(self) -> Optional[Dict[str, str]]:
+        """Get S3 configuration from the cluster."""
+        try:
+            # Get S3 credentials secret
+            result = run_oc_command([
+                "get", "secret", f"{self.helm_release}-s3-credentials",
+                "-n", self.namespace,
+                "-o", "jsonpath={.data.access-key}"
+            ], check=False)
+            if result.returncode != 0:
+                return None
+            
+            import base64
+            access_key = base64.b64decode(result.stdout.strip()).decode('utf-8')
+            
+            result = run_oc_command([
+                "get", "secret", f"{self.helm_release}-s3-credentials",
+                "-n", self.namespace,
+                "-o", "jsonpath={.data.secret-key}"
+            ], check=False)
+            if result.returncode != 0:
+                return None
+            
+            secret_key = base64.b64decode(result.stdout.strip()).decode('utf-8')
+            
+            # Get S3 endpoint from configmap
+            result = run_oc_command([
+                "get", "configmap", f"{self.helm_release}-aws-config",
+                "-n", self.namespace,
+                "-o", "jsonpath={.data.endpoint}"
+            ], check=False)
+            
+            # Default to common S4/NooBaa endpoints if not found
+            if result.returncode == 0 and result.stdout.strip():
+                endpoint = result.stdout.strip()
+            else:
+                # Try to detect S4 or NooBaa
+                s4_result = run_oc_command([
+                    "get", "svc", "s4", "-n", "s4",
+                    "-o", "jsonpath={.spec.clusterIP}"
+                ], check=False)
+                if s4_result.returncode == 0 and s4_result.stdout.strip():
+                    endpoint = f"http://{s4_result.stdout.strip()}:7480"
+                else:
+                    endpoint = "https://s3.openshift-storage.svc:443"
+            
+            return {
+                "endpoint": endpoint,
+                "access_key": access_key,
+                "secret_key": secret_key,
+                "bucket": "koku-bucket",
+                "verify_ssl": False,
+            }
+        except Exception as e:
+            print(f"  [s3-cleanup] Could not get S3 config: {e}")
+            return None
+
+    def _cleanup_s3_data(self, failures: List[str]):
+        """Clean up S3 data for all tracked clusters."""
+        s3_config = self._get_s3_config()
+        if not s3_config:
+            print("  [s3-cleanup] Skipped - could not get S3 credentials")
+            return
+        
+        # Get unique cluster IDs
+        cluster_ids = {r.cluster_id for r in self.resources if r.cluster_id}
+        if not cluster_ids:
+            return
+        
+        # Default org_id used in tests
+        org_id = os.environ.get("ORG_ID", "6089719")
+        
+        total_deleted = 0
+        for cluster_id in cluster_ids:
+            try:
+                result = cleanup_s3_data(
+                    endpoint=s3_config["endpoint"],
+                    access_key=s3_config["access_key"],
+                    secret_key=s3_config["secret_key"],
+                    bucket=s3_config["bucket"],
+                    org_id=org_id,
+                    cluster_id=cluster_id,
+                    verify_ssl=s3_config["verify_ssl"],
+                )
+                files_deleted = result.get("files_deleted", 0)
+                total_deleted += files_deleted
+                if files_deleted > 0:
+                    print(f"  Cleaned {files_deleted} S3 files for cluster {cluster_id}")
+                if result.get("error"):
+                    print(f"  Warning: S3 cleanup error for {cluster_id}: {result['error']}")
+            except Exception as e:
+                msg = f"Error cleaning S3 for cluster {cluster_id}: {e}"
+                print(f"  {msg}")
+                failures.append(msg)
+        
+        if total_deleted > 0:
+            print(f"  [s3-cleanup] Total: {total_deleted} files deleted")
+
     def cleanup(self, rh_identity_header: str):
         """Clean up all tracked resources.
 
@@ -996,6 +1095,9 @@ class PerfCleanupTracker:
                     msg = f"Error cleaning DB for cluster {resource.cluster_id}: {e}"
                     print(f"  {msg}")
                     failures.append(msg)
+        
+        # Clean S3 data for all tracked clusters
+        self._cleanup_s3_data(failures)
         
         self.resources.clear()
         
