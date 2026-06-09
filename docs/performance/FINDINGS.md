@@ -182,6 +182,95 @@ Any deployment handling more than a few sources uploading in overlapping windows
 
 ---
 
+### PERF-FINDING-019: Ceph OSD False-Full Cascade Under Load
+
+**Status**: Open — needs investigation  
+**Severity**: Critical  
+**Category**: Environment  
+**Date**: 2026-06-09  
+
+**Problem**:
+During a medium-profile performance test run, all CephFS-backed pods entered
+`CreateContainerError` state with SELinux relabeling failures. The Ceph cluster
+reported `OSD_FULL` and `POOL_FULL` errors despite OSDs showing only **25-29%
+actual disk usage**.
+
+**Symptoms**:
+```
+Error: relabel failed ... lsetxattr(label=system_u:object_r:container_file_t:s0:c28,c2)
+  .../mount/pgdata: permission denied
+```
+
+**Cascade**:
+1. Ceph OSDs incorrectly report `OSD_FULL` (false positive)
+2. CephFS volumes cannot perform SELinux xattr operations (writes blocked)
+3. Pod restarts hit `CreateContainerError` on volume mount (relabel fails)
+4. Database pod down → listeners wait on migrations → entire pipeline stalled
+5. Kafka brokers also affected (same CephFS storage class)
+
+**Evidence**:
+
+| Metric | Reported | Actual |
+|--------|----------|--------|
+| Ceph Health | `HEALTH_ERR` (OSD_FULL) | Disks 25-29% used |
+| Pool Status | 12 pools full | False positive |
+| OSD Backfill | `backfill_toofull` | No actual capacity issue |
+
+**Root Cause Analysis**:
+The Ceph operator logs showed "PGs are not clean from previous drain event", suggesting:
+1. A node drain or OSD restart triggered PG rebalancing
+2. During rebalance under memory pressure, Ceph incorrectly calculated available space
+3. The false-full state persisted until OSDs were restarted
+
+**Recovery**:
+```bash
+# Restart OSD pods to clear false-full state
+oc delete pod -n openshift-storage -l app=rook-ceph-osd --grace-period=30
+
+# Wait for OSDs to rejoin and Ceph to recalculate
+# Health should transition: HEALTH_ERR → HEALTH_WARN → HEALTH_OK
+
+# Then restart affected pods (database, Kafka)
+oc delete pod -n cost-onprem cost-onprem-database-0 --grace-period=0 --force
+oc delete pod -n kafka -l strimzi.io/broker-role=true --grace-period=0 --force
+```
+
+**Timeline** (2026-06-09):
+- ~15:01: Database liveness probe fails (rejecting connections)
+- ~15:02: Database pod restarts, hits SELinux relabel error
+- ~15:28: Kafka brokers also failing with same error
+- ~15:55: OSD pods restarted
+- ~15:58: Ceph health transitions to HEALTH_WARN
+- ~16:00: Database pod starts successfully
+- ~16:01: Listeners become ready
+
+**Cluster Context**:
+- 3-worker cluster with cost-onprem + Kafka + ODF
+- Worker nodes at 84-86% memory allocation
+- Performance tests generating significant I/O load
+
+**Pattern**: This is the second control plane failure during medium-profile tests.
+Previously master-0 went down and required recovery. The medium profile may be
+pushing the cluster beyond sustainable limits for a 3-master/3-worker configuration.
+
+**Production Implication**:
+Clusters running cost-onprem at high utilization with CephFS storage may experience
+this failure mode. The false-full condition can cascade to all CephFS-backed
+workloads (database, Kafka, any app using CephFS PVCs).
+
+**Recommended Actions**:
+1. **Monitor Ceph health** proactively during performance tests
+2. **Document recovery procedure** for operators
+3. **Investigate Ceph backfill algorithm** — why does it report full at 25% usage?
+4. **Consider storage class alternatives** — RBD vs CephFS for critical workloads
+5. **Evaluate cluster sizing** — medium profile may require larger cluster (more workers
+   or higher specs) to avoid control plane stress
+
+**Classification**: Environment — this is a Ceph/ODF behavior under stress, not a
+cost-onprem product issue. However, it affects production deployments using ODF.
+
+---
+
 ### PERF-FINDING-015: Processing Pipeline Scaling — Rightsizing Data for Test Profiles
 
 **Status**: Open — data collection phase  
@@ -496,6 +585,7 @@ until the root cause is understood and the minimum viable configuration is estab
 | PERF-FINDING-016 | Informational | None — documents measured rates | Throughput catalog; drives timeout calibration |
 | PERF-FINDING-017 | Test Framework | None — only affects test harness | Dynamic upload timeout; JWT refresh needed for long uploads |
 | PERF-FINDING-018 | Under-scaled | **Medium** — default replicas can't handle concurrent sources | Pipeline serialization bottleneck at 5+ sources |
+| PERF-FINDING-019 | Environment | None — Ceph behavior, not product | OSD false-full cascade under memory pressure |
 
 ### Rightsizing Guidelines
 
@@ -713,6 +803,7 @@ guides and/or applied via the Jira linked above.
 | Finding | Change | Status |
 |---------|--------|--------|
 | PERF-FINDING-010 | ODF default resources exhaust cluster memory | **Mitigated** — needs auto-toolbox enforcement |
+| PERF-FINDING-019 | Ceph OSD false-full cascade under load | **Documented** — recovery procedure added |
 
 ---
 
@@ -995,4 +1086,4 @@ removal, disaster recovery re-registration).
 
 ---
 
-_Last Updated: 2026-06-04 (run 0-2-20-rc5-medium-1780584560 analysis)_
+_Last Updated: 2026-06-09 (PERF-FINDING-019: Ceph OSD false-full cascade)_

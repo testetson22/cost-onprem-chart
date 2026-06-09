@@ -108,11 +108,25 @@ def _get_kafka_pod_and_namespace() -> Tuple[Optional[str], str]:
     kafka_namespace = os.environ.get("KAFKA_NAMESPACE", "kafka")
     helm_release = os.environ.get("HELM_RELEASE_NAME", "cost-onprem")
     
-    kafka_pod = get_pod_by_label(kafka_namespace, f"app.kubernetes.io/name={helm_release}-kafka")
+    # Strimzi broker pods have strimzi.io/broker-role=true (excludes controllers)
+    kafka_pod = get_pod_by_label(kafka_namespace, "strimzi.io/broker-role=true")
     if not kafka_pod:
-        kafka_pod = get_pod_by_label(kafka_namespace, "strimzi.io/kind=Kafka")
+        # Fallback: try standard k8s label
+        kafka_pod = get_pod_by_label(kafka_namespace, "app.kubernetes.io/name=kafka")
+    if not kafka_pod:
+        # Last resort: hardcoded name pattern {helm_release}-kafka-broker-0
+        kafka_pod = f"{helm_release}-kafka-broker-0"
     
     return kafka_pod, kafka_namespace
+
+
+def _is_kafka_healthy(kafka_pod: str, kafka_namespace: str) -> bool:
+    """Check if the Kafka broker pod is healthy and ready for exec."""
+    result = run_oc_command([
+        "get", "pod", kafka_pod, "-n", kafka_namespace,
+        "-o", "jsonpath={.status.containerStatuses[0].ready}"
+    ], check=False)
+    return result.returncode == 0 and result.stdout.strip() == "true"
 
 
 def get_ros_queue_depth(namespace: str) -> Optional[int]:
@@ -122,14 +136,26 @@ def get_ros_queue_depth(namespace: str) -> Optional[int]:
     if not kafka_pod:
         return None
     
-    result = run_oc_command([
+    if not _is_kafka_healthy(kafka_pod, kafka_namespace):
+        return None
+    
+    # Try without -c first (works for single-container pods)
+    # Then try with -c kafka (for multi-container pods like Strimzi)
+    base_cmd = [
         "exec", "-n", kafka_namespace,
-        kafka_pod, "--",
-        "bin/kafka-consumer-groups.sh",
+        kafka_pod
+    ]
+    kafka_cmd = [
+        "--", "bin/kafka-consumer-groups.sh",
         "--bootstrap-server", "localhost:9092",
         "--group", "ros-processor",
         "--describe"
-    ], check=False)
+    ]
+    
+    result = run_oc_command(base_cmd + kafka_cmd, check=False)
+    if result.returncode != 0 and "container" in result.stderr.lower():
+        # Multi-container pod, try with explicit container
+        result = run_oc_command(base_cmd + ["-c", "kafka"] + kafka_cmd, check=False)
     
     if result.returncode != 0:
         return None
@@ -161,6 +187,12 @@ def reset_ros_queue_offset(namespace: str) -> bool:
         print("[ros-queue-reset] Kafka pod not found, cannot reset")
         return False
     
+    print(f"[ros-queue-reset] Using Kafka pod: {kafka_pod} in namespace: {kafka_namespace}")
+    
+    if not _is_kafka_healthy(kafka_pod, kafka_namespace):
+        print(f"[ros-queue-reset] Kafka pod {kafka_pod} is not ready (container may be crash-looping)")
+        return False
+    
     # Step 1: Scale down ros-processor so consumer group becomes inactive
     print("[ros-queue-reset] Scaling down ros-processor...")
     result = run_oc_command([
@@ -177,15 +209,20 @@ def reset_ros_queue_offset(namespace: str) -> bool:
     
     # Step 3: Reset offset to latest
     print("[ros-queue-reset] Resetting offset to latest...")
-    result = run_oc_command([
-        "exec", "-n", kafka_namespace,
-        kafka_pod, "--",
-        "bin/kafka-consumer-groups.sh",
+    base_cmd = ["exec", "-n", kafka_namespace, kafka_pod]
+    kafka_cmd = [
+        "--", "bin/kafka-consumer-groups.sh",
         "--bootstrap-server", "localhost:9092",
         "--group", "ros-processor",
         "--topic", "hccm.ros.events",
         "--reset-offsets", "--to-latest", "--execute"
-    ], check=False)
+    ]
+    
+    # Try without -c first (single-container pods), then with -c kafka
+    result = run_oc_command(base_cmd + kafka_cmd, check=False)
+    if result.returncode != 0 and "container" in result.stderr.lower():
+        print("[ros-queue-reset] Multi-container pod detected, retrying with -c kafka...")
+        result = run_oc_command(base_cmd + ["-c", "kafka"] + kafka_cmd, check=False)
     
     if result.returncode != 0:
         print(f"[ros-queue-reset] Failed to reset offset: {result.stderr}")
