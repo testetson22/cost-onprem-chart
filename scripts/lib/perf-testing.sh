@@ -216,7 +216,19 @@ apply_perf_profile_config() {
         --field-selector=status.phase=Running -o jsonpath='{.items[0].spec.containers[0].resources.limits.cpu}' 2>/dev/null)
     if [[ -n "${actual_kruize_cpu_lim}" ]]; then
         log_info "  Kruize running pod CPU limit: ${actual_kruize_cpu_lim} (expected: ${kruize_cpu_lim})"
-        if [[ "${actual_kruize_cpu_lim}" != "${kruize_cpu_lim}" ]]; then
+        # Normalize both values to millicores for comparison (K8s returns "2" for "2000m")
+        local actual_m expected_m
+        if [[ "${actual_kruize_cpu_lim}" =~ ^[0-9]+$ ]]; then
+            actual_m=$(( actual_kruize_cpu_lim * 1000 ))
+        else
+            actual_m="${actual_kruize_cpu_lim%m}"
+        fi
+        if [[ "${kruize_cpu_lim}" =~ ^[0-9]+$ ]]; then
+            expected_m=$(( kruize_cpu_lim * 1000 ))
+        else
+            expected_m="${kruize_cpu_lim%m}"
+        fi
+        if [[ "${actual_m}" != "${expected_m}" ]]; then
             log_warning "  Kruize pod has stale CPU limit — cleaning up stuck ReplicaSet"
             # Delete any Pending Kruize pods (from failed scheduling)
             oc delete pods -n "${namespace}" -l app.kubernetes.io/component=ros-optimization \
