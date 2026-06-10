@@ -893,7 +893,9 @@ def extract_prometheus_series(snapshots: list[dict], test_windows: list[dict] | 
         mem = snap.get("process_memory_mb") or m.get("process_memory_mb")
         if mem is None:
             mem_bytes = m.get("pod_memory_usage_bytes")
-            if mem_bytes is not None:
+            if isinstance(mem_bytes, list):
+                mem_bytes = mem_bytes[0] if mem_bytes else None
+            if isinstance(mem_bytes, (int, float)):
                 mem = mem_bytes / (1024 * 1024)
         series["memory_mb"].append(round(mem, 1) if mem is not None else None)
 
@@ -901,7 +903,9 @@ def extract_prometheus_series(snapshots: list[dict], test_windows: list[dict] | 
         valkey = snap.get("valkey_memory_mb") or m.get("valkey_memory_mb")
         if valkey is None:
             valkey_bytes = m.get("valkey_memory_used_bytes")
-            if valkey_bytes is not None:
+            if isinstance(valkey_bytes, list):
+                valkey_bytes = valkey_bytes[0] if valkey_bytes else None
+            if isinstance(valkey_bytes, (int, float)):
                 valkey = valkey_bytes / (1024 * 1024)
         series["valkey_mb"].append(round(valkey, 1) if valkey is not None else None)
 

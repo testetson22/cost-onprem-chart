@@ -30,6 +30,23 @@ All tests can be run with different data profiles via `PERF_PROFILE` environment
 | `stress_p99` | P99 | 33 | 1,072 | 57,424 | P99 workload |
 | `stress_max` | Max | 67 | 4,311 | 793,424 | Maximum observed |
 
+### Cluster Infrastructure per Profile
+
+Worker node VM resources used for each profile. These are the `WORKER_CPU` and
+`WORKER_MEMORY` settings for the auto-toolbox deployment. Master CPU can be lowered
+to 8 vCPU (actual usage <2 cores) to free headroom for workers.
+
+| Profile | Workers | WORKER_CPU | WORKER_MEMORY | Replicas (proc/listener/ocp/summary) | Notes |
+|---------|---------|------------|---------------|--------------------------------------|-------|
+| `baseline` | 3 | 12 | 48000 | 1/1/1/1 | Listener CPU boosted to node max |
+| `small` | 3 | 12 | 48000 | 1/2/2/2 | Listener + workers scaled for drain |
+| `medium` | 3 | 12 | 64000 | 2/2/2/2 | Memory bump needed for ROS/listener |
+| `large` | 3 | 16 | 64000 | 3/3/3/3 | CPU bump needed for extra pods |
+
+Hypervisor constraint: 80 threads total. With 3 masters at 10 vCPU (30 total),
+max `WORKER_CPU` is 16 (48 + 30 = 78/80). Trimming masters to 8 vCPU allows
+`WORKER_CPU=18` (54 + 24 = 78/80).
+
 ---
 
 ## Ingestion Tests (PERF-ING-*)

@@ -43,12 +43,15 @@ _ACTIVE_PROFILE = os.environ.get("PERF_PROFILE", "baseline")
 
 
 def _get_profile_workload_count(profile_name: str) -> int:
-    """Calculate total workload (pod) count for a profile."""
+    """Calculate workload (pod) count for a single cluster in a profile.
+
+    ROS tests generate data for one cluster at a time, so this returns the
+    per-cluster count rather than the total across all clusters.
+    """
     profile = PROFILES.get(profile_name, PROFILES["baseline"])
     return (
         profile["namespaces_per_cluster"]
         * profile["pods_per_namespace"]
-        * profile["clusters"]
     )
 
 
@@ -752,7 +755,7 @@ class TestROSPerformance:
                 )
             
             # Kruize creates experiments at ~18/min (3.3s each).
-            # For 320 workloads at 90% threshold: 288 * 3.3s ≈ 960s.
+            # For medium (160 workloads) at 90%: 144 * 3.3s ≈ 480s.
             # Budget: num_workloads * 4s gives ~25% headroom.
             experiment_timeout = max(600, num_workloads * 4)
             with perf_timer.measure("kruize_experiment_creation"):
