@@ -851,20 +851,26 @@ def extract_prometheus_series(snapshots: list[dict], test_windows: list[dict] | 
         
         m = snap.get("metrics", {})
 
+        def _scalar(val):
+            """Prometheus can return lists; extract first numeric element."""
+            if isinstance(val, list):
+                val = val[0] if val else None
+            return val if isinstance(val, (int, float)) else None
+
         # CPU - check multiple possible field names (keep 4 decimal places for millicores)
-        cpu = (snap.get("listener_cpu_cores") or
-               m.get("listener_cpu_cores") or
-               m.get("pod_cpu_usage"))
+        cpu = _scalar(snap.get("listener_cpu_cores") or
+                      m.get("listener_cpu_cores") or
+                      m.get("pod_cpu_usage"))
         series["listener_cpu"].append(round(cpu, 4) if cpu is not None else None)
 
         # Celery CPU (keep 4 decimal places for millicores)
-        celery_cpu = (snap.get("celery_worker_cpu_cores") or 
-                      m.get("celery_worker_cpu_cores"))
+        celery_cpu = _scalar(snap.get("celery_worker_cpu_cores") or 
+                             m.get("celery_worker_cpu_cores"))
         series["celery_cpu"].append(round(celery_cpu, 4) if celery_cpu is not None else None)
 
         # Postgres CPU (keep 4 decimal places for millicores)
-        pg_cpu = (snap.get("postgres_cpu_cores") or 
-                  m.get("postgres_cpu_cores"))
+        pg_cpu = _scalar(snap.get("postgres_cpu_cores") or 
+                         m.get("postgres_cpu_cores"))
         series["postgres_cpu"].append(round(pg_cpu, 4) if pg_cpu is not None else None)
 
         # Celery task activity from celery-exporter
@@ -890,28 +896,24 @@ def extract_prometheus_series(snapshots: list[dict], test_windows: list[dict] | 
         series["db_connections"].append(db_conn)
 
         # Memory - convert bytes to MB if needed
-        mem = snap.get("process_memory_mb") or m.get("process_memory_mb")
+        mem = _scalar(snap.get("process_memory_mb") or m.get("process_memory_mb"))
         if mem is None:
-            mem_bytes = m.get("pod_memory_usage_bytes")
-            if isinstance(mem_bytes, list):
-                mem_bytes = mem_bytes[0] if mem_bytes else None
-            if isinstance(mem_bytes, (int, float)):
+            mem_bytes = _scalar(m.get("pod_memory_usage_bytes"))
+            if mem_bytes is not None:
                 mem = mem_bytes / (1024 * 1024)
         series["memory_mb"].append(round(mem, 1) if mem is not None else None)
 
         # Valkey memory - convert bytes to MB if needed
-        valkey = snap.get("valkey_memory_mb") or m.get("valkey_memory_mb")
+        valkey = _scalar(snap.get("valkey_memory_mb") or m.get("valkey_memory_mb"))
         if valkey is None:
-            valkey_bytes = m.get("valkey_memory_used_bytes")
-            if isinstance(valkey_bytes, list):
-                valkey_bytes = valkey_bytes[0] if valkey_bytes else None
-            if isinstance(valkey_bytes, (int, float)):
+            valkey_bytes = _scalar(m.get("valkey_memory_used_bytes"))
+            if valkey_bytes is not None:
                 valkey = valkey_bytes / (1024 * 1024)
         series["valkey_mb"].append(round(valkey, 1) if valkey is not None else None)
 
         # Postgres memory
-        pg = (snap.get("postgres_memory_mb") or 
-              m.get("postgres_memory_mb"))
+        pg = _scalar(snap.get("postgres_memory_mb") or 
+                     m.get("postgres_memory_mb"))
         series["postgres_mb"].append(round(pg, 1) if pg is not None else None)
 
     return series
