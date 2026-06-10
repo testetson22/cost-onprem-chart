@@ -67,15 +67,16 @@ apply_perf_profile_config() {
             listener_replicas=2
             ocp_worker_replicas=2
             summary_worker_replicas=2
-            # Kruize CPU bump prevents liveness probe failures under ROS load
-            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            # Keep Kruize CPU request at default so it always schedules;
+            # raise limit so it can burst under ROS load (PERF-FINDING-014).
+            kruize_cpu_lim="2000m"
             ;;
         medium)
             ros_processor_replicas=2
             listener_replicas=2
             ocp_worker_replicas=2
             summary_worker_replicas=2
-            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
             max_upload_size="209715200"   # 200MB
@@ -87,7 +88,7 @@ apply_perf_profile_config() {
             listener_replicas=3
             ocp_worker_replicas=3
             summary_worker_replicas=3
-            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
             max_upload_size="209715200"   # 200MB
@@ -206,6 +207,33 @@ apply_perf_profile_config() {
         log_success "All replica counts verified for ${PERF_PROFILE} profile"
     else
         log_warning "Some replica counts did not match — tests may not reflect expected scaling"
+    fi
+
+    # Verify Kruize pod actually has the expected CPU limit (catches scheduling
+    # failures where the old ReplicaSet's pod keeps running with default resources)
+    local actual_kruize_cpu_lim
+    actual_kruize_cpu_lim=$(oc get pods -n "${namespace}" -l app.kubernetes.io/component=ros-optimization \
+        --field-selector=status.phase=Running -o jsonpath='{.items[0].spec.containers[0].resources.limits.cpu}' 2>/dev/null)
+    if [[ -n "${actual_kruize_cpu_lim}" ]]; then
+        log_info "  Kruize running pod CPU limit: ${actual_kruize_cpu_lim} (expected: ${kruize_cpu_lim})"
+        if [[ "${actual_kruize_cpu_lim}" != "${kruize_cpu_lim}" ]]; then
+            log_warning "  Kruize pod has stale CPU limit — cleaning up stuck ReplicaSet"
+            # Delete any Pending Kruize pods (from failed scheduling)
+            oc delete pods -n "${namespace}" -l app.kubernetes.io/component=ros-optimization \
+                --field-selector=status.phase=Pending --grace-period=0 2>/dev/null || true
+            # Scale stale ReplicaSets to 0
+            for rs in $(oc get rs -n "${namespace}" -l app.kubernetes.io/component=ros-optimization \
+                -o jsonpath='{range .items[?(@.status.readyReplicas==0)]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+                oc scale rs "${rs}" -n "${namespace}" --replicas=0 2>/dev/null || true
+            done
+            # Restart the deployment to pick up new resources
+            oc rollout restart deployment "${release}-kruize" -n "${namespace}" 2>/dev/null || true
+            if oc rollout status deployment "${release}-kruize" -n "${namespace}" --timeout=3m 2>/dev/null; then
+                log_success "  Kruize restarted with correct CPU limit"
+            else
+                log_warning "  Kruize restart timed out — ROS tests may be slower than expected"
+            fi
+        fi
     fi
 }
 
