@@ -537,6 +537,7 @@ deploy_s4() {
     export S4_RELEASE_TAG="${S4_RELEASE_TAG:-}"
     export S4_REPO="${S4_REPO:-}"
     export STORAGE_SIZE="${STORAGE_SIZE:-}"
+    export STORAGE_CLASS="${STORAGE_CLASS:-}"
 
     if [[ "${VERBOSE}" == "true" ]]; then
         export VERBOSE="true"
