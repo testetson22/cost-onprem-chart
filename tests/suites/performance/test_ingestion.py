@@ -631,22 +631,28 @@ class TestIngestionThroughput:
                     else:
                         upload_results.append(result)
         
-        # Wait for all sources to process — each blocks until its manifest is done.
-        # Higher concurrency = more system load = longer processing times.
-        # Medium/large profiles put more pressure on the pipeline, so the cap
-        # is raised to avoid flaky timeouts on the last straggler source.
-        timeout_cap = 180 if _ACTIVE_PROFILE in ("medium", "large") else 120
-        base_timeout = max(60, 480 // max(concurrent_sources, 1))
-        concurrency_bonus = max(0, (concurrent_sources - 2) * 5)
-        per_source_max = min(timeout_cap, base_timeout + concurrency_bonus)
+        # Wait for all sources to process using a shared deadline.
+        # Sources process in parallel through Kafka, so the total wall-clock
+        # time is dominated by pipeline depth (concurrent_sources / replicas)
+        # not the sum of individual processing times. A per-source timeout
+        # causes false negatives when earlier sources in the loop are slow
+        # to appear (queued behind others), even though later ones are already done.
+        #
+        # Budget: 30s per source (accounts for queueing) + 120s base overhead.
+        total_budget = 120 + concurrent_sources * 30
+        if _ACTIVE_PROFILE in ("medium", "large"):
+            total_budget = int(total_budget * 1.5)
+        import time as _time
+        deadline = _time.time() + total_budget
         processed_count = 0
         with perf_timer.measure("processing_wait_all"):
             for source_info in sources:
+                remaining = max(15, int(deadline - _time.time()))
                 proc = wait_for_processing_complete(
                     self.namespace,
                     database_config.pod_name,
                     source_info["cluster_id"],
-                    max_wait_seconds=per_source_max,
+                    max_wait_seconds=remaining,
                 )
                 if proc["complete"]:
                     processed_count += 1
