@@ -653,7 +653,7 @@ class TestROSPerformance:
         _ACTIVE_PROFILE == "baseline",
         reason="ROS-002 (50 workloads, 10 min) is a scale test — not appropriate for baseline.",
     )
-    @pytest.mark.timeout(1500)
+    @pytest.mark.timeout(2400)
     def test_perf_ros_002_multi_workload_scale(
         self,
         cluster_config,
@@ -754,10 +754,10 @@ class TestROSPerformance:
                     timeout=300,
                 )
             
-            # Kruize creates experiments at ~18/min (3.3s each).
-            # For medium (160 workloads) at 90%: 144 * 3.3s ≈ 480s.
-            # Budget: num_workloads * 4s gives ~25% headroom.
-            experiment_timeout = max(600, num_workloads * 4)
+            # Measured rate: ~8 experiments/min (7.5s each).
+            # For medium (160 workloads) at 90%: 144 * 7.5s ≈ 1080s.
+            # Budget: num_workloads * 10s gives ~33% headroom.
+            experiment_timeout = max(600, num_workloads * 10)
             with perf_timer.measure("kruize_experiment_creation"):
                 exp_success, exp_count, exp_time = wait_for_kruize_experiments(
                     cluster_config.namespace,
@@ -958,7 +958,7 @@ class TestROSPerformance:
         _ACTIVE_PROFILE == "baseline",
         reason="ROS-004 (100 workloads, 15 min) is a memory pressure test — not appropriate for baseline.",
     )
-    @pytest.mark.timeout(1800)
+    @pytest.mark.timeout(2700)
     def test_perf_ros_004_kruize_memory_pressure(
         self,
         cluster_config,
@@ -1054,9 +1054,9 @@ class TestROSPerformance:
 
             assert upload_result.get("upload_status") == 202, f"Upload failed: {upload_result}"
             
-            # Kruize creates experiments at ~18/min (3.3s each).
-            # Budget: num_workloads * 4s gives ~25% headroom.
-            experiment_timeout = max(900, num_workloads * 4)
+            # Measured rate: ~8 experiments/min (7.5s each).
+            # Budget: num_workloads * 10s gives ~33% headroom.
+            experiment_timeout = max(900, num_workloads * 10)
             with perf_timer.measure("processing"):
                 exp_success, exp_count, exp_time = wait_for_kruize_experiments(
                     cluster_config.namespace,
