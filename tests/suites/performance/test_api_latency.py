@@ -541,13 +541,7 @@ class TestAPILatency:
             f"P95 latency for {len(group_by_dims)}-dim group_by exceeds {API_005_P95_THRESHOLD}s ({_ACTIVE_PROFILE} profile)"
         )
     
-    @pytest.mark.parametrize("tag_count", [
-        1,
-        5,
-        pytest.param(10, marks=pytest.mark.skip(
-            reason="NISE label generation issue - see docs/proposals/nise-tag-filtering-tests.md"
-        )),
-    ])
+    @pytest.mark.parametrize("tag_count", [1, 5, 10])
     def test_perf_api_006_tag_filtering(
         self,
         tag_count: int,
@@ -572,29 +566,39 @@ class TestAPILatency:
         session = self._get_authenticated_session()
         iterations = 10
         
-        # Get available tags from the fixture
         available_tags = labeled_nise_source["available_tags"]
         expected_labels = labeled_nise_source["expected_labels"]
+        db_tags = labeled_nise_source.get("db_tags", [])
         
         print(f"\n[API-006] Source: {labeled_nise_source['source_name']}")
-        print(f"[API-006] Available tags from API: {available_tags}")
-        print(f"[API-006] Expected labels from NISE: {expected_labels}")
+        print(f"[API-006] Tags in DB summary table: {db_tags}")
+        print(f"[API-006] Tags from API: {available_tags}")
+        print(f"[API-006] Expected NISE labels: {expected_labels}")
         
         if len(available_tags) < tag_count:
-            # Check if our expected labels are missing - that's an infrastructure issue
-            missing_expected = [l for l in expected_labels if l not in available_tags]
-            if missing_expected:
+            missing_from_api = [l for l in expected_labels if l not in available_tags]
+            missing_from_db = [l for l in expected_labels if l not in db_tags]
+            
+            if missing_from_db:
                 pytest.fail(
-                    f"Tag test infrastructure issue: NISE labels not in API. "
-                    f"Missing expected: {missing_expected}. "
-                    f"Available: {available_tags}. "
-                    f"This indicates NISE data labels may not be flowing to the database correctly."
+                    f"NISE labels never reached summary table. "
+                    f"Missing from DB: {missing_from_db}. "
+                    f"DB has: {db_tags}. "
+                    f"Root cause is in NISE CSV generation or Koku processing, "
+                    f"not tag enablement."
+                )
+            elif missing_from_api:
+                pytest.fail(
+                    f"Tags exist in DB but not in API. "
+                    f"In DB: {[l for l in expected_labels if l in db_tags]}. "
+                    f"Missing from API: {missing_from_api}. "
+                    f"Tag indexing or enablement issue — data is present but "
+                    f"not yet discoverable via /tags/ endpoint."
                 )
             else:
-                # Expected labels are present, just not enough total tags for this variant
                 pytest.skip(
                     f"Environment has only {len(available_tags)} tags, need {tag_count}. "
-                    f"Expected NISE labels ({expected_labels}) are present - infrastructure OK."
+                    f"Expected NISE labels ({expected_labels}) are present — infrastructure OK."
                 )
         
         selected_tags = available_tags[:tag_count]

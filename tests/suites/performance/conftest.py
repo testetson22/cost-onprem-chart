@@ -1196,8 +1196,9 @@ def labeled_nise_source(
         upload_with_retry,
         wait_for_provider,
         wait_for_processing_complete,
+        wait_for_summary_tables,
     )
-    from utils import create_upload_package_from_files
+    from utils import create_upload_package_from_files, execute_db_query
     from .profiles import get_profile_nise_yaml
     
     # Get required pods
@@ -1299,98 +1300,180 @@ def labeled_nise_source(
     
     # Wait for full processing including summarization (tags require summarized data)
     db_pod = get_pod_by_label(namespace, "app.kubernetes.io/component=database")
-    if db_pod:
-        # Step 1: Wait for provider to be created (manifest entry)
-        print("[labeled_nise_source] Waiting for provider to be created...")
-        wait_for_provider(
-            namespace,
-            db_pod,
-            cluster_id,
-            timeout=120,
+    if not db_pod:
+        pytest.skip("Database pod not found — cannot verify tag processing")
+
+    # Step 1: Wait for provider to be created (manifest entry)
+    print("[labeled_nise_source] Waiting for provider to be created...")
+    wait_for_provider(
+        namespace,
+        db_pod,
+        cluster_id,
+        timeout=120,
+    )
+
+    # Step 2: Wait for manifest processing (download + processing + summary phases)
+    print("[labeled_nise_source] Waiting for manifest processing...")
+    proc_result = wait_for_processing_complete(
+        namespace,
+        db_pod,
+        cluster_id,
+        poll_interval=10,
+        max_wait_seconds=300,
+    )
+    print(
+        f"[labeled_nise_source] Processing: complete={proc_result.get('complete')}, "
+        f"elapsed={proc_result.get('elapsed_s', '?')}s"
+    )
+
+    # Step 3: Confirm summary table rows exist — tags come from summarized data.
+    # wait_for_processing_complete checks completed_datetime on the manifest, but
+    # that can be set before the Celery summary task finishes writing rows.
+    print("[labeled_nise_source] Waiting for summary table rows...")
+    schema_name = wait_for_summary_tables(
+        namespace,
+        db_pod,
+        cluster_id,
+        timeout=300,
+        interval=10,
+    )
+    if not schema_name:
+        pytest.fail(
+            f"Summary table never populated for cluster {cluster_id}. "
+            "Summarization may not have run — check celery-worker-summary logs."
         )
-        
-        # Step 2: Wait for processing to complete (including summarization)
-        print("[labeled_nise_source] Waiting for data processing and summarization...")
-        result = wait_for_processing_complete(
-            namespace,
-            db_pod,
-            cluster_id,
-            poll_interval=10,
-            max_wait_seconds=300,
-        )
-        print(f"[labeled_nise_source] Processing result: complete={result.get('complete')}, elapsed={result.get('elapsed_s', '?')}s")
-    else:
-        # Fallback: just wait a fixed time
-        print("[labeled_nise_source] DB pod not found, waiting 90s for processing...")
-        time.sleep(90)
-    
-    # Tags are discovered during Celery summarization tasks, which run asynchronously
-    # after the manifest is marked complete. Poll for our NISE tags to appear.
-    from conftest import enable_tags_via_api
-    auth_header = {"Authorization": f"Bearer {jwt_token.access_token}"}
-    
-    # Core NISE tags we expect to see (must be present for test to pass)
-    # Using NATO-style arbitrary names to avoid reserved word issues
-    core_nise_tags = ["tagone", "tagtwo", "tagthree"]
-    
-    # All NISE tags we'll try to enable
+    print(f"[labeled_nise_source] Summary rows confirmed in schema: {schema_name}")
+
+    # Step 4: Query pod_labels directly from summary table to see which
+    # NISE labels actually made it into the DB. This is ground truth — if a
+    # label isn't here, no amount of API polling will find it.
+    db_tag_rows = execute_db_query(
+        namespace, db_pod, "costonprem_koku", "koku_user",
+        f"""
+        SELECT DISTINCT k
+        FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary,
+               LATERAL jsonb_object_keys(pod_labels) AS k
+        WHERE  cluster_id = '{cluster_id}'
+          AND  pod_labels IS NOT NULL
+          AND  pod_labels != '{{}}'::jsonb
+        ORDER  BY k
+        """,
+    )
+    db_tag_keys = [row[0] for row in db_tag_rows] if db_tag_rows else []
+    print(f"[labeled_nise_source] Tags in summary table pod_labels: {db_tag_keys}")
+
     nise_tag_keys = [
-        # Pod labels (10) - NATO-style arbitrary names
         "tagone", "tagtwo", "tagthree", "tagfour", "tagfive",
         "tagsix", "tagseven", "tageight", "tagnine", "tagten",
-        # Namespace labels (2)
-        "nslabel1", "nslabel2",
-        # Node labels (3)
-        "nodelabel1", "nodelabel2", "nodelabel3",
     ]
-    
-    # Poll until our core NISE tags are discoverable (max 120s)
+    db_hits = [k for k in nise_tag_keys if k in db_tag_keys]
+    db_misses = [k for k in nise_tag_keys if k not in db_tag_keys]
+    if db_misses:
+        print(
+            f"[labeled_nise_source] WARNING: {len(db_misses)} NISE labels missing from DB: "
+            f"{db_misses}"
+        )
+
+    # Also check namespace and node labels (stored in separate columns)
+    ns_label_rows = execute_db_query(
+        namespace, db_pod, "costonprem_koku", "koku_user",
+        f"""
+        SELECT DISTINCT k
+        FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary,
+               LATERAL jsonb_object_keys(namespace_labels) AS k
+        WHERE  cluster_id = '{cluster_id}'
+          AND  namespace_labels IS NOT NULL
+          AND  namespace_labels != '{{}}'::jsonb
+        ORDER  BY k
+        """,
+    )
+    ns_tag_keys = [row[0] for row in ns_label_rows] if ns_label_rows else []
+    print(f"[labeled_nise_source] Tags in namespace_labels: {ns_tag_keys}")
+
+    node_label_rows = execute_db_query(
+        namespace, db_pod, "costonprem_koku", "koku_user",
+        f"""
+        SELECT DISTINCT k
+        FROM   {schema_name}.reporting_ocpnode_label_summary,
+               LATERAL jsonb_object_keys(node_labels) AS k
+        WHERE  cluster_id = '{cluster_id}'
+          AND  node_labels IS NOT NULL
+          AND  node_labels != '{{}}'::jsonb
+        ORDER  BY k
+        """,
+    )
+    node_tag_keys = [row[0] for row in node_label_rows] if node_label_rows else []
+    if not node_tag_keys:
+        # Fallback: node labels may live in the same summary table
+        node_label_rows = execute_db_query(
+            namespace, db_pod, "costonprem_koku", "koku_user",
+            f"""
+            SELECT DISTINCT k
+            FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary,
+                   LATERAL jsonb_object_keys(node_labels) AS k
+            WHERE  cluster_id = '{cluster_id}'
+              AND  node_labels IS NOT NULL
+              AND  node_labels != '{{}}'::jsonb
+            ORDER  BY k
+            """,
+        )
+        node_tag_keys = [row[0] for row in node_label_rows] if node_label_rows else []
+    print(f"[labeled_nise_source] Tags in node_labels: {node_tag_keys}")
+
+    all_db_tags = sorted(set(db_tag_keys + ns_tag_keys + node_tag_keys))
+    print(f"[labeled_nise_source] Total unique tags in DB: {len(all_db_tags)} — {all_db_tags}")
+
+    # Step 5: Enable discovered tags via the API and poll for availability.
+    # Only bother polling for tags we confirmed exist in the DB.
+    from conftest import enable_tags_via_api
+    auth_header = {"Authorization": f"Bearer {jwt_token.access_token}"}
+
+    all_expected_keys = nise_tag_keys + ["nslabel1", "nslabel2", "nodelabel1", "nodelabel2", "nodelabel3"]
+    tags_to_enable = [k for k in all_expected_keys if k in all_db_tags]
+    if not tags_to_enable:
+        tags_to_enable = all_db_tags[:15]
+        print(
+            f"[labeled_nise_source] No expected NISE tags in DB — using discovered DB tags: "
+            f"{tags_to_enable}"
+        )
+
     max_tag_wait = 120
     poll_interval = 10
     tag_wait_start = time.time()
-    discovered_tags = []
-    
-    print(f"[labeled_nise_source] Waiting for NISE tags to be discovered (max {max_tag_wait}s)...")
-    
+    available_tags = []
+
+    print(f"[labeled_nise_source] Enabling {len(tags_to_enable)} tags via API (max {max_tag_wait}s)...")
+
     while time.time() - tag_wait_start < max_tag_wait:
-        # Try to enable tags - this will tell us which ones exist
-        enable_result = enable_tags_via_api(gateway_url, auth_header, nise_tag_keys)
-        discovered_tags = enable_result.get('enabled', []) + enable_result.get('already_enabled', [])
-        
-        # Check if our core tags are present
-        core_found = [t for t in core_nise_tags if t in discovered_tags]
+        enable_result = enable_tags_via_api(gateway_url, auth_header, tags_to_enable)
+        enabled = enable_result.get('enabled', [])
+        already = enable_result.get('already_enabled', [])
+        not_found = enable_result.get('not_found', [])
+
         elapsed = round(time.time() - tag_wait_start, 1)
-        
-        print(f"[labeled_nise_source] {elapsed}s — discovered {len(discovered_tags)} tags, core: {core_found}")
-        
-        if len(core_found) >= len(core_nise_tags):
-            print(f"[labeled_nise_source] Core tags discovered in {elapsed}s")
+        print(
+            f"[labeled_nise_source] {elapsed}s — enabled={len(enabled)}, "
+            f"already={len(already)}, not_found={len(not_found)}"
+        )
+
+        if not not_found:
+            print(f"[labeled_nise_source] All tags found in API in {elapsed}s")
             break
-        
+
         time.sleep(poll_interval)
     else:
-        # Timeout - continue anyway but log warning
-        print(f"[labeled_nise_source] Warning: tag discovery timed out after {max_tag_wait}s")
-    
-    # Final enable attempt for all tags
-    print(f"[labeled_nise_source] Final tag enablement ({len(nise_tag_keys)} keys)...")
-    enable_result = enable_tags_via_api(gateway_url, auth_header, nise_tag_keys)
-    print(f"[labeled_nise_source] Enabled: {enable_result.get('enabled', [])}")
-    if enable_result.get('already_enabled'):
-        print(f"[labeled_nise_source] Already enabled: {enable_result.get('already_enabled', [])}")
-    if enable_result.get('not_found'):
-        print(f"[labeled_nise_source] Not found: {enable_result.get('not_found', [])}")
-    
-    # Query available tags - gateway requires JWT auth, not RH-Identity
+        print(f"[labeled_nise_source] Warning: tag enablement timed out after {max_tag_wait}s")
+
+    # Final query for available tags from the API
     session = requests.Session()
     session.verify = False
     session.headers["Authorization"] = f"Bearer {jwt_token.access_token}"
-    
+
     tags_response = session.get(
         f"{gateway_url}/cost-management/v1/tags/openshift/",
         timeout=30,
     )
-    
+
     available_tags = []
     if tags_response.status_code == 200:
         tag_data = tags_response.json().get("data", [])
@@ -1399,26 +1482,18 @@ def labeled_nise_source(
                 available_tags.append(entry["key"])
             elif isinstance(entry, str):
                 available_tags.append(entry)
-    
-    print(f"[labeled_nise_source] Available tags: {available_tags}")
-    
+
+    print(f"[labeled_nise_source] Available tags from API: {available_tags}")
+
     yield {
         "source_id": source.source_id,
         "source_name": source_name,
         "cluster_id": cluster_id,
         "available_tags": available_tags,
-        # Expected NISE labels (from profiles.py with label_ prefix stripped)
-        # Using NATO-style arbitrary names to avoid reserved word issues
-        # Pod labels (10): tagone-tagten
-        # Namespace labels (2): nslabel1, nslabel2
-        # Node labels (3): nodelabel1-3
-        # Total: 15 unique tag keys
-        "expected_labels": [
-            "tagone", "tagtwo", "tagthree", "tagfour", "tagfive",
-            "tagsix", "tagseven", "tageight", "tagnine", "tagten",
-        ],
+        "db_tags": all_db_tags,
+        "expected_labels": nise_tag_keys,
     }
-    
+
     # Cleanup handled by perf_cleanup fixture
 
 
