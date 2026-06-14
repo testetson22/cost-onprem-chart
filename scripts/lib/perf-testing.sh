@@ -90,10 +90,10 @@ apply_perf_profile_config() {
             summary_worker_replicas=3
             kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
-            listener_mem_req="1Gi";     listener_mem_lim="2Gi"
-            max_upload_size="209715200"   # 200MB
-            haproxy_timeout="180s"
-            ingress_timeout="180s";       ingress_per_try_timeout="180s"
+            listener_mem_req="2Gi";     listener_mem_lim="4Gi"
+            max_upload_size="524288000"   # 500MB — large payloads (8 nodes × 20 ns × 20 pods)
+            haproxy_timeout="600s"
+            ingress_timeout="600s";       ingress_per_try_timeout="300s"
             ;;
         baseline|*)
             ;;

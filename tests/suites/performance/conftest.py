@@ -1312,32 +1312,97 @@ def labeled_nise_source(
         timeout=120,
     )
 
-    # Step 2: Wait for manifest processing (download + processing + summary phases)
+    # Step 2: Wait for manifest processing (download + processing + summary phases).
+    # Guard against stale manifests: if completed_datetime is set but num_processed
+    # files is 0, the manifest is from a prior run — wait for a fresh one.
     print("[labeled_nise_source] Waiting for manifest processing...")
-    proc_result = wait_for_processing_complete(
-        namespace,
-        db_pod,
-        cluster_id,
-        poll_interval=10,
-        max_wait_seconds=300,
-    )
+    import time as _proc_time
+    proc_deadline = _proc_time.time() + 300
+    proc_result = {"complete": False}
+
+    while _proc_time.time() < proc_deadline:
+        proc_result = wait_for_processing_complete(
+            namespace,
+            db_pod,
+            cluster_id,
+            poll_interval=10,
+            max_wait_seconds=max(15, int(proc_deadline - _proc_time.time())),
+        )
+        if proc_result.get("complete"):
+            processed = proc_result.get("num_processed_files", 0)
+            if processed > 0:
+                break
+            # Stale manifest — completed_datetime set but 0 files processed.
+            # Sleep and retry; the listener will create a new manifest.
+            print(
+                f"[labeled_nise_source] Stale manifest (0 files processed) — "
+                f"waiting for fresh manifest..."
+            )
+            _proc_time.sleep(15)
+        else:
+            break
+
     print(
         f"[labeled_nise_source] Processing: complete={proc_result.get('complete')}, "
+        f"files={proc_result.get('num_processed_files', 0)}, "
         f"elapsed={proc_result.get('elapsed_s', '?')}s"
     )
 
-    # Step 3: Confirm summary table rows exist — tags come from summarized data.
-    # wait_for_processing_complete checks completed_datetime on the manifest, but
-    # that can be set before the Celery summary task finishes writing rows.
-    print("[labeled_nise_source] Waiting for summary table rows...")
-    schema_name = wait_for_summary_tables(
-        namespace,
-        db_pod,
-        cluster_id,
-        timeout=300,
-        interval=10,
-    )
+    # Step 3: Confirm summary table rows exist for THIS cluster_id.
+    # The schema may have rows from other clusters; we need rows specifically
+    # for our newly uploaded data with pod_labels populated.
+    print("[labeled_nise_source] Waiting for summary table rows with pod_labels...")
+    schema_name = proc_result.get("schema_name")
+
     if not schema_name:
+        # Fall back to looking up the schema from the manifest
+        schema_name = wait_for_summary_tables(
+            namespace,
+            db_pod,
+            cluster_id,
+            timeout=300,
+            interval=10,
+        )
+
+    if schema_name:
+        # Verify that rows exist for our cluster with non-empty pod_labels
+        label_wait_start = _proc_time.time()
+        label_wait_max = 300
+        found_labels = False
+
+        while _proc_time.time() - label_wait_start < label_wait_max:
+            count_rows = execute_db_query(
+                namespace, db_pod, "costonprem_koku", "koku_user",
+                f"""
+                SELECT COUNT(*)
+                FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary
+                WHERE  cluster_id = '{cluster_id}'
+                  AND  pod_labels IS NOT NULL
+                  AND  pod_labels != '{{}}'::jsonb
+                """,
+            )
+            count = int(count_rows[0][0]) if count_rows and count_rows[0] else 0
+            elapsed = round(_proc_time.time() - label_wait_start, 1)
+            if count > 0:
+                print(
+                    f"[labeled_nise_source] Found {count} summary rows with pod_labels "
+                    f"in {elapsed}s"
+                )
+                found_labels = True
+                break
+            print(
+                f"[labeled_nise_source] {elapsed}s — no summary rows with pod_labels yet "
+                f"for {cluster_id[:8]}..."
+            )
+            _proc_time.sleep(15)
+
+        if not found_labels:
+            pytest.fail(
+                f"Summary table has no rows with pod_labels for cluster {cluster_id} "
+                f"after {label_wait_max}s. Data uploaded (HTTP 202) but labels not "
+                f"summarized. Check celery-worker-summary and listener logs."
+            )
+    else:
         pytest.fail(
             f"Summary table never populated for cluster {cluster_id}. "
             "Summarization may not have run — check celery-worker-summary logs."
