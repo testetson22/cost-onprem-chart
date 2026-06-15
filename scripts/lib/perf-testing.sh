@@ -57,6 +57,7 @@ apply_perf_profile_config() {
     local ros_mem_req="1Gi"       ros_mem_lim="1Gi"
     local listener_mem_req="300Mi" listener_mem_lim="600Mi"
     local max_upload_size="104857600"   # 100MB chart default
+    local max_upload_mem="33554432"    # 32MB chart default (in-memory buffer before spilling to disk)
     local haproxy_timeout="30s"
     local ingress_timeout="30s"   ingress_per_try_timeout="30s"
 
@@ -80,6 +81,7 @@ apply_perf_profile_config() {
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
             max_upload_size="209715200"   # 200MB
+            max_upload_mem="67108864"     # 64MB — reduce disk spill for medium payloads
             haproxy_timeout="180s"
             ingress_timeout="180s";       ingress_per_try_timeout="180s"
             ;;
@@ -91,7 +93,8 @@ apply_perf_profile_config() {
             kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="2Gi";     listener_mem_lim="4Gi"
-            max_upload_size="524288000"   # 500MB — large payloads (8 nodes × 20 ns × 20 pods)
+            max_upload_size="524288000"   # 500MB
+            max_upload_mem="134217728"    # 128MB — large payloads need bigger in-memory buffer
             haproxy_timeout="600s"
             ingress_timeout="600s";       ingress_per_try_timeout="300s"
             ;;
@@ -106,6 +109,7 @@ apply_perf_profile_config() {
     log_info "  ros-processor memory req/lim              = ${ros_mem_req}/${ros_mem_lim}"
     log_info "  listener memory req/lim                   = ${listener_mem_req}/${listener_mem_lim}"
     log_info "  ingress max upload size                   = ${max_upload_size}"
+    log_info "  ingress max upload memory                 = ${max_upload_mem}"
     log_info "  haproxy/envoy ingress timeout             = ${haproxy_timeout}"
 
     if [[ "${DRY_RUN}" == "true" ]]; then
@@ -134,6 +138,7 @@ apply_perf_profile_config() {
             --set "costManagement.listener.resources.requests.memory=${listener_mem_req}" \
             --set "costManagement.listener.resources.limits.memory=${listener_mem_lim}" \
             --set "ingress.upload.maxUploadSize=${max_upload_size}" \
+            --set "ingress.upload.maxMemory=${max_upload_mem}" \
             --set "jwtAuth.envoy.ingressTimeout=${ingress_timeout}" \
             --set "jwtAuth.envoy.ingressPerTryTimeout=${ingress_per_try_timeout}" \
             --set "gatewayRoute.annotations.haproxy\\.router\\.openshift\\.io/timeout=${haproxy_timeout}" \
@@ -141,6 +146,19 @@ apply_perf_profile_config() {
         log_warning "helm upgrade for profile config failed — continuing with oc scale only; resource limits may not match profile"
     else
         log_success "Resource/timeout overrides applied"
+    fi
+
+    # Envoy reads its config at startup only — restart the gateway pod so the
+    # ConfigMap changes (ingress timeout, per-try timeout) actually take effect.
+    local gw_deploy="${release}-gateway"
+    if oc rollout restart deployment "${gw_deploy}" -n "${namespace}" 2>/dev/null; then
+        if oc rollout status deployment "${gw_deploy}" -n "${namespace}" --timeout=2m 2>/dev/null; then
+            log_success "Gateway pod restarted (Envoy config reloaded)"
+        else
+            log_warning "Gateway rollout did not stabilize — Envoy may still use old timeouts"
+        fi
+    else
+        log_warning "Could not restart gateway deployment — Envoy may still use old timeouts"
     fi
 
     # Phase 2: oc scale — replica counts (faster than helm upgrade)

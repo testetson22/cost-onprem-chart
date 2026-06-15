@@ -145,8 +145,40 @@ Kruize creates experiments at ~8 per minute (7-8.5s each), limited by its Hibern
 |-----------|-------------|-------------|----------|
 | Kruize CPU | 500m/1000m | 1000m/2000m | FINDING-006: probe failures at 1 core |
 | ROS processor memory | 1Gi/1Gi | 2Gi/4Gi | OOMKill during experiment processing |
-| Listener memory | 300Mi/600Mi | 1Gi/2Gi | OOMKill during archive extraction |
-| Ingress max upload | 100MB | 200MB | Hard limit; needs explicit change for large files |
+| Listener memory | 300Mi/600Mi | 1Gi/2Gi (large: 2Gi/4Gi) | OOMKill during archive extraction |
+| Ingress max upload | 100MB | 200MB (large: 500MB) | Hard limit; needs explicit change for large files |
+| Ingress upload memory | 32MB | 64MB (large: 128MB) | FINDING-021: disk spill adds latency |
+| Gateway timeouts | 30s | 180s (large: 600s) | FINDING-001, -020: 504 on medium/large uploads |
+
+---
+
+### PERF-FINDING-020: Envoy Gateway ConfigMap Not Reloaded on Helm Upgrade
+
+**Status**: Mitigated in perf scripts; chart fix needed  
+**Severity**: Critical
+
+**Problem**:
+Envoy reads its config file at startup only — it does not watch for changes. When `helm upgrade` modifies the gateway ConfigMap (e.g. increasing `ingressTimeout` from 30s to 600s), the running gateway pod continues using the old values. This rendered all timeout overrides from `apply_perf_profile_config()` ineffective, causing HTTP 504 failures on medium/large profile uploads despite correct values in the ConfigMap.
+
+**Evidence**: Run `#37` — Envoy ConfigMap showed 600s timeouts, but uploads failed at ~30s (the old default). All ING-001[medium/large], ING-002, ING-003[10], ING-004 tests failed with instant 504/500 errors.
+
+**Mitigation**: `perf-testing.sh` now explicitly runs `oc rollout restart` on the gateway deployment after helm upgrade.
+
+**Recommended chart fix**: Add a `checksum/envoy-config` pod template annotation to the gateway deployment so any ConfigMap change triggers an automatic rolling restart during `helm upgrade`. This is the [standard Helm pattern](https://helm.sh/docs/howto/charts_tips_and_tricks/#automatically-roll-deployments) for static-config applications like Envoy.
+
+---
+
+### PERF-FINDING-021: Ingress In-Memory Buffer Too Small for Large Uploads
+
+**Status**: Fixed in perf profiles  
+**Severity**: Medium
+
+**Problem**:
+The `INGRESS_MAXUPLOADMEM` default is 32 MB. For uploads >32 MB, insights-ingress-go spills to disk, adding latency. Combined with tight per-try timeouts, this can push uploads past the retry window.
+
+**Fix**: `apply_perf_profile_config()` now sets `ingress.upload.maxMemory` per profile:
+- medium: 64 MB
+- large: 128 MB
 
 ---
 
@@ -211,6 +243,8 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 | FINDING-006 | Kruize CPU limits 500m/1000m → 1000m/2000m | [FLPATH-4302](https://redhat.atlassian.net/browse/FLPATH-4302) | Awaiting PR |
 | FINDING-011 | Envoy `request_timeout` removed | — | Fixed in chart |
 | FINDING-013 | ROS processor dead-letter handling | Needs ticket | Mitigated (test reordering) |
+| FINDING-020 | Gateway ConfigMap checksum annotation | Needs ticket | Mitigated (perf script restart) |
+| FINDING-021 | Ingress upload memory per profile | — | Fixed in perf profiles |
 
 ### Sizing Documentation
 
@@ -231,4 +265,4 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 
 ---
 
-_Last Updated: 2026-06-12_
+_Last Updated: 2026-06-15_

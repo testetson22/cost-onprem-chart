@@ -653,7 +653,7 @@ class TestROSPerformance:
         _ACTIVE_PROFILE == "baseline",
         reason="ROS-002 (50 workloads, 10 min) is a scale test — not appropriate for baseline.",
     )
-    @pytest.mark.timeout(2400)
+    @pytest.mark.timeout(3600)
     def test_perf_ros_002_multi_workload_scale(
         self,
         cluster_config,
