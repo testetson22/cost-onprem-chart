@@ -40,6 +40,11 @@ calculate_max_listener_cpu() {
         return
     fi
 
+    local replica_count
+    replica_count=$(kubectl get deploy "${listener_deploy}" -n "${NAMESPACE}" \
+        -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+    [[ "${replica_count}" -lt 1 ]] && replica_count=1
+
     local allocatable_cpu
     allocatable_cpu=$(kubectl get node "${listener_node}" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null)
     local allocatable_millicores
@@ -59,6 +64,13 @@ calculate_max_listener_cpu() {
 
     local available=$((allocatable_millicores - used_requests + listener_request_millicores - 500))
 
+    # With multiple replicas, each gets the same CPU — divide by replica count
+    # to avoid overcommitting the cluster.
+    if [[ "${replica_count}" -gt 1 ]]; then
+        available=$((available / replica_count))
+        log_verbose "Adjusting for ${replica_count} listener replicas: ${available}m per replica"
+    fi
+
     if [[ "${available}" -gt 4000 ]]; then
         available=4000
     fi
@@ -66,7 +78,7 @@ calculate_max_listener_cpu() {
         available=500
     fi
 
-    log_verbose "Node ${listener_node}: allocatable=${allocatable_millicores}m, used=${used_requests}m, listener=${listener_request_millicores}m, available=${available}m"
+    log_verbose "Node ${listener_node}: allocatable=${allocatable_millicores}m, used=${used_requests}m, listener=${listener_request_millicores}m, replicas=${replica_count}, available=${available}m"
     MAX_LISTENER_CPU="${available}"
 }
 
