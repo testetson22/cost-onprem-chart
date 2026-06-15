@@ -58,6 +58,7 @@ apply_perf_profile_config() {
     local listener_mem_req="300Mi" listener_mem_lim="600Mi"
     local max_upload_size="104857600"   # 100MB chart default
     local max_upload_mem="33554432"    # 32MB chart default (in-memory buffer before spilling to disk)
+    local app_mem_req="1Gi"  app_mem_lim="1Gi"   # resources.application (ingress pod + others)
     local haproxy_timeout="30s"
     local ingress_timeout="30s"   ingress_per_try_timeout="30s"
 
@@ -82,6 +83,7 @@ apply_perf_profile_config() {
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
             max_upload_size="209715200"   # 200MB
             max_upload_mem="67108864"     # 64MB — reduce disk spill for medium payloads
+            app_mem_req="1Gi";          app_mem_lim="2Gi"   # PERF-FINDING-022: ingress OOM on large uploads
             haproxy_timeout="180s"
             ingress_timeout="180s";       ingress_per_try_timeout="180s"
             ;;
@@ -95,6 +97,7 @@ apply_perf_profile_config() {
             listener_mem_req="2Gi";     listener_mem_lim="4Gi"
             max_upload_size="524288000"   # 500MB
             max_upload_mem="134217728"    # 128MB — large payloads need bigger in-memory buffer
+            app_mem_req="2Gi";          app_mem_lim="4Gi"   # PERF-FINDING-022: ingress OOM on large uploads
             haproxy_timeout="600s"
             ingress_timeout="600s";       ingress_per_try_timeout="300s"
             ;;
@@ -110,6 +113,7 @@ apply_perf_profile_config() {
     log_info "  listener memory req/lim                   = ${listener_mem_req}/${listener_mem_lim}"
     log_info "  ingress max upload size                   = ${max_upload_size}"
     log_info "  ingress max upload memory                 = ${max_upload_mem}"
+    log_info "  application memory req/lim (ingress pod)  = ${app_mem_req}/${app_mem_lim}"
     log_info "  haproxy/envoy ingress timeout             = ${haproxy_timeout}"
 
     if [[ "${DRY_RUN}" == "true" ]]; then
@@ -139,6 +143,8 @@ apply_perf_profile_config() {
             --set "costManagement.listener.resources.limits.memory=${listener_mem_lim}" \
             --set "ingress.upload.maxUploadSize=${max_upload_size}" \
             --set "ingress.upload.maxMemory=${max_upload_mem}" \
+            --set "resources.application.requests.memory=${app_mem_req}" \
+            --set "resources.application.limits.memory=${app_mem_lim}" \
             --set "jwtAuth.envoy.ingressTimeout=${ingress_timeout}" \
             --set "jwtAuth.envoy.ingressPerTryTimeout=${ingress_per_try_timeout}" \
             --set "gatewayRoute.annotations.haproxy\\.router\\.openshift\\.io/timeout=${haproxy_timeout}" \

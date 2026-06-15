@@ -149,6 +149,7 @@ Kruize creates experiments at ~8 per minute (7-8.5s each), limited by its Hibern
 | Ingress max upload | 100MB | 200MB (large: 500MB) | Hard limit; needs explicit change for large files |
 | Ingress upload memory | 32MB | 64MB (large: 128MB) | FINDING-021: disk spill adds latency |
 | Gateway timeouts | 30s | 180s (large: 600s) | FINDING-001, -020: 504 on medium/large uploads |
+| Ingress pod memory | 1Gi/1Gi | 1Gi/2Gi (large: 2Gi/4Gi) | FINDING-022: OOM on large/concurrent uploads |
 
 ---
 
@@ -179,6 +180,29 @@ The `INGRESS_MAXUPLOADMEM` default is 32 MB. For uploads >32 MB, insights-ingres
 **Fix**: `apply_perf_profile_config()` now sets `ingress.upload.maxMemory` per profile:
 - medium: 64 MB
 - large: 128 MB
+
+---
+
+### PERF-FINDING-022: Ingress Pod Memory Insufficient for Large/Concurrent Uploads
+
+**Status**: Mitigated in perf profiles; chart fix needed  
+**Severity**: High
+
+**Problem**:
+The ingress pod (`insights-ingress-go`) uses the shared `resources.application` block (1Gi memory limit). Processing large uploads requires multipart parsing, tar extraction, and S3 staging — all memory-intensive. Uploads >100 MB or 10+ concurrent uploads cause HTTP 500 errors from the ingress pod due to memory exhaustion.
+
+**Evidence** (Run `#38`, large profile):
+- ING-004[100] (101 MB) passed but ING-004[50] failed immediately after — residual memory pressure
+- ING-001[large] (~200+ MB package) — HTTP 500 on all attempts
+- ING-003[10] (10 concurrent uploads) — all 10 uploads returned HTTP 500
+
+Uploads up to 138 MB succeed individually (ING-002[90-days] = 138.74 MB at 2.44 MB/s).
+
+**Mitigation**: `apply_perf_profile_config()` now overrides `resources.application` per profile:
+- medium: 1Gi/2Gi
+- large: 2Gi/4Gi
+
+**Recommended chart fix**: Give ingress its own resource block in `values.yaml` (separate from the shared `resources.application`) so it can be sized independently for large file handling without affecting other services.
 
 ---
 
@@ -245,6 +269,7 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 | FINDING-013 | ROS processor dead-letter handling | Needs ticket | Mitigated (test reordering) |
 | FINDING-020 | Gateway ConfigMap checksum annotation | Needs ticket | Mitigated (perf script restart) |
 | FINDING-021 | Ingress upload memory per profile | — | Fixed in perf profiles |
+| FINDING-022 | Ingress pod dedicated resource block | Needs ticket | Mitigated (perf profile override) |
 
 ### Sizing Documentation
 
