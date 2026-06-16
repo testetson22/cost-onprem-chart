@@ -56,6 +56,9 @@ apply_perf_profile_config() {
     local kruize_cpu_req="500m"   kruize_cpu_lim="1000m"
     local ros_mem_req="1Gi"       ros_mem_lim="1Gi"
     local listener_mem_req="300Mi" listener_mem_lim="600Mi"
+    local ocp_worker_cpu_req="250m"  ocp_worker_cpu_lim="500m"
+    local ocp_worker_mem_req="512Mi" ocp_worker_mem_lim="1Gi"
+    local summary_worker_cpu_req="250m" summary_worker_cpu_lim="500m"
     local max_upload_size="104857600"   # 100MB chart default
     local max_upload_mem="33554432"    # 32MB chart default (in-memory buffer before spilling to disk)
     local app_mem_req="1Gi"  app_mem_lim="1Gi"   # resources.application (ingress pod + others)
@@ -81,6 +84,9 @@ apply_perf_profile_config() {
             kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="1Gi";     listener_mem_lim="2Gi"
+            ocp_worker_cpu_req="250m";  ocp_worker_cpu_lim="1000m"
+            ocp_worker_mem_req="512Mi"; ocp_worker_mem_lim="2Gi"
+            summary_worker_cpu_req="250m"; summary_worker_cpu_lim="1000m"
             max_upload_size="209715200"   # 200MB
             max_upload_mem="67108864"     # 64MB — reduce disk spill for medium payloads
             app_mem_req="1Gi";          app_mem_lim="2Gi"   # PERF-FINDING-022: ingress OOM on large uploads
@@ -95,6 +101,9 @@ apply_perf_profile_config() {
             kruize_cpu_lim="2000m"
             ros_mem_req="2Gi";          ros_mem_lim="4Gi"
             listener_mem_req="2Gi";     listener_mem_lim="4Gi"
+            ocp_worker_cpu_req="500m";  ocp_worker_cpu_lim="1000m"
+            ocp_worker_mem_req="1Gi";   ocp_worker_mem_lim="2Gi"
+            summary_worker_cpu_req="500m"; summary_worker_cpu_lim="1000m"
             max_upload_size="524288000"   # 500MB
             max_upload_mem="134217728"    # 128MB — large payloads need bigger in-memory buffer
             app_mem_req="2Gi";          app_mem_lim="4Gi"   # PERF-FINDING-022: ingress OOM on large uploads
@@ -111,6 +120,9 @@ apply_perf_profile_config() {
     log_info "  kruize cpu req/lim                        = ${kruize_cpu_req}/${kruize_cpu_lim}"
     log_info "  ros-processor memory req/lim              = ${ros_mem_req}/${ros_mem_lim}"
     log_info "  listener memory req/lim                   = ${listener_mem_req}/${listener_mem_lim}"
+    log_info "  ocp worker cpu req/lim                    = ${ocp_worker_cpu_req}/${ocp_worker_cpu_lim}"
+    log_info "  ocp worker memory req/lim                = ${ocp_worker_mem_req}/${ocp_worker_mem_lim}"
+    log_info "  summary worker cpu req/lim               = ${summary_worker_cpu_req}/${summary_worker_cpu_lim}"
     log_info "  ingress max upload size                   = ${max_upload_size}"
     log_info "  ingress max upload memory                 = ${max_upload_mem}"
     log_info "  application memory req/lim (ingress pod)  = ${app_mem_req}/${app_mem_lim}"
@@ -141,6 +153,12 @@ apply_perf_profile_config() {
             --set "resources.rosProcessor.limits.memory=${ros_mem_lim}" \
             --set "costManagement.listener.resources.requests.memory=${listener_mem_req}" \
             --set "costManagement.listener.resources.limits.memory=${listener_mem_lim}" \
+            --set "costManagement.celery.workers.ocp.resources.requests.cpu=${ocp_worker_cpu_req}" \
+            --set "costManagement.celery.workers.ocp.resources.limits.cpu=${ocp_worker_cpu_lim}" \
+            --set "costManagement.celery.workers.ocp.resources.requests.memory=${ocp_worker_mem_req}" \
+            --set "costManagement.celery.workers.ocp.resources.limits.memory=${ocp_worker_mem_lim}" \
+            --set "costManagement.celery.workers.summary.resources.requests.cpu=${summary_worker_cpu_req}" \
+            --set "costManagement.celery.workers.summary.resources.limits.cpu=${summary_worker_cpu_lim}" \
             --set "ingress.upload.maxUploadSize=${max_upload_size}" \
             --set "ingress.upload.maxMemory=${max_upload_mem}" \
             --set "resources.application.requests.memory=${app_mem_req}" \

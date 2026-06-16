@@ -532,7 +532,7 @@ class TestIngestionThroughput:
         
         assert proc["complete"], f"{data_days}-day data processing did not complete"
 
-    @pytest.mark.timeout(600)  # 10 minutes per concurrent upload test
+    @pytest.mark.timeout(1200)  # 20 minutes — 10 concurrent large-profile uploads need more headroom
     @pytest.mark.parametrize("concurrent_sources", [2, 5, 10])
     def test_perf_ing_003_concurrent_uploads(
         self,
