@@ -150,6 +150,9 @@ Kruize creates experiments at ~8 per minute (7-8.5s each), limited by its Hibern
 | Ingress upload memory | 32MB | 64MB (large: 128MB) | FINDING-021: disk spill adds latency |
 | Gateway timeouts | 30s | 180s (large: 600s) | FINDING-001, -020: 504 on medium/large uploads |
 | Ingress pod memory | 1Gi/1Gi | 1Gi/2Gi (large: 2Gi/4Gi) | FINDING-022: OOM on large/concurrent uploads |
+| OCP worker CPU | 250m/500m | 500m/1000m (large) | FINDING-025: 15% faster processing |
+| Summary worker CPU | 250m/500m | 500m/1000m (large) | FINDING-025: 15% faster processing |
+| OCP worker memory | 512Mi/1Gi | 1Gi/2Gi (large) | FINDING-025: headroom for large data sets |
 
 ---
 
@@ -203,6 +206,52 @@ Uploads up to 138 MB succeed individually (ING-002[90-days] = 138.74 MB at 2.44 
 - large: 2Gi/4Gi
 
 **Recommended chart fix**: Give ingress its own resource block in `values.yaml` (separate from the shared `resources.application`) so it can be sized independently for large file handling without affecting other services.
+
+---
+
+### PERF-FINDING-024: Ingress Single-Part S3 Upload Fails for Large Payloads
+
+**Status**: Product limitation; upstream enhancement needed  
+**Severity**: Medium
+
+**Problem**:
+`insights-ingress-go` uses the minio-go `PutObject()` API for S3 staging, which performs a single-part upload. Payloads exceeding ~150 MB consistently fail with HTTP 500 against NooBaa/Ceph RGW backends. The error originates in the S3 staging step, not in multipart form parsing or pod memory limits.
+
+**Evidence**:
+- ING-002[90-days] (138 MB) passes reliably across runs #40, #41
+- ING-001[large] (~200+ MB) fails with HTTP 500 on every attempt (runs #40, #41, #42)
+- ING-003[10] (10 concurrent small uploads) also fails — likely S3 connection pool exhaustion under concurrent staging
+
+**What was tried**:
+- Pod memory: `resources.application` increased to 2Gi/4Gi — no effect on the 500s (pod uses only ~49 Mi at idle, 0 restarts, 0 OOM events)
+- `INGRESS_MAXUPLOADMEM`: Increased from 128 MB to 512 MB in run #42 — **made things worse**. Go's `ParseMultipartForm(512MB)` pre-allocates heap per request, and the oversized allocation destabilized the pipeline (ING-002[30-days], previously reliable, failed with "manifest not yet visible" after 1500s). Reverted to 128 MB.
+- Node headroom: Worker nodes at 53-67% memory requests, no evictions — cluster resources are not the constraint
+
+**Recommended upstream enhancement**: `insights-ingress-go` should use multipart S3 uploads (e.g., minio-go `PutObject` with `PartSize` option or the AWS SDK S3 upload manager) for payloads exceeding a configurable threshold. This is the standard pattern for large object uploads to S3-compatible backends.
+
+**Workaround**: Customers with large clusters generating >150 MB upload packages should split data into multiple smaller uploads (e.g., by time range or namespace).
+
+---
+
+### PERF-FINDING-025: OCP/Summary Worker CPU Throttling Slows Data Processing
+
+**Status**: Mitigated in perf profiles  
+**Severity**: Medium
+
+**Problem**:
+The chart default CPU limits for OCP and summary celery workers (250m request / 500m limit) throttle data processing throughput. When the listener ingests data faster than workers can process it, the pipeline backs up.
+
+**Evidence** (Run #40 → #41, large profile):
+- Worker CPU boosted from 250m/500m to 500m/1000m (request/limit)
+- Worker memory boosted from 512Mi/1Gi to 1Gi/2Gi
+- Total run time: 112 min → 97.6 min (**15% faster**)
+- KPI violations: 1 → 0
+
+**Fix**: `apply_perf_profile_config()` now overrides worker resources per profile:
+- medium: 250m/1000m CPU, 512Mi/2Gi memory
+- large: 500m/1000m CPU, 1Gi/2Gi memory
+
+**Recommendation**: Production deployments processing large or frequent uploads should increase OCP and summary worker CPU limits to at least 1000m.
 
 ---
 
@@ -270,6 +319,8 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 | FINDING-020 | Gateway ConfigMap checksum annotation | Needs ticket | Mitigated (perf script restart) |
 | FINDING-021 | Ingress upload memory per profile | — | Fixed in perf profiles |
 | FINDING-022 | Ingress pod dedicated resource block | Needs ticket | Mitigated (perf profile override) |
+| FINDING-024 | Ingress multipart S3 upload for large payloads | Needs ticket | Product limitation |
+| FINDING-025 | Worker CPU/memory sizing for throughput | — | Fixed in perf profiles |
 
 ### Sizing Documentation
 

@@ -105,7 +105,7 @@ apply_perf_profile_config() {
             ocp_worker_mem_req="1Gi";   ocp_worker_mem_lim="2Gi"
             summary_worker_cpu_req="500m"; summary_worker_cpu_lim="1000m"
             max_upload_size="524288000"   # 500MB
-            max_upload_mem="536870912"    # 512MB — keep entire payload in memory to avoid disk spill during S3 staging
+            max_upload_mem="134217728"    # 128MB — matches prior validated runs; larger values destabilize the pipeline
             app_mem_req="2Gi";          app_mem_lim="4Gi"   # PERF-FINDING-022: ingress OOM on large uploads
             haproxy_timeout="600s"
             ingress_timeout="600s";       ingress_per_try_timeout="300s"
