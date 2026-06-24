@@ -1315,9 +1315,11 @@ def labeled_nise_source(
     # Step 2: Wait for manifest processing (download + processing + summary phases).
     # Guard against stale manifests: if completed_datetime is set but num_processed
     # files is 0, the manifest is from a prior run — wait for a fresh one.
+    # On larger profiles celery workers are under heavier load so allow more time.
     print("[labeled_nise_source] Waiting for manifest processing...")
     import time as _proc_time
-    proc_deadline = _proc_time.time() + 300
+    _profile = os.environ.get("PERF_PROFILE", "baseline")
+    proc_deadline = _proc_time.time() + get_timeout_for_profile(300, _profile)
     proc_result = {"complete": False}
 
     while _proc_time.time() < proc_deadline:
@@ -1365,9 +1367,9 @@ def labeled_nise_source(
         )
 
     if schema_name:
-        # Verify that rows exist for our cluster with non-empty pod_labels
         label_wait_start = _proc_time.time()
-        label_wait_max = 300
+        _profile = os.environ.get("PERF_PROFILE", "baseline")
+        label_wait_max = get_timeout_for_profile(300, _profile)
         found_labels = False
 
         while _proc_time.time() - label_wait_start < label_wait_max:
@@ -1390,17 +1392,47 @@ def labeled_nise_source(
                 )
                 found_labels = True
                 break
-            print(
-                f"[labeled_nise_source] {elapsed}s — no summary rows with pod_labels yet "
-                f"for {cluster_id[:8]}..."
-            )
+            # Every 60s, print diagnostic info about summary table state
+            if int(elapsed) % 60 < 16:
+                any_rows = execute_db_query(
+                    namespace, db_pod, "costonprem_koku", "koku_user",
+                    f"""
+                    SELECT COUNT(*), COUNT(NULLIF(pod_labels::text, '{{}}'))
+                    FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary
+                    WHERE  cluster_id = '{cluster_id}'
+                    """,
+                )
+                total = int(any_rows[0][0]) if any_rows and any_rows[0] else 0
+                with_labels = int(any_rows[0][1]) if any_rows and len(any_rows[0]) > 1 else 0
+                print(
+                    f"[labeled_nise_source] {elapsed}s — cluster {cluster_id[:8]}: "
+                    f"{total} total summary rows, {with_labels} with pod_labels"
+                )
+            else:
+                print(
+                    f"[labeled_nise_source] {elapsed}s — no summary rows with pod_labels yet "
+                    f"for {cluster_id[:8]}..."
+                )
             _proc_time.sleep(15)
 
         if not found_labels:
+            # Final diagnostic: check if ANY rows exist for this cluster
+            diag_rows = execute_db_query(
+                namespace, db_pod, "costonprem_koku", "koku_user",
+                f"""
+                SELECT COUNT(*) AS total,
+                       COUNT(NULLIF(pod_labels::text, '{{}}')) AS with_labels
+                FROM   {schema_name}.reporting_ocpusagelineitem_daily_summary
+                WHERE  cluster_id = '{cluster_id}'
+                """,
+            )
+            total = int(diag_rows[0][0]) if diag_rows and diag_rows[0] else 0
+            with_labels = int(diag_rows[0][1]) if diag_rows and len(diag_rows[0]) > 1 else 0
             pytest.fail(
                 f"Summary table has no rows with pod_labels for cluster {cluster_id} "
-                f"after {label_wait_max}s. Data uploaded (HTTP 202) but labels not "
-                f"summarized. Check celery-worker-summary and listener logs."
+                f"after {label_wait_max}s ({total} total rows, {with_labels} with labels). "
+                f"Data uploaded (HTTP 202) but labels not summarized. "
+                f"Check celery-worker-summary and listener logs."
             )
     else:
         pytest.fail(

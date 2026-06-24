@@ -30,6 +30,7 @@ from .conftest import (
     PerfTimer,
     PerformanceResult,
     TimingMetric,
+    get_timeout_for_profile,
 )
 
 
@@ -47,6 +48,13 @@ _API_005_P95_THRESHOLDS = {
     "large":    30.0,   # 30s for production-scale data
 }
 API_005_P95_THRESHOLD = _API_005_P95_THRESHOLDS.get(_ACTIVE_PROFILE, 10.0)
+
+# API-006 tag filtering: the labeled_nise_source fixture must create a source,
+# upload data, wait for Koku to process it AND summarize pod_labels, then poll
+# the tags API.  On larger profiles the celery workers are under heavier load,
+# so the summarization step takes much longer.
+_API_006_BASE_TIMEOUT = 300  # baseline: 5 min is sufficient
+API_006_TIMEOUT = get_timeout_for_profile(_API_006_BASE_TIMEOUT, _ACTIVE_PROFILE)
 
 
 # =============================================================================
@@ -541,6 +549,7 @@ class TestAPILatency:
             f"P95 latency for {len(group_by_dims)}-dim group_by exceeds {API_005_P95_THRESHOLD}s ({_ACTIVE_PROFILE} profile)"
         )
     
+    @pytest.mark.timeout(API_006_TIMEOUT)
     @pytest.mark.parametrize("tag_count", [1, 5, 10])
     def test_perf_api_006_tag_filtering(
         self,
