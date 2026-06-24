@@ -39,11 +39,11 @@ _PERF_TESTING_SOURCED=1
 #     Kruize is always kept at replicas=1 (scaling degrades throughput,
 #     see PERF-FINDING-014).
 #
-# Profile matrix (validated through medium-profile perf runs):
+# Profile matrix:
 #   baseline/small : replicas=1, chart resource defaults
-#   medium         : replicas=2 for processor/listener/ocp-worker/summary-worker;
-#                    raised resources, 200MB upload, 180s timeouts
-#   large          : replicas=3 (same resource overrides as medium)
+#   medium         : replicas=2; raised resources, 200MB upload, 180s timeouts
+#   large          : replicas=3; raised resources, 500MB upload, 600s timeouts
+#   xlarge         : replicas=3; higher worker CPU (1000m/2000m) for tag processing
 apply_perf_profile_config() {
     local release="${HELM_RELEASE_NAME:-cost-onprem}"
     local namespace="${NAMESPACE:-cost-onprem}"
@@ -107,6 +107,26 @@ apply_perf_profile_config() {
             max_upload_size="524288000"   # 500MB
             max_upload_mem="134217728"    # 128MB — matches prior validated runs; larger values destabilize the pipeline
             app_mem_req="2Gi";          app_mem_lim="4Gi"   # PERF-FINDING-022: ingress OOM on large uploads
+            haproxy_timeout="600s"
+            ingress_timeout="600s";       ingress_per_try_timeout="300s"
+            ;;
+        xlarge)
+            # 3.3x data volume vs large (23 clusters, 346 nodes, 6954 cores)
+            # Same replica/resource config as large — cluster headroom is the constraint.
+            # Worker CPU raised to 1000m/2000m to handle tag-based cost model processing.
+            ros_processor_replicas=3
+            listener_replicas=3
+            ocp_worker_replicas=3
+            summary_worker_replicas=3
+            kruize_cpu_req="1000m";     kruize_cpu_lim="2000m"
+            ros_mem_req="2Gi";          ros_mem_lim="4Gi"
+            listener_mem_req="2Gi";     listener_mem_lim="4Gi"
+            ocp_worker_cpu_req="1000m"; ocp_worker_cpu_lim="2000m"
+            ocp_worker_mem_req="2Gi";   ocp_worker_mem_lim="4Gi"
+            summary_worker_cpu_req="1000m"; summary_worker_cpu_lim="2000m"
+            max_upload_size="524288000"   # 500MB
+            max_upload_mem="134217728"    # 128MB
+            app_mem_req="2Gi";          app_mem_lim="4Gi"
             haproxy_timeout="600s"
             ingress_timeout="600s";       ingress_per_try_timeout="300s"
             ;;
