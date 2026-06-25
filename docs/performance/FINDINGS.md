@@ -124,22 +124,26 @@ The default single-replica listener/worker configuration cannot drain concurrent
 
 ---
 
-### PERF-FINDING-004: Kruize Experiment Creation Rate ~8/min
+### PERF-FINDING-004: Kruize Experiment Creation Rate — CPU Was the Bottleneck
 
-**Status**: Documented — throughput baseline  
+**Status**: Documented — throughput baseline updated  
 **Severity**: Low (informational)  
 **Related Jira**: [COST-7722](https://redhat.atlassian.net/browse/COST-7722) (ros-ocp-backend performance optimization)
 
-**Problem**:
-Kruize creates experiments at ~8 per minute (7-8.5s each), limited by its Hibernate connection pool (`c3p0maxsize=5`) and serial DB operations. Not CPU or memory bound. Scaling Kruize replicas degrades throughput (DB contention).
+**Problem** (original assessment):
+Kruize created experiments at ~8 per minute at the default 500m/1000m CPU allocation, which was attributed to Hibernate connection pool limits (`c3p0maxsize=5`).
 
-**Evidence** (medium profile, 160 workloads):
+**Updated assessment**:
+With the FLPATH-4302 CPU increase (1000m/2000m), Kruize throughput jumped to **31 exp/min** — a 4x improvement. This confirms the bottleneck was **CPU throttling**, not the connection pool. The original 1000m CPU limit caused liveness probe slowdowns that gated experiment creation throughput.
 
-| Run | Experiments | Rate/min | Peak Memory | Restarts |
-|-----|-------------|----------|-------------|----------|
-| 1781193941 | 160/160 | 8.6 | 723 MB | 0 |
+**Evidence**:
 
-**Recommendation**: Keep Kruize at 1 replica. Upstream connection pool or batch experiment creation improvement would increase throughput.
+| Run | Profile | CPU req/lim | Experiments | Rate/min | Peak Memory | Restarts |
+|-----|---------|-------------|-------------|----------|-------------|----------|
+| 1781193941 | medium | 500m/1000m | 160/160 | 8.6 | 723 MB | 0 |
+| 1782335628 | xlarge | 1000m/2000m | 600/600 | 31.0 | 415 MB | 0 |
+
+**Recommendation**: Keep Kruize at 1 replica. The CPU increase from FLPATH-4302 is the primary lever for throughput — connection pool tuning is secondary.
 
 ---
 
@@ -303,20 +307,25 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 
 ### Large File Processing Times
 
-| File Size | Upload Throughput | Processing Time | Total Time |
-|-----------|-------------------|-----------------|------------|
-| ~13 KB | - | <1s | <1s |
-| ~48 MB | 1-2 MB/s | 5-10 min | 6-11 min |
-| ~67 MB | 1.1-1.9 MB/s | 7-20 min | 8-22 min |
-| ~197 MB | 3.2 MB/s | >20 min | >21 min |
+| File Size | Profile | Upload Throughput | Processing Time | Total Time |
+|-----------|---------|-------------------|-----------------|------------|
+| ~13 KB | baseline | - | <1s | <1s |
+| ~48 MB | medium | 1-2 MB/s | 5-10 min | 6-11 min |
+| ~67 MB | large | 1.1-1.9 MB/s | 7-20 min | 8-22 min |
+| ~70 MB | xlarge | 14.5 MB/s | 31s | ~3 min |
+| ~102 MB | xlarge | 14.2 MB/s | 31s | ~3 min |
+| ~197 MB | large | 3.2 MB/s | >20 min | >21 min |
+
+The xlarge throughput improvement (14+ MB/s vs 1-3 MB/s) is from the worker CPU increase (1000m/2000m) — the pipeline drains faster with higher CPU allocation.
 
 ### Concurrent Upload Scaling (validated)
 
-| Concurrent Sources | Replicas (listener/ocp/summary) | Result |
-|--------------------|--------------------------------|--------|
-| 2 | 1/1/1 | PASS |
-| 5 | 2/2/2 | PASS |
-| 10 | 2/2/2 | PASS |
+| Concurrent Sources | Replicas (listener/ocp/summary) | Profile | Result |
+|--------------------|--------------------------------|---------|--------|
+| 2 | 1/1/1 | baseline | PASS |
+| 5 | 2/2/2 | medium | PASS |
+| 10 | 2/2/2 | medium | PASS |
+| 10 | 3/3/3 | xlarge | PASS |
 
 ---
 
@@ -385,4 +394,4 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 
 ---
 
-_Last Updated: 2026-06-23_
+_Last Updated: 2026-06-25_
