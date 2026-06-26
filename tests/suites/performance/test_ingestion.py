@@ -130,7 +130,7 @@ ING_004_SIZES = _ING_004_SIZES.get(_ACTIVE_PROFILE, _ING_004_SIZES["large"])
 
 # ING-006: processing-window validation (SC-4 SLA).
 # Runs for small/medium/large profiles; skipped for baseline.
-_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("small", "medium", "large") else None
+_ING_006_PROFILE = _ACTIVE_PROFILE if _ACTIVE_PROFILE in ("small", "medium", "large", "xlarge") else None
 ING_006_PROFILES = (
     [_ING_006_PROFILE]
     if _ING_006_PROFILE
