@@ -8,7 +8,7 @@ Automation scripts for deploying, configuring, and testing the Cost Management O
 |--------|---------|-------------|
 | `deploy-test-cost-onprem.sh` | **Full deployment + test orchestration** | OpenShift |
 | `run-pytest.sh` | Run pytest test suite | All environments |
-| `deploy-strimzi.sh` | Deploy Kafka infrastructure | All environments |
+| `deploy-kafka.sh` | Deploy Kafka infrastructure | All environments |
 | `install-helm-chart.sh` | Deploy CoP Helm chart | All environments |
 | `deploy-rhbk.sh` | Deploy Red Hat Build of Keycloak | OpenShift |
 | `setup-cost-mgmt-tls.sh` | Configure TLS certificates | OpenShift |
@@ -18,11 +18,11 @@ Automation scripts for deploying, configuring, and testing the Cost Management O
 
 ### Standard OpenShift Deployment
 ```bash
-# 1. Deploy Cost Management Operator with TLS support
+# 1. Deploy Cost Management Metrics Operator with TLS support
 ./setup-cost-mgmt-tls.sh
 
 # 2. Deploy Kafka infrastructure
-./deploy-strimzi.sh
+./deploy-kafka.sh
 
 # 3. Deploy Cost Management
 ./install-helm-chart.sh
@@ -38,7 +38,7 @@ NAMESPACE=cost-onprem ./run-pytest.sh
 ./deploy-rhbk.sh
 
 # 2. Deploy Kafka infrastructure
-./deploy-strimzi.sh
+./deploy-kafka.sh
 
 # 3. Deploy CoP with JWT authentication
 export JWT_AUTH_ENABLED=true
@@ -60,7 +60,7 @@ Deploy or upgrade the CoP Helm chart with automatic configuration.
 - Installs from GitHub releases or local chart
 - Auto-detects OpenShift and configures JWT authentication
 - Manages namespace and deployment lifecycle
-- **Automatically applies Cost Management Operator label** to namespace
+- **Automatically applies Cost Management Metrics Operator label** to namespace
 
 **Namespace Labeling:**
 The script automatically applies the `cost_management_optimizations=true` label to the deployment namespace. This label is **required** by the Cost Management Metrics Operator to collect resource optimization data from the namespace.
@@ -104,6 +104,7 @@ Deploy Red Hat Build of Keycloak (RHBK) with CoP integration.
 
 **What it creates:**
 - RHBK Operator in target namespace
+- PostgreSQL 16 for Keycloak (`registry.redhat.io/rhel10/postgresql-16:10.1`; requires pull access to `registry.redhat.io`)
 - Keycloak instance with `kubernetes` realm
 - `cost-management-operator` client
 - OpenShift OIDC integration
@@ -126,12 +127,12 @@ RHBK_NAMESPACE=my-keycloak ./deploy-rhbk.sh
 ---
 
 ### `setup-cost-mgmt-tls.sh`
-Configure Cost Management Operator with comprehensive CA certificate support.
+Configure Cost Management Metrics Operator with comprehensive CA certificate support.
 
 **Features:**
 - Extracts CA certificates from 15+ sources (routers, Keycloak, system CAs, custom CAs)
 - Creates consolidated CA bundle for self-signed certificate environments
-- Configures Cost Management Operator with proper TLS settings
+- Configures Cost Management Metrics Operator with proper TLS settings
 
 **Usage:**
 ```bash
@@ -149,42 +150,47 @@ Configure Cost Management Operator with comprehensive CA certificate support.
 
 ---
 
-### `deploy-strimzi.sh`
-Deploy Strimzi operator and Kafka cluster.
+### `deploy-kafka.sh`
+Deploy AMQ Streams (Streams for Apache Kafka) operator via OLM and a KRaft-based Kafka cluster.
 
 **What it creates:**
-- Strimzi Operator (Kafka cluster management)
-- Kafka 3.8.0 cluster with persistent storage
+- AMQ Streams Operator via OLM (channel: `amq-streams-3.1.x`)
+- Kafka 4.1.0 cluster in KRaft mode (no ZooKeeper) with separate controller and broker node pools
+- Persistent JBOD storage for both controllers and brokers
 - Required Kafka topics for Cost Management On-Premise
 
 **Usage:**
 ```bash
 # Basic deployment
-./deploy-strimzi.sh
+./deploy-kafka.sh
 
-# Deploy for OpenShift with custom storage
-KAFKA_ENVIRONMENT=ocp ./deploy-strimzi.sh
+# Deploy with custom storage class
+STORAGE_CLASS=gp2 ./deploy-kafka.sh
 
-# Use existing Strimzi operator
-STRIMZI_NAMESPACE=existing-strimzi ./deploy-strimzi.sh
+# Deploy into a specific namespace
+KAFKA_NAMESPACE=my-kafka ./deploy-kafka.sh
 
 # Use existing external Kafka
-KAFKA_BOOTSTRAP_SERVERS=my-kafka:9092 ./deploy-strimzi.sh
+KAFKA_BOOTSTRAP_SERVERS=my-kafka:9092 ./deploy-kafka.sh
 
 # Validate existing deployment
-./deploy-strimzi.sh validate
+./deploy-kafka.sh validate
 
 # Cleanup
-./deploy-strimzi.sh cleanup
+./deploy-kafka.sh cleanup
 ```
 
 **Environment variables:**
-- `KAFKA_NAMESPACE`: Target namespace (default: `kafka`)
+- `OPERATOR_NAMESPACE`: Namespace for AMQ Streams operator Subscription (default: `openshift-operators`)
+- `KAFKA_NAMESPACE`: Namespace for Kafka instances (default: `kafka`)
 - `KAFKA_CLUSTER_NAME`: Kafka cluster name (default: `cost-onprem-kafka`)
-- `KAFKA_VERSION`: Kafka version (default: `3.8.0`)
-- `STRIMZI_VERSION`: Strimzi operator version (default: `0.45.1`)
-- `KAFKA_ENVIRONMENT`: Environment type - `dev` or `ocp` (default: `dev`)
+- `KAFKA_VERSION`: Kafka version (default: `4.1.0`)
+- `AMQ_STREAMS_CHANNEL`: OLM subscription channel (default: `amq-streams-3.1.x`)
 - `STORAGE_CLASS`: Storage class name (auto-detected if empty)
+- `KAFKA_BROKER_REPLICAS`: Number of broker nodes (default: `3`)
+- `KAFKA_BROKER_STORAGE`: Broker persistent volume size (default: `100Gi`)
+- `KAFKA_CONTROLLER_REPLICAS`: Number of controller nodes (default: `3`)
+- `KAFKA_CONTROLLER_STORAGE`: Controller persistent volume size (default: `20Gi`)
 - `KAFKA_BOOTSTRAP_SERVERS`: Use external Kafka (skips deployment)
 
 ---
@@ -202,29 +208,62 @@ release/ci-operator/step-registry/insights-onprem/cost-onprem-chart/e2e/
 
 **What it does:**
 1. Deploys Red Hat Build of Keycloak (RHBK)
-2. Deploys Kafka/Strimzi infrastructure
+2. Deploys Kafka/AMQ Streams infrastructure
 3. Installs Cost On-Prem Helm chart
 4. Configures TLS certificates
 5. **Runs pytest via `scripts/run-pytest.sh`** (CI mode - excludes extended tests)
-6. Optionally saves deployment version info
+6. Optionally runs IQE integration tests
+7. Optionally saves deployment version info
 
-**Usage:**
+**Common workflows:**
 ```bash
-# Full deployment + tests
+# Full deployment + chart tests (default)
 ./deploy-test-cost-onprem.sh
 
-# Run tests only (skip deployments)
-./deploy-test-cost-onprem.sh --tests-only
+# Full deployment + chart tests + IQE tests
+./deploy-test-cost-onprem.sh --run-iqe --iqe-profile smoke
 
-# Skip specific steps
-./deploy-test-cost-onprem.sh --skip-rhbk --skip-strimzi
+# Run only IQE tests against an existing deployment
+./deploy-test-cost-onprem.sh --iqe-only --iqe-profile smoke
 
-# Save deployment version info for CI traceability
-./deploy-test-cost-onprem.sh --save-versions
-./deploy-test-cost-onprem.sh --save-versions custom-versions.json
+# Run only chart tests against an existing deployment
+./deploy-test-cost-onprem.sh --skip-deploy
 
-# Dry run to preview actions
+# Deploy without running any tests
+./deploy-test-cost-onprem.sh --skip-chart-tests
+
+# Skip specific deployment steps
+./deploy-test-cost-onprem.sh --skip-rhbk --skip-kafka
+
+# Dry run to preview what would execute
 ./deploy-test-cost-onprem.sh --dry-run --verbose
+```
+
+**Flag interaction matrix:**
+
+| Flags | Deploy | Chart Tests | IQE Tests |
+|-------|--------|-------------|-----------|
+| *(none)* | yes | yes | no |
+| `--run-iqe` | yes | yes | yes |
+| `--skip-chart-tests` | yes | no | no |
+| `--skip-chart-tests --run-iqe` | yes | no | yes |
+| `--skip-deploy` | no | yes | no |
+| `--skip-deploy --run-iqe` | no | yes | yes |
+| `--iqe-only` | no | no | yes |
+
+**Flag aliases** for backward compatibility:
+
+| Preferred | Alias | Description |
+|-----------|-------|-------------|
+| `--skip-deploy` | `--tests-only` | Skip all deployment steps |
+| `--skip-chart-tests` | `--skip-test` | Skip chart pytest suite |
+| `--iqe-only` | `--tests-only --skip-test --run-iqe` | Run only IQE tests |
+
+**Validation:** Flag parsing is tested automatically on PRs by
+`.github/workflows/validate-deploy-test-script.yml`, which runs `--dry-run` for all
+10 flag permutations and asserts the expected output. Run locally with:
+```bash
+./scripts/qe/test-gh-workflow-locally.sh .github/workflows/validate-deploy-test-script.yml
 ```
 
 **Version tracking:** The `--save-versions` flag generates a `version_info.json` file containing:
@@ -381,8 +420,8 @@ The pytest test suite validates:
 # Run pytest authentication tests
 NAMESPACE=cost-onprem ./run-pytest.sh --auth
 
-# Or run tests only on existing deployment
-./deploy-test-cost-onprem.sh --tests-only
+# Or run chart tests only on existing deployment (no redeploy)
+./deploy-test-cost-onprem.sh --skip-deploy
 
 # Or run full pytest suite
 NAMESPACE=cost-onprem ./run-pytest.sh
@@ -432,7 +471,7 @@ NAMESPACE=cost-onprem ./run-pytest.sh --auth -v
 oc logs -n cost-onprem -l app.kubernetes.io/component=gateway
 ```
 
-**Cost Management Operator Issues**
+**Cost Management Metrics Operator Issues**
 ```bash
 # Check operator logs
 oc logs -n costmanagement-metrics-operator deployment/costmanagement-metrics-operator
@@ -472,7 +511,7 @@ All scripts use color-coded output:
 
 ---
 
-**Last Updated**: January 2026
+**Last Updated**: April 2026
 **Maintainer**: CoP Engineering Team
 **Supported Platform**: OpenShift 4.18+
 **Tested With**: OpenShift 4.18.24

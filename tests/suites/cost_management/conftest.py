@@ -28,6 +28,8 @@ from e2e_helpers import (
     generate_cluster_id,
     generate_nise_data,
     get_koku_api_url,
+    get_nise_template_path,
+    list_nise_templates,
     register_source,
     upload_with_retry,
     wait_for_provider,
@@ -53,10 +55,15 @@ def cleanup_old_cost_val_clusters(
     
     This ensures cost_validation tests start with a clean slate and don't
     pick up data from previous runs.
+    
+    Note: Cluster IDs are generated as "e2e-pytest-cost-val-{unique}" by
+    generate_cluster_id("cost-val"), so we need to match that pattern.
+    Source names are "cost-validation-{last8chars}".
     """
     import json
     
     # Find and delete old cost-val sources
+    # Match both old pattern (cost-val-*) and new pattern (e2e-pytest-cost-val-*)
     try:
         result = exec_in_pod(
             namespace,
@@ -73,9 +80,12 @@ def cleanup_old_cost_val_clusters(
             sources = json.loads(result)
             for source in sources.get("data", []):
                 source_ref = source.get("source_ref", "")
-                if source_ref and source_ref.startswith("cost-val-"):
+                source_name = source.get("name", "")
+                # Match cluster IDs: e2e-pytest-cost-val-* or legacy cost-val-*
+                # Also match source names: cost-validation-*
+                if source_ref and ("cost-val" in source_ref or source_name.startswith("cost-validation")):
                     source_id = source.get("id")
-                    print(f"       Deleting old source: {source.get('name')} (ref: {source_ref})")
+                    print(f"       Deleting old source: {source_name} (ref: {source_ref})")
                     exec_in_pod(
                         namespace,
                         ingress_pod,
@@ -90,6 +100,7 @@ def cleanup_old_cost_val_clusters(
         print(f"       Warning: Could not clean old sources: {e}")
     
     # Clean up database records for cost-val clusters
+    # Match both patterns: e2e-pytest-cost-val-* (current) and cost-val-* (legacy)
     try:
         # Delete manifest statuses
         execute_db_query(
@@ -98,7 +109,7 @@ def cleanup_old_cost_val_clusters(
             DELETE FROM reporting_common_costusagereportstatus 
             WHERE manifest_id IN (
                 SELECT id FROM reporting_common_costusagereportmanifest 
-                WHERE cluster_id LIKE 'cost-val-%'
+                WHERE cluster_id LIKE '%cost-val-%'
             )
             """
         )
@@ -106,7 +117,7 @@ def cleanup_old_cost_val_clusters(
         # Delete manifests
         execute_db_query(
             namespace, db_pod, "costonprem_koku", "koku_user",
-            "DELETE FROM reporting_common_costusagereportmanifest WHERE cluster_id LIKE 'cost-val-%'"
+            "DELETE FROM reporting_common_costusagereportmanifest WHERE cluster_id LIKE '%cost-val-%'"
         )
         
         # Get all schemas and clean summary tables + tenant provider mappings
@@ -122,7 +133,7 @@ def cleanup_old_cost_val_clusters(
                     try:
                         execute_db_query(
                             namespace, db_pod, "costonprem_koku", "koku_user",
-                            f"DELETE FROM {schema}.reporting_ocpusagelineitem_daily_summary WHERE cluster_id LIKE 'cost-val-%'"
+                            f"DELETE FROM {schema}.reporting_ocpusagelineitem_daily_summary WHERE cluster_id LIKE '%cost-val-%'"
                         )
                     except Exception:
                         pass  # Table might not exist in all schemas
@@ -184,10 +195,17 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
     Environment Variables:
     - E2E_CLEANUP_BEFORE: Run cleanup before tests (default: true)
     - E2E_CLEANUP_AFTER: Run cleanup after tests (default: true)
+    - NISE_IQE_TEMPLATE: Use a NISE template instead of default config.
+                         Example: "ocp_report_ros_0.yml" for ROS optimization testing
+                         Available templates in tests/data/nise_templates/:
+                         - ocp_report_ros_0.yml: ROS optimization testing
+                         - ocp_report_advanced.yml: Complex multi-node setup
+                         See: tests/data/nise_templates/README.md
     """
     # Check cleanup settings
     cleanup_before = os.environ.get("E2E_CLEANUP_BEFORE", "true").lower() == "true"
     cleanup_after = os.environ.get("E2E_CLEANUP_AFTER", "true").lower() == "true"
+    iqe_template = os.environ.get("NISE_IQE_TEMPLATE", "")
     
     # Check NISE availability
     if not ensure_nise_available():
@@ -222,6 +240,8 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
         print(f"  Cluster ID: {cluster_id}")
         print(f"  Cleanup before: {cleanup_before}")
         print(f"  Cleanup after: {cleanup_after}")
+        if iqe_template:
+            print(f"  IQE Template: {iqe_template}")
         
         # Pre-test cleanup: Remove any leftover cost-val clusters from previous runs
         if cleanup_before:
@@ -243,7 +263,11 @@ def cost_validation_data(cluster_config, s3_config, keycloak_config, ingress_url
         start_date = (now - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
         end_date = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        files = generate_nise_data(cluster_id, start_date, end_date, temp_dir, config=nise_config)
+        files = generate_nise_data(
+            cluster_id, start_date, end_date, temp_dir,
+            config=nise_config,
+            iqe_template=iqe_template if iqe_template else None,
+        )
         print(f"       Generated {len(files['all_files'])} CSV files")
         
         if not files["all_files"]:

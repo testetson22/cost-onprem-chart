@@ -7,7 +7,7 @@ metadata:
     {{- include "cost-onprem.labels" . | nindent 4 }}
     app.kubernetes.io/component: ros-processor
 spec:
-  replicas: 1
+  replicas: {{ .Values.ros.processor.replicas }}
   selector:
     matchLabels:
       {{- include "cost-onprem.selectorLabels" . | nindent 6 }}
@@ -58,6 +58,7 @@ spec:
             - name: ca-bundle
               mountPath: /etc/ssl/certs/ca-bundle
               readOnly: true
+            {{- include "cost-onprem.kafka.tlsVolumeMount" . | nindent 12 }}
           env:
             - name: CLOWDER_ENABLED
               value: "false"
@@ -81,8 +82,8 @@ spec:
               value: {{ include "cost-onprem.database.url" . }}
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: {{ include "cost-onprem.kafka.bootstrapServers" . | quote }}
-            - name: KAFKA_SECURITY_PROTOCOL
-              value: {{ include "cost-onprem.kafka.securityProtocol" . | quote }}
+            {{- include "cost-onprem.kafka.saslEnv" . | nindent 12 }}
+            {{- include "cost-onprem.kafka.tlsEnv" . | nindent 12 }}
             - name: KAFKA_CONSUMER_GROUP_ID
               value: {{ .Values.ros.processor.kafkaConsumerGroupId | quote }}
             - name: KAFKA_AUTO_COMMIT
@@ -123,11 +124,12 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 5
           resources:
-            {{- toYaml .Values.resources.application | nindent 12 }}
+            {{- toYaml .Values.resources.rosProcessor | nindent 12 }}
       volumes:
         - name: cdapp-config
           configMap:
             name: {{ include "cost-onprem.fullname" . }}-cdapp-config
+        {{- include "cost-onprem.kafka.tlsVolume" . | nindent 8 }}
         # Volumes for CA bundle preparation
         - name: ca-scripts
           configMap:

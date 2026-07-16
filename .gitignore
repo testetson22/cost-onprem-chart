@@ -5,9 +5,10 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 env/
 ENV/
-.venv/
+.venv-*/
 cost-mgmt-venv/
 *-venv/
 
@@ -26,6 +27,9 @@ test-logs/
 # CI artifacts (downloaded from Prow/GCS)
 ci-artifacts-*/
 
+# CI failure analysis (ephemeral, date-specific)
+**/ci-failure-analysis-*.md
+
 # Temporary files
 *.tmp
 *.temp
@@ -36,3 +40,15 @@ ci-artifacts-*/
 version_info.json
 .digest-cache/*.digest
 reports/junit.xml
+**/*.json.gz
+debug-exports/**/*
+
+# Test reports and Playwright artifacts
+tests/reports/report.html
+tests/reports/screenshots/
+tests/reports/videos/
+tests/reports/traces/
+
+# Performance test run output (metrics, results, reports, generated HTML)
+tests/perf-runs/
+perf-runs/

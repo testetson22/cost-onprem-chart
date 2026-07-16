@@ -294,7 +294,26 @@ Both `test_complete_flow.py` and `cost_management/conftest.py` import from `e2e_
 
 ## Data Generation
 
-The E2E test suite supports two data generation methods:
+The test suite supports flexible data generation for different testing scenarios.
+
+### Quick Start: Scenario-Based Setup
+
+```bash
+# List available scenarios
+./scripts/setup-test-data.sh --list
+
+# Set up data for scenario
+./scripts/setup-test-data.sh --scenario baseline
+
+# Run tests against the data
+./scripts/run-pytest.sh --e2e
+```
+
+See **[Test Data Setup Guide](../docs/development/test-data-setup.md)** for complete documentation on:
+- Available scenarios (minimal, baseline, perf-small, perf-medium, ros)
+- On-demand data loading for manual testing
+- Pre-test environment preparation
+- Troubleshooting data issues
 
 ### NISE Data Generation (Default)
 Uses [koku-nise](https://github.com/project-koku/nise) to generate realistic OCP cost data:
@@ -347,11 +366,11 @@ release/ci-operator/step-registry/insights-onprem/cost-onprem-chart/e2e/
 **CI Execution Sequence:**
 1. Dependencies installed (yq, kubectl, helm, oc)
 2. S4 configured from `insights-onprem-s4-deploy` step
-3. Cost Management Operator installed via OLM
+3. Cost Management Metrics Operator installed via OLM
 4. Helm wrapper injects S4 storage config
 5. `scripts/deploy-test-cost-onprem.sh` runs:
    - Deploys RHBK (Keycloak)
-   - Deploys Strimzi/Kafka
+   - Deploys AMQ Streams/Kafka
    - Installs cost-onprem Helm chart
    - Configures TLS
    - **Runs `scripts/run-pytest.sh`** (CI mode)

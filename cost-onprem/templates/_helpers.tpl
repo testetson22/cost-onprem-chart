@@ -173,10 +173,10 @@ valkey
 
 {{/*
 Resolve object storage config from .Values.objectStorage.
-Returns a dict with keys: endpoint, port, useSSL, secretName, s3Region
+Returns a dict with keys: endpoint, port, useSSL, secretName, s3Region, s3AddressingStyle
 */}}
 {{- define "cost-onprem.storage.config" -}}
-  {{- $os := dict "endpoint" "" "port" 443 "useSSL" true "secretName" "" "s3Region" "onprem" -}}
+  {{- $os := dict "endpoint" "" "port" 443 "useSSL" true "secretName" "" "s3Region" "onprem" "s3AddressingStyle" "path" -}}
   {{- if .Values.objectStorage -}}
     {{- if and .Values.objectStorage.endpoint (ne .Values.objectStorage.endpoint "") -}}
       {{- $_ := set $os "endpoint" .Values.objectStorage.endpoint -}}
@@ -192,6 +192,9 @@ Returns a dict with keys: endpoint, port, useSSL, secretName, s3Region
     {{- end -}}
     {{- if and .Values.objectStorage.s3 .Values.objectStorage.s3.region -}}
       {{- $_ := set $os "s3Region" .Values.objectStorage.s3.region -}}
+    {{- end -}}
+    {{- if and .Values.objectStorage.s3 .Values.objectStorage.s3.addressingStyle -}}
+      {{- $_ := set $os "s3AddressingStyle" .Values.objectStorage.s3.addressingStyle -}}
     {{- end -}}
   {{- end -}}
   {{- $os | toJson -}}
@@ -280,6 +283,14 @@ S3 region for signature generation
 {{- end }}
 
 {{/*
+S3 addressing style for bucket URL resolution (path, auto, or virtual)
+*/}}
+{{- define "cost-onprem.storage.s3AddressingStyle" -}}
+{{- $cfg := include "cost-onprem.storage.config" . | fromJson -}}
+{{- $cfg.s3AddressingStyle -}}
+{{- end }}
+
+{{/*
 Storage credentials secret name.
 Uses secretName if set, otherwise generates '<release>-storage-credentials'.
 */}}
@@ -348,7 +359,7 @@ operator: RHBK
 {{- end }}
 
 {{/*
-Kafka service host resolver (supports both internal Strimzi and external Kafka)
+Kafka service host resolver (supports both internal and external Kafka)
 */}}
 {{- define "cost-onprem.kafka.host" -}}
 {{- if .Values.kafka.bootstrapServers -}}
@@ -373,7 +384,7 @@ Kafka service host resolver (supports both internal Strimzi and external Kafka)
 {{- end }}
 
 {{/*
-Kafka port resolver (supports both internal Strimzi and external Kafka)
+Kafka port resolver (supports both internal and external Kafka)
 */}}
 {{- define "cost-onprem.kafka.port" -}}
 {{- if .Values.kafka.bootstrapServers -}}
@@ -398,7 +409,7 @@ Kafka port resolver (supports both internal Strimzi and external Kafka)
 {{- end }}
 
 {{/*
-Kafka bootstrap servers resolver (supports both internal Strimzi and external Kafka)
+Kafka bootstrap servers resolver (supports both internal and external Kafka)
 */}}
 {{- define "cost-onprem.kafka.bootstrapServers" -}}
 {{- if .Values.kafka.bootstrapServers -}}
@@ -409,10 +420,116 @@ Kafka bootstrap servers resolver (supports both internal Strimzi and external Ka
 {{- end }}
 
 {{/*
-Kafka security protocol resolver (supports both internal Strimzi and external Kafka)
+Kafka security protocol resolver (supports both internal and external Kafka)
 */}}
 {{- define "cost-onprem.kafka.securityProtocol" -}}
 {{- .Values.kafka.securityProtocol | default "PLAINTEXT" -}}
+{{- end }}
+
+{{/*
+Kafka SASL authentication environment variables (mechanism + credentials only)
+No-op when kafka.sasl.mechanism is empty. Pair with tlsEnv for transport security.
+Usage: {{ include "cost-onprem.kafka.saslEnv" . | nindent 12 }}
+*/}}
+{{- define "cost-onprem.kafka.saslEnv" -}}
+{{- if .Values.kafka.sasl.mechanism }}
+- name: KAFKA_SASL_MECHANISM
+  value: {{ .Values.kafka.sasl.mechanism | quote }}
+{{- if .Values.kafka.sasl.existingSecret }}
+- name: KAFKA_SASL_USERNAME
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.kafka.sasl.existingSecret | quote }}
+      key: username
+- name: KAFKA_SASL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.kafka.sasl.existingSecret | quote }}
+      key: password
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Kafka TLS/transport-security environment variables (independent of SASL)
+Renders KAFKA_SECURITY_PROTOCOL when non-PLAINTEXT, and KAFKA_SSL_CA_LOCATION
+when TLS is enabled with a CA cert secret (matching tlsVolume/tlsVolumeMount gates).
+Usage: {{ include "cost-onprem.kafka.tlsEnv" . | nindent 12 }}
+*/}}
+{{- define "cost-onprem.kafka.tlsEnv" -}}
+{{- if ne (include "cost-onprem.kafka.securityProtocol" .) "PLAINTEXT" }}
+- name: KAFKA_SECURITY_PROTOCOL
+  value: {{ include "cost-onprem.kafka.securityProtocol" . | quote }}
+{{- end }}
+{{- if and .Values.kafka.tls.enabled .Values.kafka.tls.caCertSecret }}
+- name: KAFKA_SSL_CA_LOCATION
+  value: "/etc/kafka/certs/ca.crt"
+{{- end }}
+{{- end }}
+
+{{/*
+Kafka SASL environment variables for Ingress (uses INGRESS_* prefix)
+Usage: {{ include "cost-onprem.kafka.ingressSaslEnv" . | nindent 12 }}
+*/}}
+{{- define "cost-onprem.kafka.ingressSaslEnv" -}}
+{{- if .Values.kafka.sasl.mechanism }}
+- name: INGRESS_SASLMECHANISM
+  value: {{ .Values.kafka.sasl.mechanism | quote }}
+{{- if .Values.kafka.sasl.existingSecret }}
+- name: INGRESS_KAFKAUSERNAME
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.kafka.sasl.existingSecret | quote }}
+      key: username
+- name: INGRESS_KAFKAPASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.kafka.sasl.existingSecret | quote }}
+      key: password
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Kafka TLS/transport-security environment variables for Ingress (uses INGRESS_* prefix)
+Usage: {{ include "cost-onprem.kafka.ingressTlsEnv" . | nindent 12 }}
+*/}}
+{{- define "cost-onprem.kafka.ingressTlsEnv" -}}
+{{- if ne (include "cost-onprem.kafka.securityProtocol" .) "PLAINTEXT" }}
+- name: INGRESS_KAFKASECURITYPROTOCOL
+  value: {{ include "cost-onprem.kafka.securityProtocol" . | quote }}
+{{- end }}
+{{- if and .Values.kafka.tls.enabled .Values.kafka.tls.caCertSecret }}
+- name: INGRESS_KAFKACA
+  value: "/etc/kafka/certs/ca.crt"
+{{- end }}
+{{- end }}
+
+{{/*
+Kafka TLS CA certificate volume (mounts ca.crt from the referenced Secret)
+Usage: {{ include "cost-onprem.kafka.tlsVolume" . | nindent 8 }}
+*/}}
+{{- define "cost-onprem.kafka.tlsVolume" -}}
+{{- if and .Values.kafka.tls.enabled .Values.kafka.tls.caCertSecret }}
+- name: kafka-ca-cert
+  secret:
+    secretName: {{ .Values.kafka.tls.caCertSecret | quote }}
+    items:
+      - key: ca.crt
+        path: ca.crt
+{{- end }}
+{{- end }}
+
+{{/*
+Kafka TLS CA certificate volume mount
+Usage: {{ include "cost-onprem.kafka.tlsVolumeMount" . | nindent 12 }}
+*/}}
+{{- define "cost-onprem.kafka.tlsVolumeMount" -}}
+{{- if and .Values.kafka.tls.enabled .Values.kafka.tls.caCertSecret }}
+- name: kafka-ca-cert
+  mountPath: /etc/kafka/certs
+  readOnly: true
+{{- end }}
 {{- end }}
 
 {{/*

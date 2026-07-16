@@ -29,8 +29,8 @@ The Cost Management stack consists of the cost-onprem Helm chart plus infrastruc
 └─────────────────────────────────────────────────────────────────┘
                               +
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Kafka (Strimzi Operator)                     │
-│  3 Kafka Brokers, 3 ZooKeeper nodes, Entity Operator            │
+│                    Kafka (AMQ Streams Operator)                  │
+│  3 Kafka Brokers, 3 KRaft Controllers, Entity Operator           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,19 +124,19 @@ ROS components use the shared `resources.application` defaults from values.yaml 
 
 ---
 
-### 6. Kafka Cluster (Strimzi)
+### 6. Kafka Cluster (AMQ Streams)
 
 Kafka pods typically don't have explicit resource requests set by default. Based on observed production usage:
 
 | Component | Replicas | Observed CPU | Observed Memory | Recommended Request |
 |-----------|----------|--------------|-----------------|---------------------|
 | Kafka Broker | 3 | ~25m each | ~900 Mi each | 500m / 1 Gi each |
-| ZooKeeper | 3 | ~12m each | ~1 Gi each | 500m / 1.5 Gi each |
+| KRaft Controller | 3 | ~12m each | ~1 Gi each | 500m / 1.5 Gi each |
 | Entity Operator | 1 | ~5m | ~950 Mi | 200m / 1 Gi |
 
 **Subtotal**: 7 pods, **~3.2 cores** recommended request, **~7 Gi** memory
 
-> Configure Strimzi Kafka CR with explicit resource requests for production deployments.
+> Configure Kafka and KafkaNodePool CRs with explicit resource requests for production deployments.
 
 ---
 
@@ -190,6 +190,10 @@ With cloud providers enabled (3 additional Celery workers): **30** pods, **~8.8 
 | 5+ | Worker | 8 cores | 32 Gi | Scale workers horizontally |
 | 3 | Control Plane | 8 cores | 16 Gi | HA control plane |
 
+> **Scaling beyond defaults?** See [sizing-guide.md](../performance/sizing-guide.md)
+> for validated resource settings per deployment profile (small/medium/large/xlarge)
+> based on customer cluster count and data volume.
+
 ---
 
 ## Minimum Viable Deployment (Reduced Footprint)
@@ -212,8 +216,8 @@ For resource-constrained environments, you can reduce the deployment footprint:
 |-----------|---------------|------|-------|
 | PostgreSQL | Block (RWO) | 30 Gi | Main application database |
 | S3 Object Storage | Object Storage | 150+ Gi | Cost report storage |
-| Kafka | Block (RWO) | 50 Gi x 3 | Message persistence |
-| ZooKeeper | Block (RWO) | 10 Gi x 3 | Coordination state |
+| Kafka Brokers | Block (RWO) | 50 Gi x 3 | Message persistence |
+| KRaft Controllers | Block (RWO) | 10 Gi x 3 | KRaft metadata |
 | Valkey | Block (RWO) | 5 Gi | Cache persistence |
 
 **Total Persistent Storage**: ~265-365 Gi
@@ -363,7 +367,7 @@ The chart default is OCP-only: cloud-only Celery workers (download, refresh, hcs
 ### Why Cloud Workers Are Disabled
 
 #### Download Workers
-- **Reason**: OCP uses a **PUSH model** via Kafka - the Cost Management Operator sends data with presigned S3 URLs
+- **Reason**: OCP uses a **PUSH model** via Kafka - the Cost Management Metrics Operator sends data with presigned S3 URLs
 - **Cloud providers** use a **PULL model** - Koku polls and downloads reports from S3/Blob
 
 #### HCS Worker

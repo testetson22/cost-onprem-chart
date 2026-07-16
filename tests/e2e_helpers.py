@@ -189,6 +189,53 @@ def ensure_nise_available() -> bool:
     return install_nise()
 
 
+# Path to NISE templates
+# Default: local templates in tests/data/nise_templates (copied from IQE plugin)
+# Override with NISE_TEMPLATES_DIR env var if needed
+NISE_TEMPLATES_DIR = os.environ.get(
+    "NISE_TEMPLATES_DIR",
+    os.path.join(os.path.dirname(__file__), "data", "nise_templates")
+)
+
+
+def get_nise_template_path(template_name: str) -> Optional[str]:
+    """Get path to a NISE template if available.
+    
+    Templates are pre-configured NISE static reports for various test scenarios.
+    See tests/data/nise_templates/README.md for available templates.
+    
+    Args:
+        template_name: Name of the template file (e.g., "ocp_report_ros_0.yml")
+        
+    Returns:
+        Full path to template if it exists, None otherwise
+    """
+    if not os.path.isdir(NISE_TEMPLATES_DIR):
+        return None
+    
+    template_path = os.path.join(NISE_TEMPLATES_DIR, template_name)
+    if os.path.isfile(template_path):
+        return template_path
+    return None
+
+
+def list_nise_templates() -> List[str]:
+    """List available NISE templates.
+    
+    Returns:
+        List of template filenames, or empty list if templates not available
+    """
+    if not os.path.isdir(NISE_TEMPLATES_DIR):
+        return []
+    
+    return [f for f in os.listdir(NISE_TEMPLATES_DIR) if f.endswith(".yml")]
+
+
+# Aliases for backward compatibility (pending IQE integration)
+get_iqe_template_path = get_nise_template_path
+list_iqe_templates = list_nise_templates
+
+
 def generate_nise_data(
     cluster_id: str,
     start_date: datetime,
@@ -196,6 +243,7 @@ def generate_nise_data(
     output_dir: str,
     config: Optional[NISEConfig] = None,
     include_ros: bool = True,
+    iqe_template: Optional[str] = None,
 ) -> Dict[str, List[str]]:
     """Generate NISE OCP data and return categorized file paths.
     
@@ -206,17 +254,47 @@ def generate_nise_data(
         output_dir: Directory to write output files
         config: NISE configuration (uses defaults if not provided)
         include_ros: Whether to include ROS data (--ros-ocp-info flag)
+        iqe_template: Name of IQE template to use (e.g., "ocp_report_ros_0.yml")
+                     If provided, uses the IQE template instead of generating from config.
+                     Recommended templates:
+                     - "ocp_report_ros_0.yml": ROS optimization testing
+                     - "ocp_report_advanced.yml": Complex multi-node setup
     
     Returns:
         Dict with keys: pod_usage_files, ros_usage_files, node_label_files, namespace_label_files
     """
-    if config is None:
-        config = NISEConfig()
-    
-    yaml_content = config.to_yaml(cluster_id, start_date, end_date)
-    yaml_path = os.path.join(output_dir, "static_report.yml")
-    with open(yaml_path, "w") as f:
-        f.write(yaml_content)
+    # Determine which YAML to use
+    if iqe_template:
+        # Use NISE template
+        template_path = get_nise_template_path(iqe_template)
+        if not template_path:
+            raise FileNotFoundError(
+                f"NISE template '{iqe_template}' not found. "
+                f"Available templates: {list_nise_templates()}"
+            )
+        
+        # Read and modify template to use our dates
+        with open(template_path, "r") as f:
+            yaml_content = f.read()
+        
+        # Replace date placeholders if present
+        yaml_content = yaml_content.replace("start_date: last_month", f"start_date: {start_date.strftime('%Y-%m-%d')}")
+        yaml_content = yaml_content.replace("start_date: today", f"start_date: {start_date.strftime('%Y-%m-%d')}")
+        
+        yaml_path = os.path.join(output_dir, "static_report.yml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
+        
+        print(f"       Using NISE template: {iqe_template}")
+    else:
+        # Use config-based generation
+        if config is None:
+            config = NISEConfig()
+        
+        yaml_content = config.to_yaml(cluster_id, start_date, end_date)
+        yaml_path = os.path.join(output_dir, "static_report.yml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
     
     nise_output = os.path.join(output_dir, "nise_output")
     os.makedirs(nise_output, exist_ok=True)
@@ -278,20 +356,7 @@ def generate_nise_data(
 # =============================================================================
 
 def generate_cluster_id(prefix: str = "") -> str:
-    """Generate a unique cluster ID for E2E tests.
-    
-    Args:
-        prefix: Optional prefix to add after the standard e2e-pytest- prefix
-    
-    Returns:
-        Unique cluster ID like "e2e-pytest-cost-val-abc12345"
-    """
-    timestamp = int(time.time())
-    unique = uuid.uuid4().hex[:8]
-    
-    if prefix:
-        return f"{E2E_CLUSTER_PREFIX}{prefix}-{unique}"
-    return f"{E2E_CLUSTER_PREFIX}{timestamp}-{unique}"
+    return str(uuid.uuid4())
 
 
 # =============================================================================
@@ -400,6 +465,18 @@ def get_application_type_id(
     return None
 
 
+def _is_transient_rbac_dependency_error(response_body: str) -> bool:
+    """True when Koku returns 424 because RBAC was briefly unreachable (rollout, etc.)."""
+    lower = response_body.lower()
+    return (
+        "rbac unavailable" in lower
+        or "failed dependency" in lower
+        or "cost-onprem-rbac-api" in lower
+        or "connection refused" in lower
+        or "max retries exceeded" in lower
+    )
+
+
 def register_source(
     namespace: str,
     pod: str,
@@ -410,7 +487,7 @@ def register_source(
     source_name: Optional[str] = None,
     bucket: str = DEFAULT_S3_BUCKET,
     container: str = "ingress",
-    max_retries: int = 5,
+    max_retries: int = 8,
     initial_retry_delay: int = 5,
 ) -> SourceRegistration:
     """Register a source in Koku Sources API.
@@ -432,7 +509,7 @@ def register_source(
         source_name: Optional custom source name (defaults to e2e-source-{cluster_id[-8:]})
         bucket: S3 bucket name
         container: Container name in the pod (default: "ingress")
-        max_retries: Maximum number of retry attempts (default: 5)
+        max_retries: Maximum number of retry attempts (default: 8)
         initial_retry_delay: Initial delay between retries in seconds (default: 5)
     
     Returns:
@@ -500,7 +577,10 @@ def register_source(
             # 5xx errors might be transient, retry
             if http_code.startswith("5"):
                 continue
-            # 4xx errors are not retryable - break and fail
+            # 424 Failed Dependency (e.g. RBAC pod restarting) is transient in lab CI.
+            if http_code == "424" and _is_transient_rbac_dependency_error(result):
+                continue
+            # Other 4xx errors are not retryable - break and fail
             break
         
         try:
@@ -597,9 +677,10 @@ def upload_with_retry(
     auth_header: Dict[str, str],
     max_retries: int = 3,
     retry_delay: int = 5,
+    timeout: int = 180,
 ) -> requests.Response:
     """Upload file with retry logic for transient errors.
-    
+
     Args:
         session: Requests session (should have verify=False for self-signed certs)
         url: Upload URL
@@ -607,10 +688,11 @@ def upload_with_retry(
         auth_header: Authorization header dict
         max_retries: Maximum number of retry attempts
         retry_delay: Base delay between retries (exponential backoff)
-    
+        timeout: Request timeout in seconds (default 180s for large files)
+
     Returns:
         Response object
-    
+
     Raises:
         RuntimeError: If all retries fail
     """
@@ -623,7 +705,7 @@ def upload_with_retry(
                     url,
                     files={"file": ("cost-mgmt.tar.gz", f, UPLOAD_CONTENT_TYPE)},
                     headers=auth_header,
-                    timeout=60,
+                    timeout=timeout,
                 )
             
             if response.status_code in [200, 201, 202]:
@@ -680,6 +762,168 @@ def wait_for_provider(
     return wait_for_condition(check_provider, timeout=timeout, interval=interval)
 
 
+def wait_for_processing_complete(
+    namespace: str,
+    db_pod: str,
+    cluster_id: str,
+    poll_interval: int = 15,
+    max_wait_seconds: int = 1800,
+    on_poll=None,
+) -> dict:
+    """Block until the manifest for cluster_id is fully processed.
+
+                    Completion signal: ``reporting_common_costusagereportmanifest.completed_datetime``
+                    is set on the most recent manifest for *cluster_id*.  This timestamp is written
+                    after all download, processing, and summary phases finish — mirroring the
+                    ``manifest_complete_date`` field that the IQE plugin observes via the Koku
+                    source-stats API (``GET /sources/{uuid}/stats/``).
+
+                    Per-file progress is read from ``reporting_common_costusagereportstatus``
+                    (files with ``completed_datetime IS NOT NULL``) for logging only.
+
+                    A ``max_wait_seconds`` ceiling guards against stalled pipelines.  The default
+                    (1800 s) is intentionally generous; set it lower only for tests where you know
+                    the expected processing time.
+
+    Parameters
+    ----------
+    max_wait_seconds
+        Hard ceiling.  Returns ``{"complete": False, ...}`` if the manifest
+        counter hasn't reached completion by this time.
+    on_poll
+        Optional callable invoked once per poll cycle, after the DB query but
+        before sleeping.  Use this to collect side-car metrics (e.g. CPU
+        samples) without a separate polling loop.
+
+    Returns a dict::
+
+        {
+            "complete":            bool,
+            "elapsed_s":           float,
+            "num_total_files":     int,
+            "num_processed_files": int,
+            "pending_files":       int,   # informational only
+            "schema_name":         str | None,
+        }
+    """
+    import time as _time
+
+    start = _time.time()
+
+    print(
+        f"\n[wait-processing] cluster_id={cluster_id[:8]}… "
+        f"polling every {poll_interval}s (max {max_wait_seconds}s)"
+    )
+
+    last_num_processed = -1
+
+    while True:
+        elapsed = round(_time.time() - start, 1)
+
+        if elapsed >= max_wait_seconds:
+            print(f"[wait-processing] ✗ timed out after {elapsed}s — pipeline may be stalled")
+            return {
+                "complete":            False,
+                "elapsed_s":           elapsed,
+                "num_total_files":     0,
+                "num_processed_files": -1,
+                "pending_files":       -1,
+                "schema_name":         None,
+            }
+
+        # ── 1. Fetch the most recent manifest for this cluster ──────────────
+        # Safety: cluster_id is always a test-generated UUID, never external
+        # input.  If this helper is reused with user-supplied values, switch
+        # to parameterised queries.
+        #
+        # Schema note: reporting_common_costusagereportmanifest has no
+        # num_processed_files column.  Completion is signalled by
+        # completed_datetime being set (all download/processing/summary phases
+        # done) and optionally by per-file status rows in
+        # reporting_common_costusagereportstatus.
+        manifest_rows = execute_db_query(
+            namespace, db_pod, "costonprem_koku", "koku_user",
+            f"""
+            SELECT m.id,
+                   m.num_total_files,
+                   m.completed_datetime,
+                   m.state,
+                   c.schema_name
+            FROM   reporting_common_costusagereportmanifest m
+            JOIN   api_provider p ON m.provider_id = p.uuid
+            JOIN   api_customer c ON p.customer_id = c.id
+            WHERE  m.cluster_id = '{cluster_id}'
+            ORDER  BY m.creation_datetime DESC
+            LIMIT  1
+            """,
+        )
+
+        if not manifest_rows or not manifest_rows[0]:
+            print(f"[wait-processing] {elapsed}s — manifest not yet visible, waiting…")
+            _time.sleep(poll_interval)
+            continue
+
+        manifest_id, num_total, completed_dt, state_json, schema = manifest_rows[0]
+        num_total = int(num_total or 0)
+
+        # ── 2. Count per-file status rows (mirrors IQE files_processed) ──────
+        files_done_rows = execute_db_query(
+            namespace, db_pod, "costonprem_koku", "koku_user",
+            f"""
+            SELECT COUNT(*) FILTER (WHERE completed_datetime IS NOT NULL) AS done,
+                   COUNT(*)                                                AS total
+            FROM   reporting_common_costusagereportstatus
+            WHERE  manifest_id = {manifest_id}
+            """,
+        )
+        files_done  = int((files_done_rows or [[0, 0]])[0][0])
+        files_total = int((files_done_rows or [[0, 0]])[0][1])
+
+        # Derive active phase from state jsonb for progress logging
+        phase = "queued"
+        if state_json:
+            import json as _json
+            try:
+                st = _json.loads(state_json) if isinstance(state_json, str) else state_json
+                for p in ("summary", "processing", "download"):
+                    if st.get(p, {}).get("start"):
+                        phase = p + ("✓" if st[p].get("end") else "…")
+                        break
+            except Exception:
+                pass
+
+        if files_done != last_num_processed:
+            last_num_processed = files_done
+
+        print(
+            f"[wait-processing] {elapsed}s — "
+            f"files {files_done}/{files_total or num_total}, phase={phase}"
+            + (f", manifest done {completed_dt}" if completed_dt else "")
+        )
+
+        if on_poll is not None:
+            try:
+                on_poll()
+            except Exception:
+                pass
+
+        # ── 3. Done when manifest.completed_datetime is set ─────────────────
+        # This is the canonical signal: all download/processing/summary phases
+        # finished.  Mirrors IQE's manifest_complete_date check.
+        if completed_dt is not None:
+            print(f"[wait-processing] ✓ complete in {elapsed}s")
+            return {
+                "complete":            True,
+                "elapsed_s":           elapsed,
+                "num_total_files":     num_total,
+                "num_processed_files": files_done,
+                "pending_files":       max(0, files_total - files_done),
+                "schema_name":         schema,
+            }
+
+        _time.sleep(poll_interval)
+
+
 def wait_for_summary_tables(
     namespace: str,
     db_pod: str,
@@ -688,37 +932,46 @@ def wait_for_summary_tables(
     interval: int = 30,
 ) -> Optional[str]:
     """Wait for summary tables to be populated and return schema name.
-    
-    Returns schema name if successful, None on timeout.
+
+    .. deprecated::
+        Use :func:`wait_for_processing_complete` instead, which monitors the
+        manifest completion signals directly and requires no time ceiling.
+        This wrapper is kept for backwards compatibility with non-performance
+        test callers.
     """
-    found_schema = {"name": None}
-    
+    import time as _time
+
+    start = _time.time()
+    result = {"schema": None}
+
     def check_summary():
-        result = execute_db_query(
+        rows = execute_db_query(
             namespace, db_pod, "costonprem_koku", "koku_user",
             f"""
-            SELECT c.schema_name FROM reporting_common_costusagereportmanifest m
-            JOIN api_provider p ON m.provider_id = p.uuid
-            JOIN api_customer c ON p.customer_id = c.id
-            WHERE m.cluster_id = '{cluster_id}' LIMIT 1
-            """
+            SELECT c.schema_name
+            FROM   reporting_common_costusagereportmanifest m
+            JOIN   api_provider p ON m.provider_id = p.uuid
+            JOIN   api_customer c ON p.customer_id = c.id
+            WHERE  m.cluster_id = '{cluster_id}'
+            LIMIT  1
+            """,
         )
-        if not result or not result[0][0]:
+        if not rows or not rows[0][0]:
             return False
-        
-        schema = result[0][0].strip()
-        result = execute_db_query(
+
+        schema = rows[0][0].strip()
+        count_rows = execute_db_query(
             namespace, db_pod, "costonprem_koku", "koku_user",
-            f"SELECT COUNT(*) FROM {schema}.reporting_ocpusagelineitem_daily_summary WHERE cluster_id = '{cluster_id}'"
+            f"SELECT COUNT(*) FROM {schema}.reporting_ocpusagelineitem_daily_summary "
+            f"WHERE cluster_id = '{cluster_id}'",
         )
-        
-        if result and int(result[0][0]) > 0:
-            found_schema["name"] = schema
+        if count_rows and int(count_rows[0][0]) > 0:
+            result["schema"] = schema
             return True
         return False
-    
+
     if wait_for_condition(check_summary, timeout=timeout, interval=interval):
-        return found_schema["name"]
+        return result["schema"]
     return None
 
 

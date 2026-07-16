@@ -52,7 +52,7 @@ CI Step Registry: insights-onprem/cost-onprem-chart/e2e/
 **CI Execution Sequence:**
 1. Dependencies: Installs yq, kubectl, helm, oc
 2. S4 Setup: Reads config from `insights-onprem-s4-deploy` step
-3. Cost Management Operator: Installs via OLM (stable channel)
+3. Cost Management Metrics Operator: Installs via OLM (stable channel)
 4. Helm Wrapper: Injects S4 storage config for cost-onprem chart
 5. Deploy & Test: Runs `scripts/deploy-test-cost-onprem.sh --namespace cost-onprem --verbose`
 
@@ -97,6 +97,36 @@ E2E_CLEANUP_BEFORE=true   # Clean before tests (default)
 E2E_CLEANUP_AFTER=true    # Clean after tests (default)
 E2E_RESTART_SERVICES=false # Restart Valkey/listener (optional)
 ```
+
+### Performance Testing
+
+Performance tests use `scripts/lib/perf-testing.sh` for profile-based cluster scaling.
+The `apply_perf_profile_config()` function automatically adjusts the live deployment
+(replica counts, resource limits, timeouts, upload sizes) via Helm upgrade + `oc scale`
+before tests run.
+
+```bash
+# Deploy + run performance tests
+./scripts/deploy-test-cost-onprem.sh --namespace cost-onprem --run-perf --perf-profile medium
+
+# Performance tests only (skip deploy)
+./scripts/deploy-test-cost-onprem.sh --perf-only --perf-profile medium
+
+# Specific perf suite(s): api, ros, ingestion, scale, soak
+./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite ros,api
+```
+
+**Profile Scaling Matrix:** See `.cursor/prompts/run-tests.md` for the full
+table of replicas, CPU/memory, upload sizes, and timeouts per profile.
+Kruize is always 1 replica (PERF-FINDING-004). Listener CPU is auto-boosted
+to node max for perf runs.
+
+**Key Files:**
+- `scripts/lib/perf-testing.sh` — Profile config + test orchestration
+- `scripts/lib/listener-cpu.sh` — Listener CPU boost logic
+- `scripts/lib/perf-observability.sh` — Metrics collection + S3 upload
+- `tests/suites/performance/profiles.py` — Data generation profiles (cluster/node/pod counts)
+- `tests/suites/performance/conftest.py` — Fixtures, cleanup tracker, cluster info
 
 ---
 
@@ -268,11 +298,22 @@ kubectl logs -n cost-onprem -l app.kubernetes.io/component=ros-optimization --ta
 
 ### Deploy Chart
 ```bash
-# Full deployment + tests
+# Full deployment + chart tests
 ./scripts/deploy-test-cost-onprem.sh --namespace cost-onprem --verbose
 
-# Tests only (existing deployment)
-./scripts/deploy-test-cost-onprem.sh --tests-only
+# Deploy only — skip chart tests
+./scripts/deploy-test-cost-onprem.sh --skip-chart-tests
+
+# Chart tests only (skip deployment)
+./scripts/deploy-test-cost-onprem.sh --skip-deploy
+
+# Dry run to preview what would execute
+./scripts/deploy-test-cost-onprem.sh --dry-run --verbose
+```
+
+After modifying flag parsing in `deploy-test-cost-onprem.sh`, validate all permutations:
+```bash
+./scripts/qe/test-gh-workflow-locally.sh .github/workflows/validate-deploy-test-script.yml
 ```
 
 ### Troubleshoot
@@ -297,3 +338,62 @@ kubectl logs -n cost-onprem -l app.kubernetes.io/component=ros-processor | grep 
 ```
 
 **Note:** Downloaded artifacts are saved to `ci-artifacts-pr<PR>-<BUILD_ID>/` and should NOT be deleted unless explicitly requested by the user.
+
+---
+
+## IQE Integration Testing
+
+IQE (Insights QE) tests provide comprehensive integration testing for cost-management functionality.
+
+### Prerequisites
+
+1. **Red Hat Network**: Must be on VPN for repository access
+2. **Quay.io Access**: For containerized tests, need access to `quay.io/cloudservices/iqe-tests`
+   - Requires user file in `app-interface` repo: `data/teams/insights/users/<username>.yml`
+3. **Local Repositories**: For local tests, clone adjacent to this repo:
+   ```
+   ../iqe-core/
+   ../iqe-cost-management-plugin/
+   ```
+
+### Running IQE Tests
+
+```bash
+# IQE only — skip deploy + chart tests, boost listener CPU (recommended)
+./scripts/deploy-test-cost-onprem.sh --iqe-only \
+    --listener-cpu max --iqe-profile smoke
+
+# Containerized standalone (no CPU boost)
+./scripts/run-iqe-tests.sh --profile smoke
+
+# Local (requires VPN + local repos)
+./scripts/run-iqe-tests-local.sh --setup              # First time
+./scripts/run-iqe-tests-local.sh --profile smoke       # Run tests
+```
+
+### Test Profiles
+
+| Profile | Tests | Duration | Use Case |
+|---------|-------|----------|----------|
+| `smoke` | ~43 | ~17 min | PR checks |
+| `extended` | ~2100 | ~33 min | Daily CI |
+| `stable` | ~2350 | ~40 min | Weekly CI |
+| `full` | ~3324 | ~60 min | Release validation |
+
+Tests are I/O-bound waiting for backend data processing. Use `--listener-cpu max`
+to boost the listener deployment's CPU during the run (~40-50% faster ingestion).
+
+### Known Issues
+
+Tests are organized into skip groups with `SKIP_*` env vars. Key blockers:
+- **COST-7179** — GPU/MIG schema mismatch blocks ~90 tests + cascading failures
+- **90-day data** — NISE generates ~60 days; 90-day range tests fail (~228 tests)
+- **FLPATH-3423** — Source CRUD update returns 500 (1 test)
+
+See `docs/development/skipped-iqe-tests.md` for full details on all skip groups,
+pytest markers, and test profiles.
+
+See `docs/development/test-impact-map.md` for the automated test recommendation
+system that maps component changes to IQE profiles (`scripts/qe/test-impact-map.yaml`).
+
+See `docs/development/iqe-testing-setup.md` for full setup guide.

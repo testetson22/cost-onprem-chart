@@ -8,6 +8,15 @@
 #
 # Environment Variables:
 #   LOG_LEVEL - Control output verbosity (ERROR|WARN|INFO|DEBUG, default: WARN)
+#   RHBK_NAMESPACE - Target namespace for operator, Keycloak, and DB (default: keycloak)
+#
+# TLS Note: This script uses curl -sk (skip TLS verification) because test/dev
+# environments typically use self-signed certificates. For FedRAMP or production
+# environments requiring SC-8 compliance, configure a trusted CA bundle and
+# replace -sk with --cacert /path/to/ca-bundle.crt.
+#
+# Keycloak database image (embedded in deploy_postgresql):
+#   registry.redhat.io/rhel10/postgresql-16:10.1
 #
 # Examples:
 #   # Default (clean output)
@@ -38,15 +47,56 @@ STORAGE_CLASS=${STORAGE_CLASS:-}  # Auto-detect if empty
 REALM_NAME=${REALM_NAME:-kubernetes}
 COST_MGMT_OPERATOR_CLIENT_ID=${COST_MGMT_OPERATOR_CLIENT_ID:-cost-management-operator}
 COST_MGMT_UI_CLIENT_ID=${COST_MGMT_UI_CLIENT_ID:-cost-management-ui}
+RBAC_SYNC_CLIENT_ID=${RBAC_SYNC_CLIENT_ID:-rbac-keycloak-sync}
 COST_MGMT_NAMESPACE=${COST_MGMT_NAMESPACE:-cost-onprem}
 COST_MGMT_RELEASE_NAME=${COST_MGMT_RELEASE_NAME:-cost-onprem}
 KEYCLOAK_INSTANCES=${KEYCLOAK_INSTANCES:-1}
+VALUES_FILE=""  # Helm values file for reading jwtAuth.realmUsers
 
 # OpenShift cluster-specific configuration (auto-detected)
 CLUSTER_DOMAIN=""
 OAUTH_CALLBACK=""
 CONSOLE_URL=""
 UI_BASE_URL=${COST_MGMT_UI_BASE_URL:-}  # Can be set via COST_MGMT_UI_BASE_URL, otherwise auto-detected
+
+# Python interpreter with PyYAML (auto-detected)
+# Prefer test venv Python (has PyYAML) over system Python (may not have it on macOS)
+PYTHON_CMD=""
+
+find_python_with_yaml() {
+    # Already found?
+    if [[ -n "$PYTHON_CMD" ]]; then
+        echo "$PYTHON_CMD"
+        return 0
+    fi
+    
+    # Get script directory to find test venv
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local venv_python="${script_dir}/../tests/.venv/bin/python"
+    
+    # Check test venv first (it has PyYAML installed)
+    if [[ -x "$venv_python" ]]; then
+        if "$venv_python" -c "import yaml" 2>/dev/null; then
+            PYTHON_CMD="$venv_python"
+            echo "$PYTHON_CMD"
+            return 0
+        fi
+    fi
+    
+    # Fall back to system python3
+    if command -v python3 &>/dev/null; then
+        if python3 -c "import yaml" 2>/dev/null; then
+            PYTHON_CMD="python3"
+            echo "$PYTHON_CMD"
+            return 0
+        fi
+    fi
+    
+    # No suitable Python found
+    echo ""
+    return 1
+}
 
 # Logging functions with level-based filtering
 log_debug() {
@@ -83,7 +133,6 @@ log_header() {
         echo ""
     }
     return 0
-    return 0
 }
 
 # Backward compatibility aliases
@@ -92,6 +141,33 @@ echo_success() { log_success "$1"; }
 echo_warning() { log_warning "$1"; }
 echo_error() { log_error "$1"; }
 echo_header() { log_header "$1"; }
+
+# Helper function to safely parse JSON with jq
+# Usage: safe_jq [jq_args...] 'filter' "$json_string"
+# The json_string should be the last argument
+safe_jq() {
+    # Get the last argument (JSON input)
+    local input="${@: -1}"
+    # Get all arguments except the last one (jq arguments and filter)
+    local jq_args=("${@:1:$(($#-1))}")
+
+    # Check if input is valid JSON first
+    if echo "$input" | jq empty >/dev/null 2>&1; then
+        echo "$input" | jq -r "${jq_args[@]}" 2>/dev/null
+    else
+        # Return empty for invalid JSON
+        echo ""
+    fi
+}
+
+# Read admin username and password from the keycloak-initial-admin secret.
+# RHBK operator may set the username to "temp-admin" instead of "admin".
+# Sets ADMIN_USERNAME and ADMIN_PASSWORD for the caller.
+get_admin_credentials() {
+    ADMIN_USERNAME=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)
+    ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+    ADMIN_PASSWORD=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+}
 
 # Function to check prerequisites
 check_prerequisites() {
@@ -103,6 +179,13 @@ check_prerequisites() {
         exit 1
     fi
     echo_success "✓ OpenShift CLI (oc) is available"
+
+    # Check if jq is available (used for Keycloak Admin API JSON parsing)
+    if ! command -v jq >/dev/null 2>&1; then
+        echo_error "jq command not found. Please install jq (https://jqlang.github.io/jq/)."
+        exit 1
+    fi
+    echo_success "✓ jq is available"
 
     # Check if logged into OpenShift/Kubernetes
     # Use kubectl cluster-info as it works with both oc and kubectl
@@ -340,10 +423,19 @@ spec:
         app: keycloak-db
         component: database
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgres
-          image: registry.redhat.io/rhel9/postgresql-15:latest
+          image: registry.redhat.io/rhel10/postgresql-16:10.1
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
           ports:
             - name: postgres
               containerPort: 5432
@@ -361,8 +453,6 @@ spec:
                 secretKeyRef:
                   name: keycloak-db-secret
                   key: password
-            - name: PGDATA
-              value: "/var/lib/pgsql/data/pgdata"
           volumeMounts:
             - name: postgres-storage
               mountPath: /var/lib/pgsql/data
@@ -619,6 +709,19 @@ create_kubernetes_realm() {
         UI_BASE_URL=""  # Use empty string for now
     fi
 
+    # Derive operator client org_id from first orgAdmin realmUser entry
+    local OPERATOR_ORG_ID="org1234567"
+    local OPERATOR_ACCOUNT_NUMBER="7890123"
+    local _users_json
+    _users_json=$(get_realm_users_json 2>/dev/null) || _users_json='[]'
+    local _admin_entry
+    _admin_entry=$(echo "$_users_json" | jq -c '[.[] | select(.orgAdmin == true)] | .[0] // empty')
+    if [ -n "$_admin_entry" ]; then
+        OPERATOR_ORG_ID=$(echo "$_admin_entry" | jq -r '.orgId // "org1234567"')
+        OPERATOR_ACCOUNT_NUMBER=$(echo "$_admin_entry" | jq -r '.accountNumber // "7890123"')
+    fi
+    echo_info "Operator client identity: org_id=$OPERATOR_ORG_ID, account_number=$OPERATOR_ACCOUNT_NUMBER"
+
     # Check if realm import already exists
     if oc get keycloakrealmimport kubernetes-realm -n "$NAMESPACE" >/dev/null 2>&1; then
         echo_warning "KeycloakRealmImport 'kubernetes-realm' already exists"
@@ -747,13 +850,52 @@ spec:
               access.token.claim: "true"
               claim.name: email_verified
               jsonType.label: boolean
+      - name: roles
+        description: "OpenID Connect scope that adds realm and client role mappings to the token"
+        protocol: openid-connect
+        attributes:
+          include.in.token.scope: "true"
+          display.on.consent.screen: "false"
+        protocolMappers:
+          - name: realm roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-realm-role-mapper
+            config:
+              multivalued: "true"
+              userinfo.token.claim: "true"
+              id.token.claim: "true"
+              access.token.claim: "true"
+              claim.name: realm_access.roles
+              jsonType.label: String
+          - name: client roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-client-role-mapper
+            config:
+              multivalued: "true"
+              userinfo.token.claim: "true"
+              id.token.claim: "true"
+              access.token.claim: "true"
+              claim.name: "resource_access.\${client_id}.roles"
+              jsonType.label: String
+          - name: audience resolve
+            protocol: openid-connect
+            protocolMapper: oidc-audience-resolve-mapper
+            config:
+              introspection.token.claim: "true"
+              access.token.claim: "true"
+    roles:
+      realm:
+        - name: org-admin
+          description: "Grants is_org_admin=true in the X-Rh-Identity header, triggering insights-rbac admin_default role assignment (Cost Administrator)."
     defaultDefaultClientScopes:
+      - openid
       - api.console
       - profile
       - email
+      - roles
     clients:
       - clientId: $COST_MGMT_OPERATOR_CLIENT_ID
-        name: "Cost Management Operator Service Account"
+        name: "Cost Management Metrics Operator Service Account"
         description: "Service account client for Cost Management Metrics Operator"
         enabled: true
         clientAuthenticatorType: client-secret
@@ -762,12 +904,15 @@ spec:
         directAccessGrantsEnabled: false
         implicitFlowEnabled: false
         publicClient: false
+        fullScopeAllowed: true
         protocol: openid-connect
         defaultClientScopes:
           - openid
-          - profile
           - email
           - api.console
+          - roles
+        optionalClientScopes:
+          - offline_access
         protocolMappers:
           - name: audience-mapper
             protocol: openid-connect
@@ -798,7 +943,7 @@ spec:
             config:
               access.token.claim: "true"
               claim.name: org_id
-              claim.value: "org1234567"
+              claim.value: "$OPERATOR_ORG_ID"
               id.token.claim: "false"
               jsonType.label: String
               userinfo.token.claim: "false"
@@ -808,10 +953,35 @@ spec:
             config:
               access.token.claim: "true"
               claim.name: account_number
-              claim.value: "7890123"
+              claim.value: "$OPERATOR_ACCOUNT_NUMBER"
               id.token.claim: "false"
               jsonType.label: String
               userinfo.token.claim: "false"
+          - name: preferred-username-override
+            protocol: openid-connect
+            protocolMapper: oidc-hardcoded-claim-mapper
+            config:
+              access.token.claim: "true"
+              claim.name: preferred_username
+              claim.value: cost-mgmt-operator
+              id.token.claim: "true"
+              jsonType.label: String
+              userinfo.token.claim: "true"
+      - clientId: $RBAC_SYNC_CLIENT_ID
+        name: "RBAC Keycloak Sync"
+        description: "Service account for Keycloak-to-RBAC principal sync CronJob"
+        enabled: true
+        clientAuthenticatorType: client-secret
+        serviceAccountsEnabled: true
+        standardFlowEnabled: false
+        directAccessGrantsEnabled: false
+        implicitFlowEnabled: false
+        publicClient: false
+        fullScopeAllowed: false
+        protocol: openid-connect
+        defaultClientScopes:
+          - openid
+        optionalClientScopes: []
       - clientId: $COST_MGMT_UI_CLIENT_ID
         name: "Cost Management UI"
         description: "OAuth2 client for Cost Management UI"
@@ -822,15 +992,18 @@ spec:
         directAccessGrantsEnabled: true
         implicitFlowEnabled: false
         publicClient: false
+        fullScopeAllowed: true
         protocol: openid-connect
         redirectUris:
           - "${UI_BASE_URL}/oauth2/callback"
         webOrigins:
           - "$UI_BASE_URL"
         defaultClientScopes:
+          - openid
           - api.console
           - profile
           - email
+          - roles
         optionalClientScopes:
           - offline_access
         protocolMappers:
@@ -870,7 +1043,7 @@ EOF
 
     # Wait for realm import to complete
     echo_info "Waiting for realm import to complete..."
-    local timeout=120
+    local timeout=300
     local elapsed=0
 
     while [ $elapsed -lt $timeout ]; do
@@ -892,23 +1065,22 @@ EOF
     # Additional wait for Keycloak to fully process the realm and make clients available via admin API
     echo_info "Waiting for Keycloak to process realm and clients..."
     local KEYCLOAK_URL="https://$(oc get route keycloak -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null)"
-    local post_import_timeout=60
+    local post_import_timeout=120
     local post_import_elapsed=0
     local clients_available=false
 
-    # Get admin password for testing
-    local ADMIN_PASSWORD=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+    get_admin_credentials
 
     while [ $post_import_elapsed -lt $post_import_timeout ]; do
         # Try to list clients in the realm - this will fail if realm is not fully processed
         local token_response=$(curl -sk -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "username=admin" \
+            -d "username=$ADMIN_USERNAME" \
             -d "password=$ADMIN_PASSWORD" \
             -d "grant_type=password" \
             -d "client_id=admin-cli" 2>/dev/null)
 
-        local access_token=$(echo "$token_response" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+        local access_token=$(safe_jq '.access_token // empty' "$token_response")
 
         if [ -n "$access_token" ]; then
             # Try to get the clients we just created
@@ -919,14 +1091,17 @@ EOF
             local operator_client_found=false
             local ui_client_found=false
 
-            if echo "$client_data" | grep -q "\"clientId\":\"$COST_MGMT_OPERATOR_CLIENT_ID\""; then
-                echo_success "✓ Client '$COST_MGMT_OPERATOR_CLIENT_ID' is available via admin API"
-                operator_client_found=true
-            fi
+            # Check if client_data is valid JSON before parsing
+            if echo "$client_data" | jq empty >/dev/null 2>&1; then
+                if echo "$client_data" | jq -e --arg cid "$COST_MGMT_OPERATOR_CLIENT_ID" '.[] | select(.clientId == $cid)' >/dev/null 2>&1; then
+                    echo_success "✓ Client '$COST_MGMT_OPERATOR_CLIENT_ID' is available via admin API"
+                    operator_client_found=true
+                fi
 
-            if echo "$client_data" | grep -q "\"clientId\":\"$COST_MGMT_UI_CLIENT_ID\""; then
-                echo_success "✓ Client '$COST_MGMT_UI_CLIENT_ID' is available via admin API"
-                ui_client_found=true
+                if echo "$client_data" | jq -e --arg cid "$COST_MGMT_UI_CLIENT_ID" '.[] | select(.clientId == $cid)' >/dev/null 2>&1; then
+                    echo_success "✓ Client '$COST_MGMT_UI_CLIENT_ID' is available via admin API"
+                    ui_client_found=true
+                fi
             fi
 
             if [ "$operator_client_found" = true ] && [ "$ui_client_found" = true ]; then
@@ -1017,6 +1192,20 @@ validate_deployment() {
         echo_warning "⚠ Keycloak route not found (may be normal depending on ingress configuration)"
     fi
 
+    # Check RBAC sync client secret in both namespaces
+    if oc get secret keycloak-client-secret-rbac-sync -n "$NAMESPACE" >/dev/null 2>&1; then
+        echo_success "✓ RBAC sync client secret exists in $NAMESPACE"
+    else
+        echo_warning "⚠ RBAC sync client secret not found in $NAMESPACE"
+    fi
+    if [ "$NAMESPACE" != "$COST_MGMT_NAMESPACE" ]; then
+        if oc get secret keycloak-client-secret-rbac-sync -n "$COST_MGMT_NAMESPACE" >/dev/null 2>&1; then
+            echo_success "✓ RBAC sync client secret mirrored to $COST_MGMT_NAMESPACE"
+        else
+            echo_warning "⚠ RBAC sync client secret not found in $COST_MGMT_NAMESPACE (CronJob will fail)"
+        fi
+    fi
+
     if [ $validation_errors -eq 0 ]; then
         echo_success "All validation checks passed!"
         return 0
@@ -1040,8 +1229,7 @@ configure_admin_console() {
 
     echo_info "Keycloak URL: https://$KEYCLOAK_URL"
 
-    # Get admin credentials
-    local ADMIN_PASSWORD=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+    get_admin_credentials
     if [ -z "$ADMIN_PASSWORD" ]; then
         echo_error "Could not retrieve admin password"
         return 1
@@ -1056,12 +1244,12 @@ configure_admin_console() {
     while [ $attempt -lt $max_attempts ]; do
         token_response=$(curl -sk -X POST "https://$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "username=admin" \
+            -d "username=$ADMIN_USERNAME" \
             -d "password=$ADMIN_PASSWORD" \
             -d "grant_type=password" \
             -d "client_id=admin-cli" 2>/dev/null)
 
-        local access_token=$(echo "$token_response" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+        local access_token=$(safe_jq '.access_token // empty' "$token_response")
 
         if [ -n "$access_token" ]; then
             echo_success "✓ Admin API is available"
@@ -1082,7 +1270,7 @@ configure_admin_console() {
     local clients_response=$(curl -sk "https://$KEYCLOAK_URL/admin/realms/master/clients" \
         -H "Authorization: Bearer $access_token" 2>/dev/null)
 
-    local client_uuid=$(echo "$clients_response" | grep -o '"id":"[^"]*","clientId":"security-admin-console"' | grep -o '"id":"[^"]*' | cut -d'"' -f4)
+    local client_uuid=$(safe_jq '.[] | select(.clientId == "security-admin-console") | .id // empty' "$clients_response")
 
     if [ -z "$client_uuid" ]; then
         echo_error "Could not find security-admin-console client"
@@ -1136,9 +1324,7 @@ extract_client_secret() {
     KEYCLOAK_URL="https://$KEYCLOAK_URL"
     echo_info "Keycloak URL: $KEYCLOAK_URL"
 
-    # Get the admin password from the secret created by RHBK operator
-    # The operator auto-generates a password and stores it in keycloak-initial-admin
-    local ADMIN_PASSWORD=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+    get_admin_credentials
 
     if [ -z "$ADMIN_PASSWORD" ]; then
         echo_error "Could not retrieve auto-generated admin password from keycloak-initial-admin secret"
@@ -1146,18 +1332,18 @@ extract_client_secret() {
         return 1
     fi
 
-    echo_info "Using auto-generated admin password from RHBK operator"
+    echo_info "Using auto-generated admin credentials from RHBK operator (user: $ADMIN_USERNAME)"
 
     # Get admin token
     echo_info "Obtaining admin access token..."
     local TOKEN_RESPONSE=$(curl -sk -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=admin" \
+        -d "username=$ADMIN_USERNAME" \
         -d "password=$ADMIN_PASSWORD" \
         -d "grant_type=password" \
         -d "client_id=admin-cli" 2>/dev/null)
 
-    local ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+    local ACCESS_TOKEN=$(safe_jq '.access_token // empty' "$TOKEN_RESPONSE")
 
     if [ -z "$ACCESS_TOKEN" ]; then
         echo_warning "Could not obtain admin token, skipping client secret extraction"
@@ -1178,7 +1364,7 @@ extract_client_secret() {
             -H "Authorization: Bearer $ACCESS_TOKEN" \
             -H "Content-Type: application/json" 2>/dev/null)
 
-        local CLIENT_UUID=$(echo "$CLIENT_DATA" | grep -o "\"id\":\"[^\"]*\"[^}]*\"clientId\":\"$client_id\"" | grep -o "\"id\":\"[^\"]*\"" | cut -d'"' -f4 | head -1)
+        local CLIENT_UUID=$(safe_jq --arg cid "$client_id" '.[] | select(.clientId == $cid) | .id // empty' "$CLIENT_DATA")
 
         if [ -z "$CLIENT_UUID" ]; then
             echo_warning "Could not find client '$client_id' in realm '$REALM_NAME'"
@@ -1193,7 +1379,7 @@ extract_client_secret() {
             -H "Authorization: Bearer $ACCESS_TOKEN" \
             -H "Content-Type: application/json" 2>/dev/null)
 
-        local CLIENT_SECRET=$(echo "$CLIENT_SECRET_RESPONSE" | grep -o '"value":"[^"]*' | cut -d'"' -f4)
+        local CLIENT_SECRET=$(safe_jq '.value // empty' "$CLIENT_SECRET_RESPONSE")
 
         if [ -z "$CLIENT_SECRET" ]; then
             echo_warning "Could not retrieve client secret for '$client_id'"
@@ -1223,155 +1409,549 @@ extract_client_secret() {
     # Extract operator client secret
     extract_single_client_secret "$COST_MGMT_OPERATOR_CLIENT_ID" "keycloak-client-secret-cost-management-operator" || echo_warning "Failed to extract operator client secret"
 
-    # Extract UI client secret
+    # Extract UI client secret (used by oauth2-proxy for authorization_code flow)
     extract_single_client_secret "$COST_MGMT_UI_CLIENT_ID" "keycloak-client-secret-cost-management-ui" || echo_warning "Failed to extract UI client secret"
+
+    # Extract RBAC sync client secret and mirror to cost-mgmt namespace.
+    # The CronJob runs in COST_MGMT_NAMESPACE, not in the Keycloak namespace,
+    # and K8s secretKeyRef requires the secret to be in the same namespace as the pod.
+    extract_single_client_secret "$RBAC_SYNC_CLIENT_ID" "keycloak-client-secret-rbac-sync" || echo_warning "Failed to extract RBAC sync client secret"
+    if [ "$NAMESPACE" != "$COST_MGMT_NAMESPACE" ]; then
+        echo_info "Mirroring RBAC sync secret to namespace '$COST_MGMT_NAMESPACE'..."
+        oc get secret keycloak-client-secret-rbac-sync -n "$NAMESPACE" -o yaml \
+            | sed "s/namespace: $NAMESPACE/namespace: $COST_MGMT_NAMESPACE/" \
+            | oc apply -n "$COST_MGMT_NAMESPACE" -f - >/dev/null 2>&1 \
+            && echo_success "Mirrored secret to $COST_MGMT_NAMESPACE" \
+            || echo_warning "Failed to mirror sync secret to $COST_MGMT_NAMESPACE"
+    fi
 
     echo ""
 }
 
-# Function to create test user with org_id and account_number attributes
-create_test_user() {
-    echo_header "CREATING TEST USER"
+# Assign realm-management view-users role to the RBAC sync service account.
+# The service account must be able to enumerate users and query role memberships.
+assign_sync_client_realm_roles() {
+    echo_header "ASSIGNING REALM-MANAGEMENT ROLES TO RBAC SYNC CLIENT"
 
-    # Get Keycloak URL from Route
     local KEYCLOAK_URL=$(oc get route keycloak -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
     if [ -z "$KEYCLOAK_URL" ]; then
-        echo_warning "Could not determine Keycloak URL, skipping test user creation"
+        echo_warning "Could not determine Keycloak URL, skipping role assignment"
+        return 1
+    fi
+    KEYCLOAK_URL="https://$KEYCLOAK_URL"
+
+    get_admin_credentials
+    if [ -z "$ADMIN_PASSWORD" ]; then
+        echo_error "Could not retrieve admin password, skipping role assignment"
+        return 1
+    fi
+
+    local TOKEN_RESPONSE
+    TOKEN_RESPONSE=$(curl -sk -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "username=$ADMIN_USERNAME" \
+        -d "password=$ADMIN_PASSWORD" \
+        -d "grant_type=password" \
+        -d "client_id=admin-cli" 2>/dev/null)
+
+    local ACCESS_TOKEN=$(safe_jq '.access_token // empty' "$TOKEN_RESPONSE")
+
+    if [ -z "$ACCESS_TOKEN" ]; then
+        echo_warning "Could not obtain admin token, skipping role assignment"
+        return 1
+    fi
+
+    # Look up the service account user for the sync client
+    local SA_USERNAME="service-account-${RBAC_SYNC_CLIENT_ID}"
+    echo_info "Looking up service account user: $SA_USERNAME"
+
+    local SA_RESPONSE
+    SA_RESPONSE=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users?username=$SA_USERNAME&exact=true" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+
+    local SA_USER_ID=$(safe_jq '.[0].id // empty' "$SA_RESPONSE")
+
+    if [ -z "$SA_USER_ID" ]; then
+        echo_warning "Could not find service account user '$SA_USERNAME'"
+        return 1
+    fi
+    echo_success "Found service account user: $SA_USER_ID"
+
+    # Look up the realm-management client UUID
+    local RM_RESPONSE
+    RM_RESPONSE=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/clients?clientId=realm-management" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+
+    local RM_CLIENT_UUID=$(safe_jq '.[0].id // empty' "$RM_RESPONSE")
+
+    if [ -z "$RM_CLIENT_UUID" ]; then
+        echo_warning "Could not find realm-management client"
+        return 1
+    fi
+    echo_success "Found realm-management client: $RM_CLIENT_UUID"
+
+    # Get the view-users and view-realm client role representations
+    local ROLES_NEEDED=("view-users" "query-users" "view-realm")
+    local ROLE_PAYLOAD="["
+    local first=true
+
+    for role_name in "${ROLES_NEEDED[@]}"; do
+        local ROLE_JSON
+        ROLE_JSON=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/clients/$RM_CLIENT_UUID/roles/$role_name" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+
+        local ROLE_ID=$(safe_jq '.id // empty' "$ROLE_JSON")
+
+        if [ -z "$ROLE_ID" ]; then
+            echo_warning "Could not find realm-management role '$role_name', skipping"
+            continue
+        fi
+
+        echo_info "Found role: $role_name ($ROLE_ID)"
+        if [ "$first" = true ]; then
+            first=false
+        else
+            ROLE_PAYLOAD+=","
+        fi
+        ROLE_PAYLOAD+="{\"id\":\"$ROLE_ID\",\"name\":\"$role_name\"}"
+    done
+    ROLE_PAYLOAD+="]"
+
+    if [ "$ROLE_PAYLOAD" = "[]" ]; then
+        echo_warning "No roles found to assign"
+        return 1
+    fi
+
+    # Assign the roles to the service account user
+    local HTTP_CODE
+    HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X POST \
+        "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users/$SA_USER_ID/role-mappings/clients/$RM_CLIENT_UUID" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$ROLE_PAYLOAD" 2>/dev/null)
+
+    if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
+        echo_success "✓ Assigned realm-management roles (${ROLES_NEEDED[*]}) to $SA_USERNAME"
+    else
+        echo_warning "Role assignment returned HTTP $HTTP_CODE (may already be assigned)"
+    fi
+}
+
+# Read realm users from values file (jwtAuth.realmUsers) or return default JSON
+get_realm_users_json() {
+    if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ]; then
+        # Find a Python with PyYAML
+        local python_cmd
+        python_cmd=$(find_python_with_yaml)
+        if [[ -z "$python_cmd" ]]; then
+            echo_error "No Python with PyYAML found. Either:"
+            echo_error "  1. Run: ./scripts/run-pytest.sh --setup-only  (creates test venv with PyYAML)"
+            echo_error "  2. Or:  pip3 install pyyaml --user"
+            return 1
+        fi
+        
+        # Parse jwtAuth.realmUsers from the values file
+        local users_json
+        users_json=$("$python_cmd" -c "
+import sys, json, yaml
+with open(sys.argv[1]) as f:
+    vals = yaml.safe_load(f)
+users = vals.get('jwtAuth', {}).get('realmUsers', [])
+json.dump(users, sys.stdout)
+" "$VALUES_FILE")
+
+        local parse_rc=$?
+        if [ $parse_rc -ne 0 ]; then
+            echo_error "Failed to parse $VALUES_FILE (exit code $parse_rc)."
+            return 1
+        fi
+        if [ -n "$users_json" ] && [ "$users_json" != "[]" ]; then
+            echo "$users_json"
+            return 0
+        fi
+        echo_warning "No realmUsers found in $VALUES_FILE, using defaults"
+    fi
+
+    # Default: single admin user matching historical behavior
+    cat <<'DEFAULT_USERS'
+[{"username":"admin","password":"admin","email":"admin@test.com","firstName":"Admin","lastName":"User","orgId":"org1234567","accountNumber":"7890123","orgAdmin":true}]
+DEFAULT_USERS
+}
+
+# Create or update a single Keycloak realm user
+# Args: $1=keycloak_url $2=access_token $3=user_json (single user object)
+create_or_update_user() {
+    local keycloak_url="$1"
+    local access_token="$2"
+    local user_json="$3"
+
+    local username=$(echo "$user_json" | jq -r '.username')
+    local password=$(echo "$user_json" | jq -r '.password // "changeme"')
+    local email=$(echo "$user_json" | jq -r '.email // (.username + "@noreply.local")')
+    local first_name=$(echo "$user_json" | jq -r '.firstName // "User"')
+    local last_name=$(echo "$user_json" | jq -r '.lastName // ""')
+    local org_id=$(echo "$user_json" | jq -r '.orgId // "org1234567"')
+    local account_number=$(echo "$user_json" | jq -r '.accountNumber // "7890123"')
+
+    echo_info "Creating user '$username' (org_id=$org_id)..."
+
+    local create_payload=$(jq -n \
+        --arg u "$username" --arg e "$email" \
+        --arg fn "$first_name" --arg ln "$last_name" \
+        --arg org "$org_id" --arg acct "$account_number" \
+        '{username:$u, email:$e, emailVerified:true, enabled:true,
+          firstName:$fn, lastName:$ln,
+          attributes:{org_id:[$org], account_number:[$acct]}}')
+
+    local tmp_response
+    tmp_response=$(mktemp "${TMPDIR:-/tmp}/rhbk-user-XXXXXX")
+    local USER_HTTP_CODE=$(curl -sk -o "$tmp_response" -w "%{http_code}" \
+        -X POST "$keycloak_url/admin/realms/$REALM_NAME/users" \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "$create_payload" 2>/dev/null)
+
+    local USER_RESPONSE=$(cat "$tmp_response" 2>/dev/null || echo "")
+    rm -f "$tmp_response"
+
+    local USER_ID=""
+    if [ "$USER_HTTP_CODE" = "409" ] || { echo "$USER_RESPONSE" | jq empty >/dev/null 2>&1 && echo "$USER_RESPONSE" | jq -e '.errorMessage // empty | test("already exists|Conflict"; "i")' >/dev/null 2>&1; }; then
+        echo_info "User '$username' already exists, updating..."
+        local USERS_RESPONSE=$(curl -sk -X GET "$keycloak_url/admin/realms/$REALM_NAME/users?username=$username&exact=true" \
+            -H "Authorization: Bearer $access_token" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        USER_ID=$(safe_jq '.[0].id // empty' "$USERS_RESPONSE")
+
+        if [ -n "$USER_ID" ]; then
+            curl -sk -X PUT "$keycloak_url/admin/realms/$REALM_NAME/users/$USER_ID" \
+                -H "Authorization: Bearer $access_token" \
+                -H "Content-Type: application/json" \
+                -d "$create_payload" >/dev/null 2>&1
+            echo_success "✓ User '$username' updated"
+        fi
+    elif [ "$USER_HTTP_CODE" = "201" ] || [ "$USER_HTTP_CODE" = "200" ]; then
+        sleep 2
+        local USERS_RESPONSE=$(curl -sk -X GET "$keycloak_url/admin/realms/$REALM_NAME/users?username=$username&exact=true" \
+            -H "Authorization: Bearer $access_token" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        USER_ID=$(safe_jq '.[0].id // empty' "$USERS_RESPONSE")
+        echo_success "✓ User '$username' created"
+    fi
+
+    if [ -z "$USER_ID" ]; then
+        echo_warning "Could not determine user ID for '$username'"
+        return 1
+    fi
+
+    # Set password (check HTTP status, not just curl exit code)
+    local pw_http_code
+    pw_http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
+        -X PUT "$keycloak_url/admin/realms/$REALM_NAME/users/$USER_ID/reset-password" \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg p "$password" '{type:"password",value:$p,temporary:false}')" 2>/dev/null)
+
+    if [ "$pw_http_code" = "204" ] || [ "$pw_http_code" = "200" ]; then
+        echo_success "✓ Password set for user '$username'"
+    else
+        echo_warning "Could not set password for user '$username' (HTTP $pw_http_code)"
+    fi
+
+    # Manage org-admin realm role assignment based on orgAdmin flag.
+    # This ensures the declared state in realmUsers is enforced on every run.
+    local is_org_admin=$(echo "$user_json" | jq -r '.orgAdmin // false')
+    local role_json=$(curl -sk -X GET "$keycloak_url/admin/realms/$REALM_NAME/roles/org-admin" \
+        -H "Authorization: Bearer $access_token" 2>/dev/null)
+    local role_id=$(echo "$role_json" | jq -r '.id // empty')
+
+    if [ -z "$role_id" ]; then
+        echo_warning "Could not find 'org-admin' realm role — ensure realm import includes it"
+        return 0
+    fi
+
+    local role_payload="[$(echo "$role_json" | jq '{id:.id, name:.name}')]"
+    local audit_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if [ "$is_org_admin" = "true" ]; then
+        curl -sk -X POST "$keycloak_url/admin/realms/$REALM_NAME/users/$USER_ID/role-mappings/realm" \
+            -H "Authorization: Bearer $access_token" \
+            -H "Content-Type: application/json" \
+            -d "$role_payload" 2>/dev/null
+        echo_success "✓ Assigned 'org-admin' realm role to '$username'"
+        echo "[AUDIT] $audit_ts action=assign_role user=$username role=org-admin realm=$REALM_NAME actor=deploy-rhbk.sh"
+    else
+        # Remove org-admin role if previously assigned (Day 2: orgAdmin changed to false)
+        curl -sk -X DELETE "$keycloak_url/admin/realms/$REALM_NAME/users/$USER_ID/role-mappings/realm" \
+            -H "Authorization: Bearer $access_token" \
+            -H "Content-Type: application/json" \
+            -d "$role_payload" 2>/dev/null
+        echo_info "Ensured '$username' does not have 'org-admin' realm role"
+        echo "[AUDIT] $audit_ts action=remove_role user=$username role=org-admin realm=$REALM_NAME actor=deploy-rhbk.sh"
+    fi
+
+    return 0
+}
+
+# Acquire a short-lived Keycloak admin token via password grant.
+# Args: $1=keycloak_url $2=admin_username $3=admin_password
+_obtain_admin_token() {
+    local url="$1" user="$2" pass="$3"
+    curl -sk -X POST "${url}/realms/master/protocol/openid-connect/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "username=${user}" \
+        -d "password=${pass}" \
+        -d "grant_type=password" \
+        -d "client_id=admin-cli" 2>/dev/null | jq -r '.access_token // empty'
+}
+
+# Create realm users from jwtAuth.realmUsers (values file) or defaults
+create_realm_users() {
+    echo_header "CREATING REALM USERS"
+
+    local KEYCLOAK_URL=$(oc get route keycloak -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    if [ -z "$KEYCLOAK_URL" ]; then
+        echo_warning "Could not determine Keycloak URL, skipping realm user creation"
         return 1
     fi
 
     KEYCLOAK_URL="https://$KEYCLOAK_URL"
     echo_info "Keycloak URL: $KEYCLOAK_URL"
 
-    # Get the admin password from the secret created by RHBK operator
-    local ADMIN_PASSWORD=$(oc get secret keycloak-initial-admin -n "$NAMESPACE" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+    get_admin_credentials
 
     if [ -z "$ADMIN_PASSWORD" ]; then
         echo_error "Could not retrieve auto-generated admin password from keycloak-initial-admin secret"
         return 1
     fi
 
-    # Get admin token
     echo_info "Obtaining admin access token..."
-    local TOKEN_RESPONSE=$(curl -sk -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=admin" \
-        -d "password=$ADMIN_PASSWORD" \
-        -d "grant_type=password" \
-        -d "client_id=admin-cli" 2>/dev/null)
-
-    local ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+    local ACCESS_TOKEN
+    ACCESS_TOKEN=$(_obtain_admin_token "$KEYCLOAK_URL" "$ADMIN_USERNAME" "$ADMIN_PASSWORD")
 
     if [ -z "$ACCESS_TOKEN" ]; then
-        echo_warning "Could not obtain admin token, skipping test user creation"
+        echo_warning "Could not obtain admin token, skipping realm user creation"
         return 1
     fi
-
     echo_success "Admin token obtained"
 
-    # Create test user with org_id and account_number attributes
-    # These values match the operator client's hardcoded values for testing
-    #
-    # WORKAROUND: The org_id includes "org" prefix (org1234567 instead of 1234567)
-    # because the Koku image has a bug that prepends "org" to the org_id when
-    # creating tenant schemas. This results in schema names like "orgorg1234567"
-    # when the org_id is "org1234567". Once the Koku bug is fixed, change this
-    # back to a plain numeric org_id like "1234567".
-    # See: https://github.com/project-koku/koku/issues/XXXX (TODO: add issue link)
-    #
-    # REQUIRED ATTRIBUTES for Cost Management:
-    #   - org_id: Tenant identifier (maps to database schema)
-    #   - account_number: Customer account identifier
-    #
-    # Note: "access" attribute is NOT required when using ENHANCED_ORG_ADMIN mode.
-    # All authenticated users are treated as org admins with full access within their org.
-    # This simplifies setup but means no granular RBAC within an org.
-    # Multi-tenancy is preserved: users only see data for their own org_id.
+    local USERS_JSON
+    USERS_JSON=$(get_realm_users_json)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    local user_count=$(echo "$USERS_JSON" | jq 'length')
 
-    echo_info "Creating user 'test' with org_id and account_number attributes..."
-    local USER_HTTP_CODE=$(curl -sk -o /tmp/user_response.txt -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users" \
-        -H "Authorization: Bearer $ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"username\": \"test\",
-            \"email\": \"test@test.com\",
-            \"emailVerified\": true,
-            \"enabled\": true,
-            \"firstName\": \"Test\",
-            \"lastName\": \"User\",
-            \"attributes\": {
-                \"org_id\": [\"org1234567\"],
-                \"account_number\": [\"7890123\"]
-            }
-        }" 2>/dev/null)
-
-    local USER_RESPONSE=$(cat /tmp/user_response.txt 2>/dev/null || echo "")
-    rm -f /tmp/user_response.txt
-
-    local USER_ID=""
-    if [ "$USER_HTTP_CODE" = "409" ] || echo "$USER_RESPONSE" | grep -q "already exists\|Conflict"; then
-        echo_warning "User 'test' may already exist, attempting to find it..."
-        # Get existing user
-        local USERS_RESPONSE=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users?username=test" \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -H "Content-Type: application/json" 2>/dev/null)
-        USER_ID=$(echo "$USERS_RESPONSE" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 | head -1)
-
-        if [ -n "$USER_ID" ]; then
-            echo_info "Found existing user 'test', updating with attributes..."
-            # Update user with attributes
-            curl -sk -X PUT "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users/$USER_ID" \
-                -H "Authorization: Bearer $ACCESS_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d '{
-                    "username": "test",
-                    "email": "test@test.com",
-                    "emailVerified": true,
-                    "enabled": true,
-                    "firstName": "Test",
-                    "lastName": "User",
-                    "attributes": {
-                        "org_id": ["org1234567"],
-                        "account_number": ["7890123"]
-                    }
-                }' >/dev/null 2>&1
-            echo_success "✓ User 'test' updated"
-        fi
-    elif [ "$USER_HTTP_CODE" = "201" ] || [ "$USER_HTTP_CODE" = "200" ]; then
-        # User created successfully, get ID from users list
-        sleep 2
-        local USERS_RESPONSE=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users?username=test" \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -H "Content-Type: application/json" 2>/dev/null)
-        USER_ID=$(echo "$USERS_RESPONSE" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 | head -1)
-        echo_success "✓ User 'test' created"
+    echo_info "Provisioning $user_count realm user(s)..."
+    if [ -n "$VALUES_FILE" ]; then
+        echo_info "  Source: $VALUES_FILE (jwtAuth.realmUsers)"
+    else
+        echo_info "  Source: built-in defaults (use -f <values.yaml> to customize)"
     fi
 
-    if [ -z "$USER_ID" ]; then
-        echo_warning "Could not determine user ID for 'test'"
+    local i=0
+    local fail_count=0
+    while [ $i -lt "$user_count" ]; do
+        # Re-acquire token before each user to guard against TTL expiry
+        ACCESS_TOKEN=$(_obtain_admin_token "$KEYCLOAK_URL" "$ADMIN_USERNAME" "$ADMIN_PASSWORD")
+        if [ -z "$ACCESS_TOKEN" ]; then
+            echo_error "Admin token expired and could not be renewed"
+            return 1
+        fi
+        local user_obj=$(echo "$USERS_JSON" | jq ".[$i]")
+        if ! create_or_update_user "$KEYCLOAK_URL" "$ACCESS_TOKEN" "$user_obj"; then
+            fail_count=$((fail_count + 1))
+        fi
+        i=$((i + 1))
+    done
+
+    if [ "$fail_count" -gt 0 ]; then
+        echo_error "$fail_count of $user_count user(s) failed to provision"
+        return 1
+    fi
+    echo_success "✓ All $user_count realm user(s) provisioned successfully"
+    echo ""
+}
+
+# Create organization groups for multi-org Keycloak-to-RBAC sync.
+# For each distinct orgId in realmUsers, creates:
+#   - A top-level group named {ORG_GROUP_PREFIX}{orgId}
+#     with attributes: org_id, account_number
+#   - A sub-group named "org-admin" under each org group
+# Then assigns users to their org group and orgAdmin users to the admin sub-group.
+create_org_groups() {
+    echo_header "CREATING ORGANIZATION GROUPS"
+
+    local KEYCLOAK_URL=$(oc get route keycloak -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    if [ -z "$KEYCLOAK_URL" ]; then
+        echo_warning "Could not determine Keycloak URL, skipping org group creation"
+        return 1
+    fi
+    KEYCLOAK_URL="https://$KEYCLOAK_URL"
+
+    get_admin_credentials
+    if [ -z "$ADMIN_PASSWORD" ]; then
+        echo_error "Could not retrieve admin password"
         return 1
     fi
 
-    echo_info "User ID: $USER_ID"
-
-    # Set user password
-    echo_info "Setting password for user 'test'..."
-    local PASSWORD_RESPONSE=$(curl -sk -X PUT "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users/$USER_ID/reset-password" \
-        -H "Authorization: Bearer $ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "type": "password",
-            "value": "test",
-            "temporary": false
-        }' 2>/dev/null)
-
-    if [ $? -eq 0 ]; then
-        echo_success "✓ Password set for user 'test'"
-    else
-        echo_warning "Could not set password for user 'test' (may already be set)"
+    local ACCESS_TOKEN
+    ACCESS_TOKEN=$(_obtain_admin_token "$KEYCLOAK_URL" "$ADMIN_USERNAME" "$ADMIN_PASSWORD")
+    if [ -z "$ACCESS_TOKEN" ]; then
+        echo_warning "Could not obtain admin token, skipping org group creation"
+        return 1
     fi
 
-    echo_success "✓ Test user creation complete"
+    local ORG_GROUP_PREFIX="${ORG_GROUP_PREFIX:-org-}"
+    local ORG_ADMIN_SUBGROUP="${ORG_ADMIN_SUBGROUP:-org-admin}"
+
+    local USERS_JSON
+    USERS_JSON=$(get_realm_users_json)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    # Discover distinct orgIds and their account numbers
+    local orgs_json
+    orgs_json=$(echo "$USERS_JSON" | jq -c '[group_by((.orgId // "org1234567")) | .[] | {orgId: (.[0].orgId // "org1234567"), accountNumber: (.[0].accountNumber // "7890123")}]')
+
+    local org_count
+    org_count=$(echo "$orgs_json" | jq 'length')
+    echo_info "Found $org_count distinct organization(s) in realmUsers"
+
+    local o=0
+    while [ $o -lt "$org_count" ]; do
+        ACCESS_TOKEN=$(_obtain_admin_token "$KEYCLOAK_URL" "$ADMIN_USERNAME" "$ADMIN_PASSWORD")
+        if [ -z "$ACCESS_TOKEN" ]; then
+            echo_error "Admin token expired and could not be renewed"
+            return 1
+        fi
+
+        local org_id account_number group_name
+        org_id=$(echo "$orgs_json" | jq -r ".[$o].orgId")
+        account_number=$(echo "$orgs_json" | jq -r ".[$o].accountNumber")
+        group_name="${ORG_GROUP_PREFIX}${org_id}"
+
+        echo_info "Creating org group '$group_name' (org_id=$org_id, account_number=$account_number)..."
+
+        # Create top-level org group with attributes
+        local group_payload
+        group_payload=$(jq -n \
+            --arg name "$group_name" \
+            --arg org "$org_id" \
+            --arg acct "$account_number" \
+            '{name: $name, attributes: {org_id: [$org], account_number: [$acct]}}')
+
+        local GROUP_HTTP_CODE
+        GROUP_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            -X POST "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$group_payload" 2>/dev/null)
+
+        if [ "$GROUP_HTTP_CODE" = "201" ]; then
+            echo_success "  ✓ Group '$group_name' created"
+        elif [ "$GROUP_HTTP_CODE" = "409" ]; then
+            echo_info "  Group '$group_name' already exists, updating attributes..."
+            # Find existing group and update
+            local existing_group
+            existing_group=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups?search=$group_name&exact=true" \
+                -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+            local group_id
+            group_id=$(echo "$existing_group" | jq -r ".[0].id // empty")
+            if [ -n "$group_id" ]; then
+                curl -sk -X PUT "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups/$group_id" \
+                    -H "Authorization: Bearer $ACCESS_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "$group_payload" >/dev/null 2>&1
+                echo_success "  ✓ Group '$group_name' updated"
+            fi
+        else
+            echo_error "  Failed to create group '$group_name' (HTTP $GROUP_HTTP_CODE)"
+            o=$((o + 1))
+            continue
+        fi
+
+        # Find the group ID
+        local groups_response
+        groups_response=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups?search=$group_name&exact=true" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+        local GROUP_ID
+        GROUP_ID=$(echo "$groups_response" | jq -r ".[0].id // empty")
+
+        if [ -z "$GROUP_ID" ]; then
+            echo_error "  Could not find group ID for '$group_name'"
+            o=$((o + 1))
+            continue
+        fi
+
+        # Create org-admin sub-group
+        local subgroup_payload
+        subgroup_payload=$(jq -n --arg name "$ORG_ADMIN_SUBGROUP" '{name: $name}')
+        local SUB_HTTP_CODE
+        SUB_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            -X POST "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups/$GROUP_ID/children" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$subgroup_payload" 2>/dev/null)
+
+        if [ "$SUB_HTTP_CODE" = "201" ]; then
+            echo_success "  ✓ Sub-group '$ORG_ADMIN_SUBGROUP' created"
+        elif [ "$SUB_HTTP_CODE" = "409" ]; then
+            echo_info "  Sub-group '$ORG_ADMIN_SUBGROUP' already exists"
+        else
+            echo_warning "  Sub-group creation returned HTTP $SUB_HTTP_CODE (may already exist)"
+        fi
+
+        # Find the admin sub-group ID via the parent group representation
+        # (GET /groups/{id}/children is not supported in all RHBK versions)
+        local group_detail
+        group_detail=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/groups/$GROUP_ID" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+        local ADMIN_SG_ID
+        ADMIN_SG_ID=$(echo "$group_detail" | jq -r ".subGroups[] | select(.name==\"$ORG_ADMIN_SUBGROUP\") | .id // empty")
+
+        # Assign users to this org group and admin sub-group
+        local user_count
+        user_count=$(echo "$USERS_JSON" | jq 'length')
+        local u=0
+        while [ $u -lt "$user_count" ]; do
+            local u_org u_name u_admin
+            u_org=$(echo "$USERS_JSON" | jq -r ".[$u].orgId // \"org1234567\"")
+            u_name=$(echo "$USERS_JSON" | jq -r ".[$u].username")
+            u_admin=$(echo "$USERS_JSON" | jq -r ".[$u].orgAdmin // false")
+
+            if [ "$u_org" = "$org_id" ]; then
+                # Find user ID
+                local user_response
+                user_response=$(curl -sk -X GET "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users?username=$u_name&exact=true" \
+                    -H "Authorization: Bearer $ACCESS_TOKEN" 2>/dev/null)
+                local USER_ID
+                USER_ID=$(echo "$user_response" | jq -r ".[0].id // empty")
+
+                if [ -n "$USER_ID" ]; then
+                    # Add user to org group
+                    curl -sk -X PUT "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users/$USER_ID/groups/$GROUP_ID" \
+                        -H "Authorization: Bearer $ACCESS_TOKEN" >/dev/null 2>&1
+                    echo_info "  Added user '$u_name' to group '$group_name'"
+
+                    # Add orgAdmin users to admin sub-group
+                    if [ "$u_admin" = "true" ] && [ -n "$ADMIN_SG_ID" ]; then
+                        curl -sk -X PUT "$KEYCLOAK_URL/admin/realms/$REALM_NAME/users/$USER_ID/groups/$ADMIN_SG_ID" \
+                            -H "Authorization: Bearer $ACCESS_TOKEN" >/dev/null 2>&1
+                        echo_info "  Added user '$u_name' to admin sub-group '$ORG_ADMIN_SUBGROUP'"
+                    fi
+                else
+                    echo_warning "  User '$u_name' not found in Keycloak, skipping group assignment"
+                fi
+            fi
+            u=$((u + 1))
+        done
+
+        echo_success "✓ Org group '$group_name' fully provisioned"
+        o=$((o + 1))
+    done
+
+    echo_success "✓ All $org_count organization group(s) provisioned"
     echo ""
 }
 
@@ -1398,10 +1978,11 @@ display_summary() {
     echo_info "  Namespace: $NAMESPACE"
     echo_info "  Keycloak URL: https://$hostname"
     echo_info "  Realm: $REALM_NAME"
-    echo_info "  Admin User: admin (auto-generated by operator)"
+    get_admin_credentials
+    echo_info "  Admin User: $ADMIN_USERNAME (from keycloak-initial-admin secret)"
     echo ""
 
-    echo_info "Cost Management Operator Client Information:"
+    echo_info "Cost Management Metrics Operator Client Information:"
     echo_info "  Client ID: $COST_MGMT_OPERATOR_CLIENT_ID"
     echo_info "  Client Type: Service Account (client_credentials flow)"
     echo_info "  Default Scopes: openid, profile, email, api.console"
@@ -1411,22 +1992,55 @@ display_summary() {
 
     echo_info "Cost Management UI Client Information:"
     echo_info "  Client ID: $COST_MGMT_UI_CLIENT_ID"
-    echo_info "  Client Type: OAuth2 Public Client (authorization_code flow)"
+    echo_info "  Client Type: Confidential (authorization_code flow for oauth2-proxy)"
     echo_info "  Redirect URI: ${UI_BASE_URL}/oauth2/callback"
     echo_info "  Web Origin: $UI_BASE_URL"
-    echo_info "  Default Scopes: api.console, profile, email"
+    echo_info "  Default Scopes: openid, api.console, profile, email"
     echo_info "  Optional Scopes: offline_access"
     echo_info "  Secret stored in: keycloak-client-secret-cost-management-ui"
     echo ""
 
-    echo_info "Test User Information:"
-    echo_info "  User: test"
-    echo_info "    Password: test"
-    echo_info "    Email: test@test.com (verified)"
-    echo_info "    Attributes:"
-    echo_info "      org_id: org1234567 (includes 'org' prefix as workaround for Koku bug)"
-    echo_info "      account_number: 7890123"
-    echo_info "      access: OCP-only (openshift.cluster, openshift.project, openshift.node, cost_model)"
+    echo_info "RBAC Keycloak Sync Client Information:"
+    echo_info "  Client ID: $RBAC_SYNC_CLIENT_ID"
+    echo_info "  Client Type: Confidential (client_credentials service account)"
+    echo_info "  Realm-management roles: view-users, query-users, view-realm"
+    echo_info "  Secret stored in: keycloak-client-secret-rbac-sync"
+    echo ""
+
+    echo_info "Provisioned Realm Users:"
+    local USERS_JSON
+    USERS_JSON=$(get_realm_users_json 2>/dev/null) || USERS_JSON='[]'
+    local u_count
+    u_count=$(echo "$USERS_JSON" | jq 'length')
+    local u=0
+    while [ $u -lt "$u_count" ]; do
+        local u_name u_org u_acct u_admin
+        u_name=$(echo "$USERS_JSON" | jq -r ".[$u].username")
+        u_org=$(echo "$USERS_JSON" | jq -r ".[$u].orgId // \"org1234567\"")
+        u_acct=$(echo "$USERS_JSON" | jq -r ".[$u].accountNumber // \"7890123\"")
+        u_admin=$(echo "$USERS_JSON" | jq -r ".[$u].orgAdmin // false")
+        local role_info=""
+        [ "$u_admin" = "true" ] && role_info=" (org-admin)"
+        echo_info "  ${u_name}${role_info}  org_id=${u_org}  account_number=${u_acct}"
+        u=$((u + 1))
+    done
+    echo_info ""
+    echo_info "  Organization Groups (for multi-org RBAC sync):"
+    local ORG_GROUP_PREFIX="${ORG_GROUP_PREFIX:-org-}"
+    local orgs_json
+    orgs_json=$(echo "$USERS_JSON" | jq -c "[group_by((.orgId // \"org1234567\")) | .[] | (.[0].orgId // \"org1234567\")]" 2>/dev/null) || orgs_json='[]'
+    local org_list
+    org_list=$(echo "$orgs_json" | jq -r '.[]' 2>/dev/null)
+    for org_id in $org_list; do
+        echo_info "    ${ORG_GROUP_PREFIX}${org_id}  (org_id=$org_id, sub-group: org-admin)"
+    done
+    echo_info ""
+    echo_info "  RBAC Permissions:"
+    echo_info "    To sync Keycloak users to RBAC automatically (recommended):"
+    echo_info "      rbac.keycloakSync.enabled=true"
+    echo_info "      rbac.keycloakSync.clientSecretRef.name=keycloak-client-secret-rbac-sync"
+    echo_info "    Users are synced per-org from Keycloak groups matching prefix '${ORG_GROUP_PREFIX}'."
+    echo_info "    Admin access is determined by membership in the 'org-admin' sub-group."
     echo ""
 
     # Display admin credential retrieval
@@ -1468,6 +2082,8 @@ cleanup_deployment() {
     oc delete secret keycloak-db-secret -n "$NAMESPACE" 2>/dev/null || true
     oc delete secret keycloak-client-secret-cost-management-operator -n "$NAMESPACE" 2>/dev/null || true
     oc delete secret keycloak-client-secret-cost-management-ui -n "$NAMESPACE" 2>/dev/null || true
+    oc delete secret keycloak-client-secret-rbac-sync -n "$NAMESPACE" 2>/dev/null || true
+    oc delete secret keycloak-client-secret-rbac-sync -n "$COST_MGMT_NAMESPACE" 2>/dev/null || true
 
     # Remove PVCs (if any were manually created in old versions)
     # Note: RHBK operator manages its own PVCs, they'll be deleted with the namespace
@@ -1495,7 +2111,7 @@ main() {
     echo_info "  Namespace: $NAMESPACE"
     echo_info "  Storage Class: $STORAGE_CLASS"
     echo_info "  Realm: $REALM_NAME"
-    echo_info "  Cost Management Operator Client ID: $COST_MGMT_OPERATOR_CLIENT_ID"
+    echo_info "  Cost Management Metrics Operator Client ID: $COST_MGMT_OPERATOR_CLIENT_ID"
     echo_info "  Cost Management UI Client ID: $COST_MGMT_UI_CLIENT_ID"
     echo_info "  Keycloak Instances: $KEYCLOAK_INSTANCES"
     echo ""
@@ -1510,7 +2126,9 @@ main() {
     create_kubernetes_realm
     configure_admin_console
     extract_client_secret
-    create_test_user
+    assign_sync_client_realm_roles
+    create_realm_users
+    create_org_groups
 
     # Validate and summarize
     if validate_deployment; then
@@ -1521,8 +2139,32 @@ main() {
     fi
 }
 
+# Parse all flags and collect the command in a single pass
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--values)
+            VALUES_FILE="$2"
+            if [ -z "$VALUES_FILE" ] || [ ! -f "$VALUES_FILE" ]; then
+                echo_error "Values file not found: ${VALUES_FILE:-<empty>}"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -*)
+            echo_error "Unknown flag: $1"
+            echo_info "Use '$0 help' for usage information"
+            exit 1
+            ;;
+        *)
+            COMMAND="$1"
+            shift
+            ;;
+    esac
+done
+
 # Handle script arguments
-case "${1:-}" in
+case "${COMMAND}" in
     "cleanup"|"clean")
         cleanup_deployment
         exit 0
@@ -1532,7 +2174,7 @@ case "${1:-}" in
         exit $?
         ;;
     "help"|"-h"|"--help")
-        echo "Usage: $0 [command]"
+        echo "Usage: $0 [-f <values.yaml>] [command]"
         echo ""
         echo "Commands:"
         echo "  (no command)    Deploy RHBK with all components"
@@ -1540,12 +2182,19 @@ case "${1:-}" in
         echo "  cleanup         Remove all RHBK resources"
         echo "  help            Show this help message"
         echo ""
+        echo "Options:"
+        echo "  -f, --values <file>   Helm values file to read jwtAuth.realmUsers from."
+        echo "                        Users listed under jwtAuth.realmUsers will be created"
+        echo "                        in the Keycloak realm. Without this flag, a default"
+        echo "                        admin/admin user is created."
+        echo ""
         echo "Environment Variables:"
         echo "  RHBK_NAMESPACE            Target namespace (default: keycloak)"
         echo "  STORAGE_CLASS             Storage class name (auto-detected by default)"
         echo "  REALM_NAME                Realm name (default: kubernetes)"
         echo "  COST_MGMT_OPERATOR_CLIENT_ID  Operator client ID (default: cost-management-operator)"
         echo "  COST_MGMT_UI_CLIENT_ID    UI client ID (default: cost-management-ui)"
+        echo "  RBAC_SYNC_CLIENT_ID       RBAC sync client ID (default: rbac-keycloak-sync)"
         echo "  COST_MGMT_NAMESPACE    UI namespace for URL construction (default: cost-onprem)"
         echo "  COST_MGMT_RELEASE_NAME UI release name for URL construction (default: cost-onprem)"
         echo "  COST_MGMT_UI_BASE_URL     UI base URL (auto-detected if not set)"
@@ -1555,28 +2204,20 @@ case "${1:-}" in
         echo "      Access them via: oc get secret keycloak-initial-admin -n keycloak"
         echo ""
         echo "Examples:"
-        echo "  # Deploy with default settings"
+        echo "  # Deploy with default admin/admin user"
         echo "  $0"
+        echo ""
+        echo "  # Deploy with users from values.yaml"
+        echo "  $0 -f cost-onprem/values.yaml"
         echo ""
         echo "  # Deploy with custom storage class"
         echo "  STORAGE_CLASS=gp2 $0"
-        echo ""
-        echo "  # Deploy with HA configuration"
-        echo "  KEYCLOAK_INSTANCES=2 $0"
         echo ""
         echo "  # Validate existing deployment"
         echo "  $0 validate"
         echo ""
         echo "  # Clean up deployment"
         echo "  $0 cleanup"
-        echo ""
-        echo "RHBK Operator Details:"
-        echo "  This script uses the RHBK operator (k8s.keycloak.org/v2alpha1)"
-        echo ""
-        echo "  Key features:"
-        echo "  - Uses KeycloakRealmImport instead of KeycloakRealm"
-        echo "  - Clients are defined within the realm import"
-        echo "  - Different CR structure for Keycloak instances"
         exit 0
         ;;
     "")

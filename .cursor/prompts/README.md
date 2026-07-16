@@ -7,6 +7,9 @@ These prompt templates help you quickly invoke common actions in Cursor.
 In Cursor, type `@` followed by the prompt name to include it in your conversation:
 
 - `@run-tests` - Run the pytest test suite
+- `@run-iqe-tests` - Run IQE integration tests
+- `@analyze-test-run` - Analyze IQE test run logs for performance and failures
+- `@analyze-perf-run` - Analyze performance test results (downloaded or local)
 - `@troubleshoot-tests` - Diagnose test failures
 - `@connect-cluster` - Set up cluster access
 - `@deploy-chart` - Deploy the Helm chart
@@ -21,6 +24,9 @@ In Cursor, type `@` followed by the prompt name to include it in your conversati
 | Prompt | Purpose |
 |--------|---------|
 | `run-tests.md` | Run pytest with various options (CI mode, extended, specific suites) |
+| `run-iqe-tests.md` | Run IQE integration tests (containerized or local) |
+| `analyze-test-run.md` | Analyze IQE test run logs for performance and failures |
+| `analyze-perf-run.md` | Analyze performance test results with KPI assessment |
 | `troubleshoot-tests.md` | Diagnose common test failures with specific commands |
 | `connect-cluster.md` | Set up OpenShift cluster access with credentials |
 | `deploy-chart.md` | Deploy the cost-onprem Helm chart |

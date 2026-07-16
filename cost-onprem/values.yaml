@@ -4,6 +4,7 @@
 # This chart deploys the complete Cost Management on-premise solution:
 # - ROS (Resource Optimization Service)
 # - Cost Management Service (Koku and Sources API)
+# - RBAC v1 Authorization Service (insights-rbac)
 # - Shared infrastructure (PostgreSQL, Kafka, Valkey, S3 object storage)
 #
 # Naming conventions:
@@ -37,7 +38,7 @@ global:
   initContainers:
     waitFor:
       repository: registry.access.redhat.com/ubi9/ubi-minimal
-      tag: "latest"
+      tag: "9.7"
 
 # -----------------------------------------------------------------------------
 # ROS (Resource Optimization Service) - Top-level Service
@@ -47,9 +48,9 @@ ros:
   # All ROS services (api, processor, recommendationPoller, housekeeper, partitionCleaner)
   # use the same image
   image:
-    repository: quay.io/insights-onprem/ros-ocp-backend
-    tag: "latest"
-    pullPolicy: Always
+    repository: quay.io/redhat-services-prod/insights-management-tenant/insights-ocp-resource-optimization/ros-ocp-backend
+    tag: "410b86b"
+    pullPolicy: IfNotPresent
 
   # Service Account
   serviceAccount:
@@ -62,8 +63,6 @@ ros:
     metricsPort: 9000
     pathPrefix: /api
 
-    # Service-specific configuration
-    rbacEnabled: false # RBAC is not supported yet
     dbPoolSize: 10
     dbMaxOverflow: 20
     serviceName: ros-api
@@ -71,6 +70,7 @@ ros:
 
   # Processor Component - Processes uploaded data
   processor:
+    replicas: 1
     metricsPort: 9000
     logLevel: INFO
     serviceName: ros-processor
@@ -146,9 +146,9 @@ costManagement:
     enabled: true
 
     image:
-      repository: quay.io/insights-onprem/koku
-      tag: "sources-3"
-      pullPolicy: Always
+      repository: quay.io/redhat-services-prod/cost-mgmt-dev-tenant/koku
+      tag: "d3c5bba"
+      pullPolicy: IfNotPresent
 
     replicas: 1
     resources:
@@ -194,7 +194,7 @@ costManagement:
       CACHED_VIEWS_DISABLED: "False"
       RETAIN_NUM_MONTHS: "3"
       NOTIFICATION_CHECK_TIME: "24"
-      ENHANCED_ORG_ADMIN: "True"
+      ENHANCED_ORG_ADMIN: "False"
       RBAC_CACHE_TIMEOUT: "300"
       CACHE_TIMEOUT: "3600"
       TAG_ENABLED_LIMIT: "200"
@@ -439,9 +439,11 @@ costManagement:
 # -----------------------------------------------------------------------------
 # Kruize is used exclusively by ROS for workload optimization recommendations
 kruize:
+  replicas: 1
+
   image:
     repository: quay.io/redhat-services-prod/kruize-autotune-tenant/autotune
-    tag: "d0b4337"
+    tag: "5eeae99"
 
   port: 8080
 
@@ -498,9 +500,9 @@ kruize:
 # Uses insights-ingress-go which requires INGRESS_* prefixed environment variables
 ingress:
   image:
-    repository: quay.io/insights-onprem/insights-ingress-go
-    tag: "latest"
-    pullPolicy: Always
+    repository: quay.io/iop/ingress
+    tag: "master"
+    pullPolicy: IfNotPresent
 
   # Server configuration
   server:
@@ -591,8 +593,10 @@ database:
   # Unified Database Server Configuration
   server:
     image:
-      repository: quay.io/insights-onprem/postgresql
-      tag: "16"
+      repository: registry.redhat.io/rhel10/postgresql-16
+      tag: "10.1"
+      # Image entrypoint expects POSTGRESQL_* or POSTGRESQL_ADMIN_PASSWORD; chart supplies
+      # the latter. Secret key postgres-user must be the DB superuser name (default: postgres).
 
     storage:
       size: 30Gi  # Total storage for all databases (sum of individual DBs)
@@ -636,20 +640,180 @@ database:
     user: koku_user
     password: koku_password
 
+  # RBAC Database Configuration
+  rbac:
+    name: costonprem_rbac
+    user: rbac_user
+    password: rbac_password
+
+# -----------------------------------------------------------------------------
+# RBAC v1 Authorization Backend (insights-rbac)
+# -----------------------------------------------------------------------------
+# insights-rbac: RBAC v1 authorization backend for Koku.
+# Koku delegates all permission checks to this service via HTTP.
+# Deploys an API server (Gunicorn) and a Celery worker for async tasks.
+rbac:
+  image:
+    repository: quay.io/redhat-services-prod/hcc-accessmanagement-tenant/insights-rbac
+    tag: "b34eb9a"
+    pullPolicy: IfNotPresent
+
+  api:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  # Comma-separated list of role names that non-admin users may create.
+  # Maps to ROLE_CREATE_ALLOW_LIST env var on the RBAC API.
+  # Leave empty to use the upstream default (no custom role creation).
+  roleCreateAllowList: ""
+
+  worker:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 2Gi
+
+  # Bootstrap an initial admin user with Cost Administrator permissions.
+  # A post-install/post-upgrade hook Job creates the RBAC Tenant, Principal,
+  # Group, and Policy so the user can access the API immediately.
+  # All operations are idempotent (safe to leave enabled across upgrades).
+  #
+  # The bootstrap user identity (username, orgId, accountNumber) is derived
+  # from the first orgAdmin:true entry in jwtAuth.realmUsers — no need to
+  # duplicate credentials here. Enable this toggle after running deploy-rhbk.sh.
+  bootstrapAdmin:
+    enabled: false
+
+  # Keycloak-to-RBAC principal sync CronJob.
+  # Periodically fetches all users from a Keycloak realm and upserts
+  # corresponding RBAC Tenant/Principal/Group records so that API
+  # authorization stays in sync with the identity provider.
+  # Requires a dedicated Keycloak service-account client with realm-management
+  # view-users role (provisioned by deploy-rhbk.sh).
+  #
+  # RELATIONSHIP WITH bootstrapAdmin:
+  #   When keycloakSync is enabled, bootstrapAdmin.enabled should typically be
+  #   false. The sync CronJob creates the same Group/Policy/Principal objects.
+  #   If both are enabled, they coexist safely (idempotent get_or_create), but
+  #   the bootstrap admin principal may be pruned if that user does not exist
+  #   in Keycloak. Disable bootstrapAdmin once keycloakSync is managing users.
+  #
+  # MULTI-ORG SYNC VIA KEYCLOAK GROUPS:
+  #   The sync discovers organizations from Keycloak groups matching the
+  #   orgGroupPrefix (default: "org-"). Each group must have:
+  #     - Group attributes: org_id, account_number
+  #     - A sub-group named per orgAdminSubgroup (default: "org-admin")
+  #       whose members receive Cost Administrator permissions
+  #   Users are synced per-org: each group's members become RBAC Principals
+  #   under the corresponding tenant. deploy-rhbk.sh provisions these groups
+  #   automatically from jwtAuth.realmUsers.
+  #
+  # ADMIN SCOPING DEPENDENCY:
+  #   Multi-org admin scoping requires ENHANCED_ORG_ADMIN=False in
+  #   costManagement.api.env (the default). This forces Koku to call RBAC
+  #   for every request, so admin permissions come from per-org RBAC group
+  #   membership rather than the realm-global is_org_admin JWT flag.
+  #   The CronJob template validates this at render time.
+  #
+  # MONITORING (FedRAMP SI-4):
+  # The CronJob is a batch workload with no persistent metrics endpoint.
+  # Prometheus cannot scrape ephemeral job pods, and automountServiceAccountToken
+  # is disabled (security hardening), so the script cannot emit K8s Events.
+  # Sync failures are visible only through:
+  #   - Pod logs: "SYNC COMPLETE" or error messages
+  #   - kube-state-metrics: kube_job_status_failed (if kube-state-metrics is
+  #     deployed and Prometheus has access — not guaranteed in all clusters)
+  # Operators should configure log-based alerting on:
+  #   - Absence of "SYNC COMPLETE" log line within 2x the schedule interval
+  #   - "AUDIT action=skip_disabled" log lines (disabled user detected)
+  #
+  # FUTURE IMPROVEMENT: Replace the CronJob with a long-running controller
+  # (analogous to the SaaS BOP service) that exposes /metrics, /healthz, and
+  # emits Kubernetes Events for first-class observability.
+  #
+  # ACCESS FRESHNESS SLA (FedRAMP AC-2(4)): Keycloak user changes (creation,
+  # disablement, role revocation) propagate to RBAC within one schedule
+  # interval. For FedRAMP compliance, keep schedule <= 15 minutes.
+  #
+  # SECRET ROTATION:
+  #   If the Keycloak client secret is rotated, update the K8s secret
+  #   referenced by clientSecretRef. The next CronJob run will pick up the
+  #   new value automatically (env vars are read fresh per job execution).
+  #   Re-run deploy-rhbk.sh to regenerate and mirror the secret.
+  #
+  # TROUBLESHOOTING:
+  #   "Public tenant does not exist" -> RBAC migrations haven't run; the job
+  #     retries automatically (backoffLimit: 3).
+  #   "Failed to authenticate with Keycloak" -> Check KEYCLOAK_URL and client
+  #     secret. Verify the secret exists: oc get secret <clientSecretRef.name>
+  #   "User count drift" warning -> Users were added/removed during sync;
+  #     usually harmless, resolves on next run.
+  #   CronJob never starts -> Verify the K8s secret is in the release
+  #     namespace (not the Keycloak namespace). deploy-rhbk.sh mirrors it
+  #     automatically.
+  keycloakSync:
+    enabled: false
+    # Schedule interval. Maximum staleness for access data equals this value.
+    # FedRAMP AC-2(4) recommendation: do not exceed "*/15 * * * *".
+    schedule: "*/15 * * * *"
+    # Keycloak group name prefix for org discovery.
+    # Groups matching "{prefix}{orgId}" are treated as organizations.
+    orgGroupPrefix: "org-"
+    # Sub-group name under each org group whose members get admin access.
+    orgAdminSubgroup: "org-admin"
+    # Delete RBAC Principals that no longer exist in the org's Keycloak group.
+    pruneOrphans: true
+    # Keycloak service-account client for Admin API access.
+    clientId: "rbac-keycloak-sync"
+    # K8s Secret containing the Keycloak client secret.
+    # Required when keycloakSync is enabled — Helm render will fail if empty.
+    clientSecretRef:
+      name: ""
+      key: CLIENT_SECRET
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 250m
+        memory: 512Mi
+
 # -----------------------------------------------------------------------------
 # Shared Infrastructure - Kafka
 # -----------------------------------------------------------------------------
-# IMPORTANT: Kafka/Strimzi deployment is NOT managed by this Helm chart!
-# The install-helm-chart.sh script installs Strimzi operator and creates Kafka cluster separately
-# This section only contains connection settings
+# IMPORTANT: Kafka deployment is NOT managed by this Helm chart!
+# The deploy-kafka.sh script installs AMQ Streams operator and creates a KRaft Kafka cluster separately.
+# This section only contains connection settings.
 kafka:
   # Bootstrap servers for Kafka cluster
   # This is auto-configured by the install script based on the Kafka cluster it creates
   bootstrapServers: "cost-onprem-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
 
-  # Security protocol — only PLAINTEXT is currently supported.
-  # SASL/TLS support requires upstream application changes (see docs/operations/configuration.md).
+  # Security protocol for Kafka connections.
+  # Supported values: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
   securityProtocol: "PLAINTEXT"
+
+  # SASL authentication (optional — leave mechanism empty to disable)
+  sasl:
+    mechanism: ""              # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    existingSecret: ""         # K8s Secret with keys: username, password
+
+  # TLS configuration (optional)
+  tls:
+    enabled: false
+    caCertSecret: ""           # K8s Secret with key: ca.crt
 
 # -----------------------------------------------------------------------------
 # Shared Infrastructure - Cache (Valkey)
@@ -666,7 +830,7 @@ valkey:
   deploy: true
   image:
     repository: registry.redhat.io/rhel10/valkey-8
-    tag: "latest"
+    tag: "10.1"
     pullPolicy: IfNotPresent
 
   # Connection settings
@@ -682,9 +846,20 @@ valkey:
   # For password-protected Redis instances (e.g., ElastiCache, Redis Enterprise)
   auth:
     enabled: false
-    # Name of the Secret containing key: 'redis-password'
-    # Required when auth.enabled is true.
+    # Name of the Secret containing key 'redis-password' (required when auth.enabled is true).
+    # The Secret may also contain key 'redis-username' for Redis 6+ ACL authentication.
+    # When 'redis-username' is absent, the default Redis user is used.
     secretName: ""
+
+  # TLS configuration for external Redis/Valkey (only used when deploy is false)
+  # For TLS-encrypted Redis connections (e.g., ElastiCache in-transit encryption,
+  # Redis Enterprise TLS, Azure Cache for Redis)
+  tls:
+    enabled: false
+    # Name of the Secret containing key 'ca.crt' with the CA certificate.
+    # When set, certificate verification is enforced (ssl.CERT_REQUIRED).
+    # When empty, TLS is used but certificates are not verified (ssl.CERT_NONE).
+    caCertSecretName: ""
 
   # Persistence configuration for Celery chord callback reliability
   # Persistent storage is always enabled when deploying bundled Valkey.
@@ -754,6 +929,12 @@ objectStorage:
   # Override to AWS region (e.g., "us-east-1") if deploying to AWS S3
   s3:
     region: "onprem"
+    # S3 addressing style for bucket URL resolution:
+    #   "path"    - Path-style: endpoint/bucket (default, for on-prem S3-compatible backends)
+    #   "auto"    - SDK auto-detection: virtual-hosted when supported (recommended for AWS S3)
+    #   "virtual" - Virtual-hosted style: bucket.endpoint/object (AWS preferred, not supported by most on-prem backends)
+    # The install script sets this to "auto" for AWS S3 endpoints (*.amazonaws.com).
+    addressingStyle: "path"
 
 
 # -----------------------------------------------------------------------------
@@ -773,7 +954,12 @@ jwtAuth:
       tag: "2.6"
       pullPolicy: IfNotPresent
 
+    replicas: 2
     port: 9080
+
+    # Route-level timeouts for the ingress (file upload) endpoint.
+    ingressTimeout: "30s"
+    ingressPerTryTimeout: "10s"
     servicePort: 80  # Service port exposed to other components (nginx, etc.)
     adminPort: 9901
     logLevel: info
@@ -785,6 +971,39 @@ jwtAuth:
       requests:
         cpu: 100m
         memory: 128Mi
+
+  # Keycloak realm users provisioned by deploy-rhbk.sh -f <this-file>.
+  # Each entry defines a user in the Keycloak realm with Cost Management attributes.
+  #
+  # WARNING: Change default passwords before deploying to production.
+  # These are initial development/test defaults only. FedRAMP and production
+  # environments require passwords that meet organizational complexity policy.
+  #
+  # orgAdmin: true assigns the Keycloak "org-admin" realm role to the user.
+  # The Envoy gateway reads this role from the JWT (realm_access.roles) and sets
+  # is_org_admin=true in X-Rh-Identity, triggering insights-rbac's admin_default
+  # group (Cost Administrator = cost-management:*:*).
+  #
+  # Keycloak is the single source of truth — after initial provisioning, admin
+  # status can also be managed directly in the Keycloak admin console by
+  # assigning/removing the "org-admin" realm role.
+  realmUsers:
+    - username: admin
+      password: admin
+      email: admin@test.com
+      firstName: Admin
+      lastName: User
+      orgId: "org1234567"
+      accountNumber: "7890123"
+      orgAdmin: true
+    - username: viewer
+      password: viewer
+      email: viewer@test.com
+      firstName: Viewer
+      lastName: User
+      orgId: "org1234567"
+      accountNumber: "7890123"
+      orgAdmin: false
 
   # Keycloak configuration for JWT validation
   # Supported operator: Red Hat Build of Keycloak (RHBK) v22+ - k8s.keycloak.org/v2alpha1
@@ -803,7 +1022,7 @@ jwtAuth:
     # Keycloak realm name
     realm: kubernetes
 
-    # Client configuration (for reference - used by Cost Management Operator)
+    # Client configuration (for reference - used by Cost Management Metrics Operator)
     client:
       id: cost-management-operator
 
@@ -853,7 +1072,7 @@ ui:
   app:
     image:
       repository: quay.io/insights-onprem/koku-ui-onprem
-      tag: "latest"
+      tag: "a15e49551a33ed1718f1434c012cc38a2174fc64"
       pullPolicy: IfNotPresent
     port: 8080
     resources:
@@ -900,7 +1119,7 @@ resources:
       memory: "512Mi"
       cpu: "500m"
 
-  # Standard application services (ROS API, Processor, Poller, Housekeeper)
+  # Standard application services (ROS API, Ingress, Poller, Housekeeper)
   # Aligned with SaaS Clowder configuration (ros-ocp-backend/clowdapp.yaml)
   application:
     requests:
@@ -910,14 +1129,23 @@ resources:
       memory: "1Gi"
       cpu: "1"
 
-  # Kruize is memory-intensive (Java workload)
-  kruize:
+  # ROS Processor needs more memory than other application services.
+  rosProcessor:
     requests:
       memory: "1Gi"
       cpu: "500m"
     limits:
-      memory: "2Gi"
+      memory: "1Gi"
+      cpu: "1"
+
+  # Kruize is CPU-intensive under load (Java workload, liveness probe sensitive)
+  kruize:
+    requests:
+      memory: "1Gi"
       cpu: "1000m"
+    limits:
+      memory: "2Gi"
+      cpu: "2000m"
 
 
 # -----------------------------------------------------------------------------

@@ -18,7 +18,7 @@ Complete Helm chart for deploying the full Cost Management stack with OCP cost a
 
 **📖 Documentation:**
 - **[Cost Management Installation Guide](docs/operations/cost-management-installation.md)** - Complete deployment guide
-- **Prerequisites**: OpenShift 4.18+, S3-compatible object storage (ODF, AWS S3, or other), Kafka/Strimzi
+- **Prerequisites**: OpenShift 4.18+, S3-compatible object storage (ODF, AWS S3, or other), Kafka/AMQ Streams
 - **Architecture**: Single unified chart with all components
 - **E2E Testing**: Automated validation with `./scripts/run-pytest.sh` (pytest-based test suite)
 
@@ -105,8 +105,8 @@ cost-onprem-chart/
 - **S3-compatible object storage**: ODF, AWS S3, or other S3-compatible provider
 
 ### Kafka Infrastructure (Managed by Install Script)
-- **Strimzi Operator**: Deploys and manages Kafka clusters
-- **Kafka 3.8.0**: Message streaming with persistent storage (deployed via Strimzi CRDs)
+- **AMQ Streams Operator**: Deploys and manages Kafka clusters (Streams for Apache Kafka 3.1)
+- **Kafka 4.1.0**: Message streaming with persistent JBOD storage, KRaft mode (no ZooKeeper)
 
 ### Application Services
 - **API Gateway**: Centralized Envoy gateway for JWT authentication and API routing (port 9080)
@@ -180,7 +180,7 @@ JWT authentication is **automatically enabled** and requires Keycloak configurat
 # Step 1: Deploy Red Hat Build of Keycloak (RHBK)
 ./scripts/deploy-rhbk.sh
 
-# Step 2: Configure Cost Management Operator with JWT credentials
+# Step 2: Configure Cost Management Metrics Operator with JWT credentials
 ./scripts/setup-cost-mgmt-tls.sh
 
 # Step 3: Deploy Cost Management On-Premise
@@ -193,7 +193,7 @@ Key requirements:
 - ✅ Keycloak realm with `org_id` and `account_number` claims
 - ✅ Service account client credentials
 - ✅ Self-signed CA certificate bundle (auto-configured)
-- ✅ Cost Management Operator configured with JWT token URL
+- ✅ Cost Management Metrics Operator configured with JWT token URL
 
 **Operator Support:**
 - ✅ Red Hat Build of Keycloak (RHBK) v22+ - `k8s.keycloak.org/v2alpha1`

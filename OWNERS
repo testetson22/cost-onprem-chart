@@ -1,8 +1,17 @@
 approvers:
-  - jordigilh    # Jordi Gil <jgil@redhat.com>
-  - masayag      # Moti Asayag <masayag@redhat.com>
+  - chadcrum
+  - ELK4N4
+  - jordigilh
+  - lcouzens
+  - martinpovolny
+  - myersCody
+  - testetson22
 
 reviewers:
-  - jordigilh    # Jordi Gil <jgil@redhat.com>
-  - masayag      # Moti Asayag <masayag@redhat.com>
-
+  - chadcrum
+  - ELK4N4
+  - jordigilh
+  - lcouzens
+  - martinpovolny
+  - myersCody
+  - testetson22

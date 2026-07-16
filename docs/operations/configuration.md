@@ -7,6 +7,7 @@ Complete configuration reference for resource requirements, storage, and access 
 - [Storage Configuration](#storage-configuration)
 - [Access Points](#access-points)
 - [Configuration Values](#configuration-values)
+  - [RBAC Configuration](#rbac-configuration)
 - [Platform-Specific Configuration](#platform-specific-configuration)
 - [External Infrastructure (BYOI)](#external-infrastructure-byoi)
 - [Security Configuration](#security-configuration)
@@ -27,7 +28,7 @@ Complete configuration reference for resource requirements, storage, and access 
 | Service | CPU Request | CPU Limit |
 |---------|-------------|-----------|
 | PostgreSQL (3×) | 300m | 1500m |
-| Kafka + Zookeeper | 350m | 750m |
+| Kafka (KRaft) | 350m | 750m |
 | Kruize | 500m | 1000m |
 | Application Services | 800m | 1200m |
 | **Total** | **~2 cores** | **~4.5 cores** |
@@ -36,7 +37,7 @@ Complete configuration reference for resource requirements, storage, and access 
 | Service | Memory Request | Memory Limit |
 |---------|----------------|--------------|
 | PostgreSQL (3×) | 768MB | 1536MB |
-| Kafka + Zookeeper | 768MB | 1536MB |
+| Kafka (KRaft) | 768MB | 1536MB |
 | Kruize | 1GB | 2GB |
 | Application Services | 2GB | 3GB |
 | **Total** | **~4.5GB** | **~8GB** |
@@ -47,15 +48,15 @@ Complete configuration reference for resource requirements, storage, and access 
 | PostgreSQL ROS | 10GB | RWO | Main database |
 | PostgreSQL Kruize | 10GB | RWO | Kruize database |
 | PostgreSQL Koku | 10GB | RWO | Koku database (includes sources data) |
-| Kafka | 10GB | RWO | Message storage |
-| Zookeeper | 5GB | RWO | Coordination data |
+| Kafka Brokers | 10GB | RWO | Message storage |
+| Kafka Controllers | 5GB | RWO | KRaft metadata |
 | **Total** | **~45GB** | - | Production: 50GB+ |
 
 ---
 
 ## Namespace Requirements
 
-### Cost Management Operator Label
+### Cost Management Metrics Operator Label
 
 **REQUIRED**: The deployment namespace must be labeled for the Cost Management Metrics Operator to collect resource optimization data.
 
@@ -307,10 +308,11 @@ oc get route cost-onprem-ui -n cost-onprem         # UI (web interface)
 |-------|------|---------|---------|
 | `cost-onprem-main` | `/` | ROS API | ROS status and recommendations |
 | `cost-onprem-api` | `/api/cost-management` | Envoy → Koku API | Cost Management reports and Sources API (JWT validated) |
+| `cost-onprem-api` | `/api/rbac` | Envoy → RBAC API | IAM role/group management (JWT validated) |
 | `cost-onprem-ingress` | `/api/ingress` | Envoy → Ingress | File uploads (JWT validated) |
 | `cost-onprem-ui` | (default) | UI | Web interface (reencrypt TLS) |
 
-> **Note**: The `cost-onprem-api` and `cost-onprem-ingress` routes pass through the Envoy ingress proxy for JWT authentication. Sources API is accessible via `/api/cost-management/v1/sources/` through the `cost-onprem-api` route.
+> **Note**: The `cost-onprem-api` and `cost-onprem-ingress` routes pass through the Envoy ingress proxy for JWT authentication. Sources API is accessible via `/api/cost-management/v1/sources/` and RBAC management via `/api/rbac/v1/` through the `cost-onprem-api` route.
 
 **Access Pattern:**
 ```bash
@@ -521,7 +523,6 @@ ros:
     port: 8000
     metricsPort: 9000
     pathPrefix: /api
-    rbacEnable: false
     logLevel: INFO
   processor:
     metricsPort: 9000
@@ -583,6 +584,89 @@ ui:
         memory: "64Mi"
 ```
 
+### RBAC Configuration
+
+```yaml
+# insights-rbac: RBAC v1 authorization backend for Koku.
+# Koku delegates all permission checks to this service via HTTP.
+# Deploys an API server (Gunicorn) and a Celery worker for async tasks.
+rbac:
+  image:
+    repository: quay.io/cloudservices/rbac
+    tag: "c2b9ccf"
+    pullPolicy: IfNotPresent
+
+  # API server
+  api:
+    replicas: 1             # Increase for HA (recommended: 2+)
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  # Celery worker (async tasks)
+  worker:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 2Gi
+```
+
+> **Note**: RBAC environment variables (e.g. `PGSSLMODE`, `BYPASS_BOP_VERIFICATION`,
+> `ACCESS_CACHE_ENABLED`) are hardcoded in the `_helpers-rbac.tpl` commonEnv helper
+> and are not user-configurable via `values.yaml`. `PGSSLMODE` tracks
+> `database.server.sslMode` automatically.
+
+#### Koku RBAC Integration Variables
+
+These are set automatically by the Helm chart in `_helpers-koku.tpl`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RBAC_SERVICE_HOST` | `cost-onprem-rbac-api` | RBAC API service hostname |
+| `RBAC_SERVICE_PORT` | `8000` | RBAC API port |
+| `RBAC_SERVICE_PATH` | `/api/rbac/v1/` | RBAC API base path |
+| `RBAC_SERVICE_PROTOCOL` | `http` | Protocol (http/https) |
+| `ENHANCED_ORG_ADMIN` | `False` | **Must be False** — disables Koku's admin bypass so all auth flows through RBAC |
+
+> **Important**: `ENHANCED_ORG_ADMIN` must remain `False`. Setting it to `True` causes Koku to bypass RBAC entirely for users with `is_org_admin: true` in their identity header, which defeats the purpose of RBAC enforcement.
+
+#### ROS RBAC Integration Variables
+
+RBAC is **always enabled** on the ROS API — there is no `values.yaml` toggle. The following environment variables are hardcoded in the ROS API deployment template:
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `RBAC_ENABLE` | `true` (hardcoded) | Activates the RBAC middleware in the ROS Go backend |
+| `RBACHOST` | `<release>-rbac-api.<namespace>.svc.cluster.local` | RBAC API service hostname (from `cost-onprem.rbac.serviceHost` helper) |
+| `RBACPORT` | `8000` | RBAC API port (from `cost-onprem.rbac.service.port` helper) |
+| `RBACPROTOCOL` | `http` | Protocol for RBAC communication |
+
+The ROS API pod includes a `wait-for-rbac` init container that blocks startup until the RBAC service is accepting TCP connections, preventing authorization errors during the startup race.
+
+> **Note**: Unlike Koku (which uses `RBAC_SERVICE_*` prefixed variables), ROS uses uppercase unprefixed names (`RBACHOST`, `RBACPORT`, `RBACPROTOCOL`) due to how the Go Viper configuration library maps struct fields to environment variables via `AutomaticEnv()`.
+
+#### RBAC Internal Variables (set automatically)
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `V2_BOOTSTRAP_TENANT` | `True` | Enables TenantMapping creation for V1/V2 compatibility |
+| `SYSTEM_DEFAULT_ROOT_WORKSPACE_ROLE_UUID` | Placeholder UUID | Required by V2 bootstrap code path (Kessel) |
+| `SYSTEM_DEFAULT_TENANT_ROLE_UUID` | Placeholder UUID | Required by V2 bootstrap code path |
+| `SYSTEM_ADMIN_ROOT_WORKSPACE_ROLE_UUID` | Placeholder UUID | Required by V2 bootstrap code path |
+| `SYSTEM_ADMIN_TENANT_ROLE_UUID` | Placeholder UUID | Required by V2 bootstrap code path |
+
+These placeholder UUIDs are required to prevent `ValueError` during tenant bootstrap. They will be removable once the Kessel code path is gated in upstream `insights-rbac`.
+
+For detailed RBAC setup, user management, and troubleshooting, see the [RBAC Setup and Operations Guide](rbac-setup.md).
+
 ### Environment-Specific Values Files
 
 ```bash
@@ -629,13 +713,13 @@ global:
 
 ## External Infrastructure (BYOI)
 
-The chart bundles PostgreSQL, Valkey, and deploys Kafka via Strimzi for development and testing. For production deployments, you can **bring your own infrastructure** (BYOI) by connecting to externally-managed services instead.
+The chart bundles PostgreSQL, Valkey, and deploys Kafka via AMQ Streams for development and testing. For production deployments, you can **bring your own infrastructure** (BYOI) by connecting to externally-managed services instead.
 
 | Service | Bundled Default | External Examples | Config Key |
 |---------|----------------|-------------------|------------|
 | **PostgreSQL** | Single-replica StatefulSet | RDS, Crunchy, EDB, Azure DB | `database.deploy: false` |
 | **Valkey/Redis** | Single-replica Deployment | ElastiCache, Redis Enterprise, Azure Cache | `valkey.deploy: false` |
-| **Kafka** | Strimzi (via install script) | AMQ Streams, MSK, Confluent | `kafka.bootstrapServers` |
+| **Kafka** | AMQ Streams (via install script) | MSK, Confluent, other Kafka providers | `kafka.bootstrapServers` |
 | **Keycloak** | RHBK (via deploy-rhbk.sh) | Customer-managed Keycloak | `jwtAuth.keycloak.url` |
 
 ---
@@ -744,47 +828,152 @@ Use an existing Redis-compatible cache instead of the bundled Valkey Deployment.
 
 1. A Redis 7+ or Valkey 8+ instance accessible from the OpenShift cluster
 2. (Optional) Authentication credentials if the instance is password-protected
+3. (Optional) TLS certificate if the instance uses encrypted connections
+
+**Required Redis configuration:**
+- `maxmemory-policy`: `allkeys-lru` (recommended) — Koku uses Redis for caching and as a Celery broker; LRU eviction prevents OOM
+- Persistence: Recommended for Celery result backend reliability (RDB snapshots or AOF), but not strictly required
+- Redis 7+ or Valkey 8+ for compatibility with the redis-py client
 
 **Configuration:**
 
 ```yaml
-# values.yaml
+# values.yaml — Basic external Redis with password auth
 valkey:
   deploy: false
   host: "my-redis.example.com"
   port: 6379
   auth:
     enabled: true
-    secretName: "my-redis-credentials"  # Secret with key: redis-password
+    secretName: "my-redis-credentials"  # Secret with keys: redis-password, redis-username (optional)
+```
+
+```yaml
+# values.yaml — External Redis with password auth + TLS
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6380
+  auth:
+    enabled: true
+    secretName: "my-redis-credentials"  # Secret with keys: redis-password, redis-username (optional)
+  tls:
+    enabled: true
+    caCertSecretName: "my-redis-ca"     # Secret with key: ca.crt
+```
+
+```yaml
+# values.yaml — External Redis with TLS only (no password)
+valkey:
+  deploy: false
+  host: "my-redis.example.com"
+  port: 6380
+  tls:
+    enabled: true
+    caCertSecretName: ""  # Empty = TLS without certificate verification
 ```
 
 When `valkey.deploy: false`:
 - The chart skips the Valkey Deployment, Service, and PVC
 - Koku and Celery components connect to the external Redis host
-- If `auth.enabled`, a `REDIS_PASSWORD` environment variable is injected into all consumers (requires `auth.secretName`)
+- If `auth.enabled`, `REDIS_PASSWORD` (and optionally `REDIS_USERNAME`) environment variables are injected into all consumers (requires `auth.secretName`)
+- If `tls.enabled`, `REDIS_SSL=True` is set and the connection uses `rediss://` scheme
+- If `tls.caCertSecretName` is provided, the CA certificate is mounted at `/etc/redis-tls/ca.crt` and certificate verification is enforced (`ssl.CERT_REQUIRED`); without it, TLS is used but certificates are not verified (`ssl.CERT_NONE`)
+
+**Creating the auth Secret:**
+
+```bash
+# Password only (default Redis user):
+kubectl create secret generic my-redis-credentials \
+  --from-literal=redis-password='YOUR_REDIS_PASSWORD' \
+  -n cost-onprem
+
+# Password + username (Redis 6+ ACL authentication):
+kubectl create secret generic my-redis-credentials \
+  --from-literal=redis-password='YOUR_REDIS_PASSWORD' \
+  --from-literal=redis-username='YOUR_REDIS_USERNAME' \
+  -n cost-onprem
+```
+
+**Creating the TLS CA cert Secret:**
+
+```bash
+kubectl create secret generic my-redis-ca \
+  --from-file=ca.crt=/path/to/redis-ca.crt \
+  -n cost-onprem
+```
 
 **Consumers:** Koku API, MASU, Kafka Listener, Migration Job, Celery Beat, and all Celery Workers. ROS components do not use Valkey.
 
 ---
 
-### External Kafka
+### Kafka Infrastructure Requirements
 
-Use an existing Kafka cluster instead of the Strimzi-managed Kafka deployed by the install script.
+Cost Management On-Premise uses Apache Kafka for its data pipeline. Kafka can be deployed automatically by the bundled `deploy-kafka.sh` script (via AMQ Streams) or managed externally by the cluster administrator.
 
-> **Known Limitation:** Only **PLAINTEXT** Kafka connections are currently supported. Both Koku and ROS backends do not read SASL/TLS configuration from environment variables in on-prem (non-Clowder) mode. Upstream application changes are required before chart-level SASL/TLS support can be added.
+#### What the bundled deployment provides
+
+When you run `./scripts/deploy-kafka.sh`, the script installs AMQ Streams (Streams for Apache Kafka) 3.1 via OLM and creates a KRaft-based Kafka cluster with the following characteristics:
+
+| Property | Development (`dev`) | Production (`ocp`) |
+|----------|--------------------|--------------------|
+| Kafka version | 4.1.0 | 4.1.0 |
+| Cluster mode | KRaft (no ZooKeeper) | KRaft (no ZooKeeper) |
+| Broker nodes | 1 | 3 |
+| Controller nodes | 1 | 3 |
+| Broker storage | 10 Gi persistent (JBOD) | 100 Gi persistent (JBOD) |
+| Controller storage | 5 Gi persistent (JBOD) | 20 Gi persistent (JBOD) |
+| Listeners | PLAINTEXT (9092) | PLAINTEXT (9092) + TLS (9093) |
+| Replication factor | 1 | 3 |
+| Min in-sync replicas | 1 | 2 |
+| Log retention | 7 days | 7 days |
+
+#### Required Kafka topics
+
+The following topics must exist before the application starts processing data. The bundled script creates them automatically. If you manage Kafka externally, create them manually or enable `auto.create.topics.enable`.
+
+| Topic | Partitions | Purpose | Producers | Consumers |
+|-------|------------|---------|-----------|-----------|
+| `platform.upload.announce` | 3 | Upload announcements for cost reports | Ingress | Koku Listener |
+| `platform.payload-status` | 3 | Payload processing status tracking | Ingress | Koku Listener |
+| `hccm.ros.events` | 3 | Resource optimization events | Koku (MASU) | ROS Processor |
+| `platform.sources.event-stream` | 3 | Source configuration events | Sources API | Koku Listener |
+| `rosocp.kruize.recommendations` | 3 | Kruize optimization recommendations | Kruize | ROS Recommendation Poller |
+
+**Recommended topic settings:**
+- **Replication factor**: Match your broker count (3 for production)
+- **Retention**: At least 7 days (`retention.ms: 604800000`)
+- **Segment rotation**: 1 day (`segment.ms: 86400000`)
+
+#### Kafka connection settings
+
+The Helm chart does **not** deploy Kafka — it only configures applications to connect to it. Connection settings are in `values.yaml`:
+
+```yaml
+kafka:
+  bootstrapServers: "cost-onprem-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  securityProtocol: "PLAINTEXT"
+```
+
+The `install-helm-chart.sh` script auto-detects the bootstrap address from the deployed Kafka cluster. To override (e.g., for an external cluster):
+
+```bash
+KAFKA_BOOTSTRAP_SERVERS="my-kafka-broker1:9092" ./scripts/install-helm-chart.sh
+```
+
+Or set it in your values file directly.
+
+#### External Kafka
+
+Use an existing Kafka cluster instead of the bundled AMQ Streams deployment.
 
 **Prerequisites:**
 
-1. A Kafka 3.x+ cluster accessible from the OpenShift cluster with **PLAINTEXT** listeners
-2. The following topics must exist (or auto-creation must be enabled):
+1. Apache Kafka 3.x or later accessible from the OpenShift cluster
+2. All five topics listed above must exist (or `auto.create.topics.enable` must be set to `true`)
+3. Bootstrap servers reachable from the `cost-onprem` namespace over the network
 
-| Topic | Purpose |
-|-------|---------|
-| `platform.upload.announce` | Upload announcements (Ingress -> Koku Listener) |
-| `hccm.ros.events` | ROS events (ROS Processor) |
-| `rosocp.kruize.recommendations` | Kruize recommendations (ROS Recommendation Poller) |
-
-**Configuration:**
+**Configuration (PLAINTEXT):**
 
 ```yaml
 # values.yaml
@@ -793,13 +982,65 @@ kafka:
   securityProtocol: "PLAINTEXT"
 ```
 
-**Install script behavior:** When running `install-helm-chart.sh`, set `KAFKA_BOOTSTRAP_SERVERS` to skip Strimzi verification:
+**Configuration (SASL/TLS):**
+
+For authenticated connections (SASL_SSL, SASL_PLAINTEXT), provide credentials via a
+Kubernetes Secret and optionally a CA certificate Secret:
+
+```bash
+# Create the SASL credentials Secret
+kubectl create secret generic kafka-sasl-credentials \
+  --from-literal=username=my-kafka-user \
+  --from-literal=password=my-kafka-password \
+  -n cost-onprem
+
+# (Optional) Create the TLS CA certificate Secret
+kubectl create secret generic kafka-ca-cert \
+  --from-file=ca.crt=/path/to/ca-certificate.pem \
+  -n cost-onprem
+```
+
+```yaml
+# values.yaml
+kafka:
+  bootstrapServers: "my-kafka-broker1:9093,my-kafka-broker2:9093"
+  securityProtocol: "SASL_SSL"
+
+  sasl:
+    mechanism: "SCRAM-SHA-512"       # PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512
+    existingSecret: "kafka-sasl-credentials"  # Secret with keys: username, password
+
+  tls:
+    enabled: true
+    caCertSecret: "kafka-ca-cert"    # Secret with key: ca.crt
+```
+
+| Value | Description | Required |
+|-------|-------------|----------|
+| `kafka.securityProtocol` | `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, or `SASL_SSL` | Yes |
+| `kafka.sasl.mechanism` | SASL mechanism (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) | Only for SASL |
+| `kafka.sasl.existingSecret` | Name of a Secret containing `username` and `password` keys | Only for SASL |
+| `kafka.tls.enabled` | Mount the CA certificate into pods | Only for TLS |
+| `kafka.tls.caCertSecret` | Name of a Secret containing a `ca.crt` key | Only for TLS |
+
+**Install script behavior:** Setting `KAFKA_BOOTSTRAP_SERVERS` tells the install script to skip AMQ Streams operator verification:
 
 ```bash
 KAFKA_BOOTSTRAP_SERVERS="my-kafka-broker1:9092" ./scripts/install-helm-chart.sh --namespace cost-onprem
 ```
 
-**Consumers:** Ingress (producer), Koku Listener (consumer), ROS Processor (consumer), ROS Recommendation Poller (consumer), ROS Housekeeper, ROS API.
+**Components that use Kafka:**
+
+| Component | Role | Topics used |
+|-----------|------|-------------|
+| Ingress | Producer | `platform.upload.announce`, `platform.payload-status` |
+| Koku Listener | Consumer | `platform.upload.announce`, `platform.payload-status`, `platform.sources.event-stream` |
+| Koku (MASU) | Producer | `hccm.ros.events` |
+| ROS Processor | Consumer | `hccm.ros.events` |
+| ROS Recommendation Poller | Consumer | `rosocp.kruize.recommendations` |
+| ROS Housekeeper | Consumer | `hccm.ros.events` |
+| ROS API | Consumer | (reads consumer group offsets) |
+| Kruize | Producer | `rosocp.kruize.recommendations` |
 
 ---
 

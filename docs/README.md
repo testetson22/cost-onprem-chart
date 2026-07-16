@@ -12,8 +12,24 @@ docs/
 ├── operations/       # Installation, configuration, troubleshooting
 ├── api/             # Authentication, authorization, API guides
 ├── development/     # Testing, validation, development resources
+├── performance/     # Performance testing, sizing, findings
 └── README.md        # This file - documentation index and navigation
 ```
+
+## 📊 Diagrams
+
+Visual overviews of the system architecture, data flows, and key transitions.
+
+| Diagram | Purpose |
+|---------|---------|
+| **[Architecture Overview](cost-onprem-architecture-diagram.svg)** | Component layout of the on-prem deployment |
+| **[SaaS to On-Prem Transition](saas-to-onprem-transition-diagram.svg)** | What changes between SaaS and on-prem |
+| **[Data Processing Flow](data-processing-flow.svg)** | End-to-end data pipeline from operator upload to cost insights |
+| **[Gateway Routing](gateway-routing-diagram.svg)** | Envoy gateway route configuration and request flow |
+| **[UI Login Flow](ui-login-flow.svg)** | OAuth/Keycloak authentication sequence for the UI |
+> **Tip:** These SVGs are also embedded inline in the relevant documentation pages listed below.
+
+---
 
 ## 📚 Documentation Index
 
@@ -52,7 +68,7 @@ Deployment, configuration, maintenance, and troubleshooting.
 | **[Resource Requirements](operations/resource-requirements.md)** | Hardware and resource sizing guidance |
 | **[Worker Deployment Scenarios](operations/worker-deployment-scenarios.md)** | Different worker deployment configurations |
 | **[TLS Certificate Options](operations/tls-certificate-options.md)** | Guide to different TLS certificate configuration scenarios |
-| **[Cost Management Operator TLS Config](operations/cost-management-operator-tls-config-setup.md)** | TLS configuration for the Cost Management Metrics Operator |
+| **[Cost Management Metrics Operator TLS Config](operations/cost-management-operator-tls-config-setup.md)** | TLS configuration for the Cost Management Metrics Operator |
 | **[Force Operator Upload](operations/force-operator-upload.md)** | Guide for manually triggering metrics upload for testing |
 | **[Upload Verification Checklist](operations/cost-management-operator-upload-verification-checklist.md)** | Step-by-step checklist to verify operator metrics upload |
 | **[Troubleshooting Guide](operations/troubleshooting.md)** | Common issues and their solutions |
@@ -73,6 +89,17 @@ Testing guides, validation procedures, and development resources.
 |----------|---------|
 | **[OCP Dev Setup with S4](development/ocp-dev-setup-s4.md)** | Set up a dev environment on OCP using S4 instead of ODF |
 | **[UI OAuth Testing](development/ui-oauth-testing.md)** | Guide for testing UI OAuth flow with Keycloak |
+
+### 📊 Performance
+Performance testing, sizing recommendations, and findings (FLPATH-4036 / COST-7567).
+
+| Document | Purpose |
+|----------|---------|
+| **[Performance Testing Plan](performance/performance-testing-plan.md)** | Strategy, success criteria, and execution status |
+| **[Test Matrix](performance/TEST-MATRIX.md)** | Complete test matrix with all permutations and parameters |
+| **[Sizing Guide](performance/sizing-guide.md)** | Validated resource recommendations by deployment scale |
+| **[Findings](performance/FINDINGS.md)** | Product issues discovered during testing with Jira-ready summaries |
+| **[Observability](performance/OBSERVABILITY.md)** | Metrics collection, S3 archival, and report generation |
 
 ---
 
@@ -99,8 +126,8 @@ Testing guides, validation procedures, and development resources.
 4. Use **[TLS Certificate Options](operations/tls-certificate-options.md)** for TLS configuration
 5. Reference **[External Keycloak Scenario](architecture/external-keycloak-scenario.md)** if using external Keycloak
 
-### "I'm setting up the Cost Management Operator"
-1. Follow **[Cost Management Operator TLS Config Setup](operations/cost-management-operator-tls-config-setup.md)**
+### "I'm setting up the Cost Management Metrics Operator"
+1. Follow **[Cost Management Metrics Operator TLS Config Setup](operations/cost-management-operator-tls-config-setup.md)**
 2. Use **[Force Operator Upload](operations/force-operator-upload.md)** to test the upload pipeline
 3. Verify with **[Upload Verification Checklist](operations/cost-management-operator-upload-verification-checklist.md)**
 
@@ -129,6 +156,7 @@ For detailed information about each document's purpose, use cases, and key topic
 - **[operations/](operations/)** - Installation, configuration, deployment, and operational guides
 - **[api/](api/)** - Authentication, authorization, and API integration documentation
 - **[development/](development/)** - Testing, validation, and development resources
+- **[performance/](performance/)** - Performance testing, sizing recommendations, and findings
 
 ---
 
@@ -170,7 +198,7 @@ All documents are maintained and updated regularly. If you find outdated informa
 
 ---
 
-**Last Updated:** 2026-01-29
-**Helm Chart Version:** 0.1.5+
-**Documentation Structure:** Reorganized into architecture/, operations/, api/, and development/ categories (TASK-014)
+**Last Updated:** 2026-06-25
+**Helm Chart Version:** 0.2.20+
+**Documentation Structure:** Reorganized into architecture/, operations/, api/, development/, and performance/ categories
 

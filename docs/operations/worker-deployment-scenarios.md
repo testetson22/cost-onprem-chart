@@ -96,12 +96,12 @@ This document details the worker requirements and resource consumption for diffe
 
 ```
 OCP-Only:
-  Cost Management Operator → Kafka → ocp workers → summary → cost-model → Database
+  Cost Management Metrics Operator → Kafka → ocp workers → summary → cost-model → Database
 
 OCP-on-Cloud:
-  Cost Management Operator → Kafka → ocp workers ─┐
-                                                  ├→ refresh (correlate) → summary → cost-model → Database
-  Cloud Provider S3/Blob → download workers ──────┘
+  Cost Management Metrics Operator → Kafka → ocp workers ─┐
+                                                          ├→ refresh (correlate) → summary → cost-model → Database
+  Cloud Provider S3/Blob → download workers ──────────────┘
 ```
 
 ---
@@ -193,7 +193,7 @@ Infrastructure (PostgreSQL, Valkey) and support services (gateway, ingress, UI) 
 | **OCP-Only** | ~4.15 cores / ~10.5 Gi | ~1.0 cores / ~1.9 Gi | **~5.2 cores / ~12.4 Gi** |
 | **OCP on Cloud** | ~4.55 cores / ~11.6 Gi | ~1.0 cores / ~1.9 Gi | **~5.6 cores / ~13.5 Gi** |
 
-> **Note**: These totals exclude Kafka (Strimzi), which adds ~3.2 cores / ~7 Gi if deployed alongside.
+> **Note**: These totals exclude Kafka (AMQ Streams), which adds ~3.2 cores / ~7 Gi if deployed alongside.
 
 ---
 

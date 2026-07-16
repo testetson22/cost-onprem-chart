@@ -10,13 +10,14 @@ These tests validate the S3 storage infrastructure required for Cost Management:
 Source Reference: scripts/e2e_validator/phases/preflight.py
 """
 
+import logging
 import os
 import subprocess
 from typing import Optional
 
 import pytest
 
-from utils import get_pod_by_label, get_secret_value
+from utils import get_pod_by_label, get_secret_value, run_oc_command
 
 
 # =============================================================================
@@ -132,10 +133,10 @@ def check_bucket_exists_via_pod(
         Dict with exists status and details
     """
     # Use Python/boto3 since AWS CLI may not be available
+    # boto3 reads addressing_style/signature_version from the pod's AWS_CONFIG_FILE
     python_script = f'''
 import boto3
 import os
-from botocore.config import Config
 
 try:
     s3 = boto3.client(
@@ -144,7 +145,6 @@ try:
         aws_access_key_id=os.environ.get("S3_ACCESS_KEY", os.environ.get("AWS_ACCESS_KEY_ID", "")),
         aws_secret_access_key=os.environ.get("S3_SECRET_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "")),
         verify=False,
-        config=Config(signature_version="s3v4", s3={{"addressing_style": "path"}}),
     )
     s3.head_bucket(Bucket="{bucket}")
     print("EXISTS:TRUE:ACCESSIBLE:TRUE")
@@ -159,7 +159,7 @@ except Exception as e:
     else:
         print(f"EXISTS:FALSE:ERROR:{{err}}")
 '''
-    
+
     try:
         result = subprocess.run(
             [
@@ -204,11 +204,10 @@ def check_s3_connectivity_via_pod(
     Returns:
         Dict with connectivity status
     """
-    # Use Python/boto3 since AWS CLI may not be available
+    # boto3 reads addressing_style/signature_version from the pod's AWS_CONFIG_FILE
     python_script = f'''
 import boto3
 import os
-from botocore.config import Config
 
 try:
     s3 = boto3.client(
@@ -217,7 +216,6 @@ try:
         aws_access_key_id=os.environ.get("S3_ACCESS_KEY", os.environ.get("AWS_ACCESS_KEY_ID", "")),
         aws_secret_access_key=os.environ.get("S3_SECRET_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "")),
         verify=False,
-        config=Config(signature_version="s3v4", s3={{"addressing_style": "path"}}),
     )
     response = s3.list_buckets()
     bucket_count = len(response.get("Buckets", []))
@@ -225,7 +223,7 @@ try:
 except Exception as e:
     print(f"CONNECTED:FALSE:ERROR:{{str(e)}}")
 '''
-    
+
     try:
         result = subprocess.run(
             [
@@ -323,82 +321,119 @@ class TestS3Connectivity:
         )
 
 
+def _resolve_bucket_name(
+    namespace: str,
+    release_name: str,
+    deployment_suffix: str,
+    env_var_name: str,
+    default: str,
+) -> str:
+    log = logging.getLogger(__name__)
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "get", "deployment",
+                f"{release_name}-{deployment_suffix}",
+                "-n", namespace,
+                "-o", f"jsonpath={{.spec.template.spec.containers[*].env[?(@.name=='{env_var_name}')].value}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()[0]
+        if result.returncode != 0:
+            log.warning(
+                "Failed to resolve %s from %s (rc=%d): %s",
+                env_var_name, deployment_suffix, result.returncode, result.stderr.strip(),
+            )
+    except Exception as exc:
+        log.warning("Failed to resolve %s from %s: %s", env_var_name, deployment_suffix, exc)
+    return default
+
+
 @pytest.mark.infrastructure
 @pytest.mark.integration
 class TestS3Buckets:
     """Tests for required S3 buckets."""
-    
-    REQUIRED_BUCKETS = [
-        "koku-bucket",  # Main cost data bucket
-    ]
-    
-    OPTIONAL_BUCKETS = [
-        "ros-data",     # ROS data bucket (may not exist in all deployments)
-    ]
-    
-    @pytest.mark.parametrize("bucket", REQUIRED_BUCKETS)
-    def test_required_bucket_exists(self, cluster_config, bucket: str):
-        """Verify required S3 bucket exists and is accessible."""
+
+    def test_required_bucket_exists(self, cluster_config):
+        """Verify the koku storage bucket exists and is accessible."""
         masu_pod = get_pod_by_label(
             cluster_config.namespace,
             "app.kubernetes.io/component=cost-processor"
         )
-        
+
         if not masu_pod:
             pytest.skip("MASU/cost-processor pod not found for bucket check")
-        
+
         endpoint = get_s3_endpoint_from_cluster(cluster_config.namespace)
         if not endpoint:
             pytest.skip("S3 endpoint not discoverable")
-        
+
+        bucket = _resolve_bucket_name(
+            cluster_config.namespace,
+            cluster_config.helm_release_name,
+            "koku-api",
+            "REQUESTED_BUCKET",
+            "koku-bucket",
+        )
+
         status = check_bucket_exists_via_pod(
             cluster_config.namespace,
             masu_pod,
             bucket,
             endpoint,
         )
-        
+
         if status.get("error") == "timeout":
             pytest.skip(f"Bucket check timed out for '{bucket}'")
-        
+
         assert status.get("exists"), (
             f"Required bucket '{bucket}' not found: {status.get('error', 'unknown')}"
         )
-        
+
         if not status.get("accessible"):
             pytest.fail(
                 f"Bucket '{bucket}' exists but is not accessible: {status.get('error')}"
             )
-    
-    @pytest.mark.parametrize("bucket", OPTIONAL_BUCKETS)
-    def test_optional_bucket_exists(self, cluster_config, bucket: str):
-        """Check if optional S3 bucket exists (informational)."""
+
+    def test_optional_bucket_exists(self, cluster_config):
+        """Check if the ROS data bucket exists (informational)."""
         masu_pod = get_pod_by_label(
             cluster_config.namespace,
             "app.kubernetes.io/component=cost-processor"
         )
-        
+
         if not masu_pod:
             pytest.skip("MASU/cost-processor pod not found for bucket check")
-        
+
         endpoint = get_s3_endpoint_from_cluster(cluster_config.namespace)
         if not endpoint:
             pytest.skip("S3 endpoint not discoverable")
-        
+
+        bucket = _resolve_bucket_name(
+            cluster_config.namespace,
+            cluster_config.helm_release_name,
+            "koku-api",
+            "REQUESTED_ROS_BUCKET",
+            "ros-data",
+        )
+
         status = check_bucket_exists_via_pod(
             cluster_config.namespace,
             masu_pod,
             bucket,
             endpoint,
         )
-        
+
         if not status.get("exists"):
             pytest.skip(
                 f"Optional bucket '{bucket}' not found (this may be expected): "
                 f"{status.get('error', 'unknown')}"
             )
-        
-        # If we get here, bucket exists
+
         assert status.get("accessible", True), (
             f"Optional bucket '{bucket}' exists but is not accessible"
         )
@@ -410,24 +445,31 @@ class TestS3DataPaths:
     """Tests for S3 data path structure."""
     
     def test_can_list_bucket_contents(self, cluster_config):
-        """Verify we can list contents of the koku-bucket."""
+        """Verify we can list contents of the koku storage bucket."""
         masu_pod = get_pod_by_label(
             cluster_config.namespace,
             "app.kubernetes.io/component=cost-processor"
         )
-        
+
         if not masu_pod:
             pytest.skip("MASU/cost-processor pod not found")
-        
+
         endpoint = get_s3_endpoint_from_cluster(cluster_config.namespace)
         if not endpoint:
             pytest.skip("S3 endpoint not discoverable")
-        
-        # Use Python/boto3 since AWS CLI may not be available
+
+        bucket = _resolve_bucket_name(
+            cluster_config.namespace,
+            cluster_config.helm_release_name,
+            "koku-api",
+            "REQUESTED_BUCKET",
+            "koku-bucket",
+        )
+
+        # boto3 reads addressing_style/signature_version from the pod's AWS_CONFIG_FILE
         python_script = f'''
 import boto3
 import os
-from botocore.config import Config
 
 try:
     s3 = boto3.client(
@@ -436,9 +478,8 @@ try:
         aws_access_key_id=os.environ.get("S3_ACCESS_KEY", os.environ.get("AWS_ACCESS_KEY_ID", "")),
         aws_secret_access_key=os.environ.get("S3_SECRET_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "")),
         verify=False,
-        config=Config(signature_version="s3v4", s3={{"addressing_style": "path"}}),
     )
-    response = s3.list_objects_v2(Bucket="koku-bucket", MaxKeys=10)
+    response = s3.list_objects_v2(Bucket="{bucket}", MaxKeys=10)
     count = response.get("KeyCount", 0)
     print(f"SUCCESS:OBJECTS:{{count}}")
 except Exception as e:
@@ -448,7 +489,7 @@ except Exception as e:
     else:
         print(f"ERROR:{{err}}")
 '''
-        
+
         try:
             result = subprocess.run(
                 [
@@ -461,11 +502,108 @@ except Exception as e:
                 text=True,
                 timeout=60,
             )
-            
+
             output = result.stdout.strip()
-            # Success even if empty (0 objects)
             assert "SUCCESS" in output or "NoSuchBucket" not in output, (
-                f"Cannot list koku-bucket contents: {output or result.stderr}"
+                f"Cannot list bucket '{bucket}' contents: {output or result.stderr}"
             )
         except subprocess.TimeoutExpired:
             pytest.skip("S3 list operation timed out")
+
+
+# =============================================================================
+# Deployed S3 Configuration Validation
+# =============================================================================
+
+
+@pytest.mark.infrastructure
+@pytest.mark.component
+class TestS3DeployedConfig:
+    """Validate that the deployed aws-config ConfigMap is consistent with the S3 backend.
+
+    These tests read the deployed ConfigMap (no boto3, no pod exec) and validate
+    configuration correctness. They run on ALL backends — S4, ODF, and AWS — so
+    they provide value even without an AWS deployment.
+    """
+
+    def _get_config_text(self, cluster_config):
+        result = run_oc_command([
+            "get", "configmap",
+            f"{cluster_config.helm_release_name}-aws-config",
+            "-n", cluster_config.namespace,
+            "-o", "jsonpath={.data.config}",
+        ], check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            pytest.skip("aws-config ConfigMap not found")
+        return result.stdout.strip()
+
+    def _parse_value(self, config_text, key):
+        for line in config_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(key):
+                return stripped.split("=", 1)[1].strip()
+        return None
+
+    def _get_endpoint(self, cluster_config):
+        result = run_oc_command([
+            "get", "deployment",
+            f"{cluster_config.helm_release_name}-koku-api",
+            "-n", cluster_config.namespace,
+            "-o", "jsonpath={.spec.template.spec.containers[*].env[?(@.name=='S3_ENDPOINT')].value}",
+        ], check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()[0]
+        return None
+
+    def test_aws_config_exists(self, cluster_config):
+        """Verify aws-config ConfigMap exists and has required keys."""
+        config_text = self._get_config_text(cluster_config)
+        assert self._parse_value(config_text, "region"), "region not found in ConfigMap"
+        assert self._parse_value(config_text, "signature_version"), "signature_version not found"
+        assert self._parse_value(config_text, "addressing_style"), "addressing_style not found"
+
+    def test_signature_version_is_s3v4(self, cluster_config):
+        """Verify signature_version is always s3v4."""
+        config_text = self._get_config_text(cluster_config)
+        assert self._parse_value(config_text, "signature_version") == "s3v4"
+
+    def test_addressing_style_valid(self, cluster_config):
+        """Verify addressing_style is a recognized value."""
+        config_text = self._get_config_text(cluster_config)
+        style = self._parse_value(config_text, "addressing_style")
+        assert style in ("path", "auto", "virtual"), (
+            f"Unexpected addressing_style '{style}'"
+        )
+
+    def test_addressing_style_matches_backend(self, cluster_config):
+        """Verify addressing_style is 'auto' for AWS S3, 'path' for on-prem."""
+        config_text = self._get_config_text(cluster_config)
+        style = self._parse_value(config_text, "addressing_style")
+        endpoint = self._get_endpoint(cluster_config)
+
+        if not endpoint:
+            pytest.skip("S3_ENDPOINT not found in deployment")
+
+        if ".amazonaws.com" in endpoint:
+            assert style == "auto", (
+                f"AWS S3 endpoint ({endpoint}) requires addressing_style='auto', "
+                f"got '{style}'. Virtual-hosted-style is required for AWS S3."
+            )
+        else:
+            assert style in ("path", "auto"), (
+                f"On-prem endpoint ({endpoint}) has unexpected "
+                f"addressing_style='{style}'"
+            )
+
+    def test_region_not_default_on_aws(self, cluster_config):
+        """Verify region is not 'onprem' when using AWS S3."""
+        endpoint = self._get_endpoint(cluster_config)
+        if not endpoint or ".amazonaws.com" not in endpoint:
+            pytest.skip("Not an AWS S3 deployment")
+
+        config_text = self._get_config_text(cluster_config)
+        region = self._parse_value(config_text, "region")
+        assert region != "onprem", (
+            f"AWS S3 endpoint ({endpoint}) but region is still 'onprem'. "
+            f"Set objectStorage.s3.region to the correct AWS region."
+        )

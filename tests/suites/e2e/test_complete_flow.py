@@ -333,9 +333,8 @@ class TestCompleteDataFlow:
 
     @pytest.fixture(scope="class")
     def e2e_cluster_id(self) -> str:
-        """Generate a unique cluster ID for this E2E test run."""
         import uuid
-        return f"e2e-pytest-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        return str(uuid.uuid4())
 
     @pytest.fixture(scope="class")
     def e2e_test_data(self, e2e_cluster_id: str) -> dict:
@@ -463,6 +462,7 @@ class TestCompleteDataFlow:
                 "secret_key": s3_config.secret_key,
                 "bucket": s3_config.bucket,
                 "verify_ssl": s3_config.verify_ssl,
+                "addressing_style": s3_config.addressing_style,
             }
         
         # Pre-test cleanup
@@ -1359,31 +1359,20 @@ class TestCompleteDataFlow:
         self,
         gateway_url: str,
         keycloak_config,
+        cluster_config,
         http_session: requests.Session,
     ):
         """Step 9: Verify recommendations are accessible via JWT-authenticated API."""
-        # Get a fresh JWT token (the session-scoped one may have expired)
-        from datetime import datetime, timedelta, timezone
+        from conftest import obtain_user_jwt_token
 
-        token_response = http_session.post(
-            keycloak_config.token_url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": keycloak_config.client_id,
-                "client_secret": keycloak_config.client_secret,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
-        )
-
-        if token_response.status_code != 200:
-            pytest.skip(f"Could not refresh JWT token: {token_response.status_code}")
-
-        fresh_token = token_response.json().get("access_token")
+        try:
+            token = obtain_user_jwt_token(keycloak_config, cluster_config)
+        except Exception as exc:
+            pytest.skip(f"Could not obtain user JWT token: {exc}")
 
         response = http_session.get(
             f"{gateway_url}/cost-management/v1/recommendations/openshift",
-            headers={"Authorization": f"Bearer {fresh_token}"},
+            headers={"Authorization": f"Bearer {token.access_token}"},
             timeout=30,
         )
         
