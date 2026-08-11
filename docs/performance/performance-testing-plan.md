@@ -1,7 +1,7 @@
 # Cost On-Prem Performance Testing Plan
 
-**Date**: 2026-04-15 (updated 2026-06-25)  
-**Status**: Execution — Small through XLarge profiles validated  
+**Date**: 2026-04-15 (updated 2026-08-11)  
+**Status**: Execution — Small through XLarge profiles validated; soak tests hardened and validated  
 **Epic**: [FLPATH-4036](https://redhat.atlassian.net/browse/FLPATH-4036) / [COST-7567](https://redhat.atlassian.net/browse/COST-7567) - CoP - Performance Tuning & Hardware Sizing Guidelines
 
 ---
@@ -444,7 +444,7 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 - [x] API latency tests (PERF-API-001 through PERF-API-006)
 - [x] Multi-cluster scale tests (PERF-SCALE-001 through PERF-SCALE-005)
 - [x] ROS/Kruize performance tests (PERF-ROS-001 through PERF-ROS-004)
-- [x] Soak test stubs (PERF-SOAK-001 through PERF-SOAK-004, opt-in via `SOAK_TESTS=true`)
+- [x] Soak tests validated (PERF-SOAK-001 through SOAK-004, COST-7634) — condensed mode, JWT refresh, shared data collection
 - [x] Observability stack (FLPATH-4061 / COST-7625) — metrics collection, HTML reports, S3 archival
 - [x] Profile-aware resource tuning (`apply_perf_profile_config()` in `perf-testing.sh`)
 - [x] Jenkins CI integration (`insights_onprem.groovy` with `PERF_PROFILE` and `PERF_SUITE` params)
@@ -465,6 +465,140 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 | `PERF_CLEANUP_TIMEOUT` | `900` | Max seconds for post-test resource cleanup (prevents hangs) |
 | `METRICS_MAX_DURATION` | `14400` | Max seconds for metrics collector (auto-set from `JOB_TIMEOUT_HOURS` in Jenkins) |
 
+### Soak Test Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOAK_TESTS` | `false` | Set to `true` to enable soak tests (opt-in) |
+| `SOAK_CONDENSED` | `false` | Set to `true` for compressed intervals (~15 min cycle) |
+| `SOAK_DURATION_HOURS` | `1` (or `0.25` if condensed) | Test duration in hours |
+| `SOAK_UPLOAD_INTERVAL_MINUTES` | `15` (or `1` if condensed) | Interval between uploads |
+| `SOAK_QUERY_INTERVAL_MINUTES` | `5` (or `1` if condensed) | Interval between API queries |
+| `SOAK_METRICS_INTERVAL_SECONDS` | `60` (or `15` if condensed) | Metrics collection interval |
+| `SOAK_CHECKPOINT_HOURS` | `6` | How often to publish state snapshot to S3 (0 = disabled) |
+
+### 7-Day Soak: Operational Guide
+
+The 1-hour soak validates test logic; a 7-day run validates production stability
+(SC-5). A 7-day pytest process **cannot run from a local machine** — VPN drops,
+SSH timeouts, and laptop sleeps will kill it.
+
+#### Industry Patterns (Red Hat / OpenShift)
+
+Research across Red Hat projects shows three patterns for long-running stability
+testing. **None use sidecars or in-cluster Jobs for soak tests.**
+
+| Pattern | Used by | How it works |
+|---------|---------|--------------|
+| **Periodic CI trigger** | Karpenter, K8s upstream, OpenShift TRT | Short test runs on a schedule against a long-lived cluster. Stability measured by trends across runs, not within a single run. |
+| **Loop script on stable host** | OLM v1 (`run_e2e.py`) | Python script loops for N days, running the test binary every M seconds from a bastion/hypervisor. Publishes results to Slack/Google Sheets/S3. |
+| **In-cluster Job** | Rare for soak; mostly batch workloads | Single Kubernetes Job running pytest. Fragile — crash at day 5 loses state; log rotation limits visibility. |
+
+The **loop script on stable host** pattern is the best fit for us. Our hypervisors
+are always on, have `kubeconfig` access, and aren't affected by VPN. The test
+logic (analysis, assertions, JWT refresh) is already in the pytest tests. We
+just need a thin outer loop and S3 checkpoint persistence.
+
+#### Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│  Hypervisor (kni@<host>)                     │
+│  screen -S soak                              │
+│                                              │
+│  soak-loop.sh                                │
+│    for each iteration (every 1h):            │
+│      1. run-pytest.sh --perf-soak            │
+│      2. publish checkpoint to S3             │
+│      3. check for stop signal                │
+│    end                                       │
+│                                              │
+│  Runs for --days N (default 7)               │
+│  Detach: Ctrl-A D / Reattach: screen -r soak │
+└──────────────────────────────────────────────┘
+         │
+         │  S3 checkpoint after each iteration
+         ▼
+┌──────────────────────────────────────────────┐
+│  S3 bucket (eco-bucket-perf-scale)           │
+│                                              │
+│  soak-runs/<run-id>/                         │
+│    checkpoint-001.json  (hour 1)             │
+│    checkpoint-002.json  (hour 2)             │
+│    ...                                       │
+│    final-results.json   (day 7)              │
+│                                              │
+│  Pull from any machine — no VPN required     │
+└──────────────────────────────────────────────┘
+```
+
+Each checkpoint contains the iteration's `SoakTestState` snapshot: upload/query
+counts, error list, memory/disk/queue samples, and elapsed time. On completion,
+a final summary with aggregate analysis across all iterations is published.
+
+Monitoring is as simple as pulling the latest checkpoint from S3 — no VPN, no
+`kubectl`, no SSH required.
+
+#### Prerequisites
+
+| Requirement | Why |
+|-------------|-----|
+| **Dedicated cluster** | No other workloads should share the cluster during the soak |
+| **Stable deployment** | Deploy with `--sizing-profile medium` (or target profile) first |
+| **Hypervisor access** | SSH to the machine hosting the cluster (always-on, unaffected by VPN) |
+| **No scheduled jobs** | Disable any cron-based cluster operations that could interfere |
+
+#### Execution
+
+```bash
+ssh kni@<hypervisor>
+screen -S soak
+export KUBECONFIG=/home/kni/clusterconfigs/auth/kubeconfig_ocp-edge94
+cd /path/to/cost-onprem-chart
+
+# 7-day soak: 1-hour iterations, checkpoint to S3 after each
+SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
+  ./scripts/soak-loop.sh --days 7 \
+  --s3-bucket eco-bucket-perf-scale \
+  --s3-endpoint https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com
+
+# Ctrl-A D to detach, screen -r soak to reattach
+```
+
+```bash
+# Monitor from any machine via S3
+aws s3 ls s3://eco-bucket-perf-scale/soak-runs/<run-id>/
+aws s3 cp s3://eco-bucket-perf-scale/soak-runs/<run-id>/checkpoint-latest.json -
+```
+
+#### Monitoring Checklist (check daily)
+
+- [ ] **S3 checkpoint** — pull latest, verify upload/query counts incrementing and error count low
+- [ ] `kubectl get pods -n cost-onprem` — all pods Running, no CrashLoopBackOff
+- [ ] `kubectl top pods -n cost-onprem` — no pod near its memory limit
+- [ ] `oc adm top nodes` — no node at >90% memory
+- [ ] DB disk: `kubectl exec -n cost-onprem cost-onprem-database-0 -- df -h /var/lib/pgsql/data`
+
+#### What the Test Validates Over 7 Days
+
+| Check | SOAK Test | Threshold |
+|-------|-----------|-----------|
+| OOM kills | SOAK-001 | 0 pod restarts during window |
+| Upload success rate | SOAK-001 | 0 failed uploads |
+| API error rate | SOAK-001 | < 5% query failures |
+| Memory growth | SOAK-002 | < 5% daily growth per pod |
+| Disk growth | SOAK-003 | < 50 GB projected 7-day growth |
+| Queue backlog | SOAK-004 | No sustained >100 avg depth or >90% non-empty |
+
+#### Implementation Status
+
+- [x] Test code hardened and validated (1-hour, 4/4 passed)
+- [x] Condensed mode for rapid iteration
+- [x] JWT token refresh for long-running workers
+- [x] Jenkins parameters wired (`SOAK_TESTS`, `SOAK_CONDENSED`, `SOAK_DURATION_HOURS`)
+- [ ] `soak-loop.sh` wrapper script (outer loop, S3 checkpoints, stop signal)
+- [ ] S3 checkpoint publishing (serialize iteration state to existing bucket)
+
 ### Validated Profiles
 
 | Profile | Run ID | Tests | Result | Duration | Key Metric |
@@ -483,7 +617,7 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 | `test_api_latency.py` | 6 | API latency (API-001 through API-006) |
 | `test_scale.py` | 5 | Multi-cluster scale (SCALE-001 through SCALE-005) |
 | `test_ros.py` | 4 | ROS/Kruize performance (ROS-001 through ROS-004) |
-| `test_soak.py` | 4 | Soak stability (SOAK-001 through SOAK-004, opt-in) |
+| `test_soak.py` | 4 | Soak stability (SOAK-001 through SOAK-004, opt-in; condensed mode available) |
 | `test_stress.py` | 2 | Stress ramp-to-failure + backlog recovery (STR-001, STR-002) |
 | `profiles.py` | — | Profile definitions + NISE YAML generation |
 | `tracker.py` | — | Resource cleanup tracker with configurable timeout |
@@ -510,6 +644,12 @@ PERF_PROFILE=xlarge pytest -m "performance and ingestion" tests/suites/performan
 ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-profile medium --perf-suite stress_ramp
 ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-profile medium --perf-suite stress_recovery
 
+# Soak tests (opt-in — condensed ~15 min, or 1h/7d standard)
+SOAK_TESTS=true SOAK_CONDENSED=true \
+  ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
+SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
+  ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
+
 # Via Jenkins
 # Job: flightpath-insights-onprem (RUN_PERF_TESTS=true, PERF_PROFILE=xlarge, PERF_SUITE=all)
 ```
@@ -524,12 +664,13 @@ PERF_PROFILE=xlarge pytest -m "performance and ingestion" tests/suites/performan
 | SC-2 | Cluster count limits | **Done** | XLarge (23 clusters) validated; stress ramp tested at medium (75), large (100), xlarge (100+) concurrent sources |
 | SC-3 | Bottleneck analysis | **Done** | [FINDINGS.md](./FINDINGS.md) — 13 findings documented with severity and evidence |
 | SC-4 | Processing window | **Partial** | XLarge completes in ~2h; need to validate against 6-hour SLA formally |
-| SC-5 | Soak test | **Not started** | Tests exist but require `SOAK_TESTS=true` and dedicated 7-day run window |
+| SC-5 | Soak test | **Partial** | 1-hour soak validated (4/4 passed, COST-7634). Condensed mode available for rapid iteration. 7-day run pending dedicated cluster time. |
 
 ## Next Steps
 
 1. [x] Run medium profile for a clean validated baseline (target: 0 failures) — 28/28 api+ingestion, 4/4 ros passed
 2. [x] Execute stress ramp-to-failure across medium, large, xlarge — breaking points identified (75, 100, 100+ sources)
-3. [ ] Execute 7-day soak test (SC-5) — requires dedicated cluster time
+3. [x] Soak tests hardened and validated (COST-7634) — 1-hour run passes, condensed mode for rapid iteration
+   - [ ] Execute 7-day soak test — requires dedicated cluster time
 4. [x] Publish sizing profile overlays + operator mapping draft (COST-7618) — see `cost-onprem/values-*.yaml` and `operator-profile-crd-mapping.md`
 5. [x] File tickets for untracked findings — FLPATH-4428 (013), FLPATH-4429 (020), FLPATH-4430 (022), FLPATH-4431 (024)
