@@ -596,8 +596,8 @@ aws s3 cp s3://eco-bucket-perf-scale/soak-runs/<run-id>/checkpoint-latest.json -
 - [x] Condensed mode for rapid iteration
 - [x] JWT token refresh for long-running workers
 - [x] Jenkins parameters wired (`SOAK_TESTS`, `SOAK_CONDENSED`, `SOAK_DURATION_HOURS`)
-- [ ] `soak-loop.sh` wrapper script (outer loop, S3 checkpoints, stop signal)
-- [ ] S3 checkpoint publishing (serialize iteration state to existing bucket)
+- [x] `soak-loop.sh` wrapper script (outer loop, S3 checkpoints, stop signal)
+- [x] S3 checkpoint publishing (JSON checkpoints per iteration + final summary)
 
 ### Validated Profiles
 
