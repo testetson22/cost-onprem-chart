@@ -564,13 +564,24 @@ cd /path/to/cost-onprem-chart
 
 # 7-day soak: 1-hour iterations, checkpoint to S3 after each.
 # --background returns immediately once the loop is launched.
-SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
+# PYTHON=python3.12: the test suite requires 3.10+, but some hosts (e.g.
+# ocp-edge94) default `python3` to 3.9 — see note below.
+SOAK_TESTS=true SOAK_DURATION_HOURS=1 PYTHON=python3.12 \
   ./scripts/soak-loop.sh --days 7 --background \
   --s3-bucket eco-bucket-perf-scale \
   --s3-endpoint https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com
 
 # You can safely exit the SSH session now — the loop keeps running.
 ```
+
+> **Python version:** the test suite requires Python 3.10+ (some test files
+> use PEP 604 `X | None` type hints that raise a `TypeError` at collection
+> time on older Python). `run-pytest.sh` checks this and fails fast with the
+> available candidates if the default `python3` is too old, but on hosts
+> where that's known ahead of time (e.g. `ocp-edge94` defaults to 3.9, with
+> `python3.12` available), set `PYTHON=python3.12` up front. `tests/.venv` is
+> bound to whichever interpreter created it — delete it before switching
+> interpreters on a host that's already run tests with the wrong one.
 
 ```bash
 # Reconnect later to check on it
