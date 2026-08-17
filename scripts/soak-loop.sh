@@ -136,12 +136,30 @@ if [[ "${BACKGROUND}" == "true" ]]; then
     disown "${child_pid}"
     echo "${child_pid}" > "${PID_FILE}"
 
-    echo "soak-loop started in background (PID ${child_pid})"
-    echo "  Log:  ${LOG_FILE}"
-    echo "  PID:  ${PID_FILE}"
-    echo "  Stop: touch ${STOP_FILE}   (graceful, after current iteration)"
-    echo "  Kill: kill ${child_pid}    (last resort)"
-    exit 0
+    # Pre-flight (cluster reachability, SOAK_TESTS, S3) typically fails fast
+    # if something's wrong. Give it a moment and verify the child actually
+    # survived pre-flight before declaring success — otherwise a fast failure
+    # looks identical to "started fine" and the EXIT trap will have already
+    # removed the PID file by the time anyone checks on it.
+    # Skip this check for --dry-run, which is expected to exit quickly.
+    sleep 3
+    if [[ "${DRY_RUN}" == "true" ]] || kill -0 "${child_pid}" 2>/dev/null; then
+        echo "soak-loop started in background (PID ${child_pid})"
+        echo "  Log:  ${LOG_FILE}"
+        echo "  PID:  ${PID_FILE}"
+        echo "  Stop: touch ${STOP_FILE}   (graceful, after current iteration)"
+        echo "  Kill: kill ${child_pid}    (last resort)"
+        exit 0
+    else
+        echo "ERROR: soak-loop exited immediately after starting (PID ${child_pid} is dead)." >&2
+        echo "This usually means pre-flight failed (SOAK_TESTS not set, cluster" >&2
+        echo "unreachable, or unhealthy pods). Log output (${LOG_FILE}):" >&2
+        echo "---" >&2
+        cat "${LOG_FILE}" >&2 2>/dev/null || echo "(log file not found)" >&2
+        echo "---" >&2
+        rm -f "${PID_FILE}"
+        exit 1
+    fi
 fi
 
 # ── Logging ───────────────────────────────────────────────────────────────
