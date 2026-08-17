@@ -231,14 +231,19 @@ preflight() {
     fi
     log_info "Cluster:         $(kubectl cluster-info 2>&1 | head -1)"
 
-    # Verify pods are healthy
+    # Verify pods are healthy.
+    # NOTE: `grep -v "Running"` exits 1 when *every* pod is Running (i.e. the
+    # healthy case) — with `pipefail` that would otherwise kill the whole
+    # script via `set -e`. The `|| not_running=0` fallback guards against
+    # exactly that "zero matches" outcome (not against a kubectl failure,
+    # which still surfaces as an empty/erroneous count here).
     local not_running
     not_running=$(kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/instance=cost-onprem" \
         --field-selector=status.phase!=Succeeded \
-        --no-headers 2>/dev/null | grep -v "Running" | wc -l)
+        --no-headers 2>/dev/null | grep -v "Running" | wc -l) || not_running=0
     if [[ "${not_running}" -gt 0 ]]; then
         log_warn "${not_running} pod(s) not in Running state"
-        kubectl get pods -n "${NAMESPACE}" --no-headers | grep -v "Running\|Completed"
+        kubectl get pods -n "${NAMESPACE}" --no-headers | grep -v "Running\|Completed" || true
     else
         log_info "All pods healthy"
     fi
