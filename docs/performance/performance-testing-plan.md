@@ -504,9 +504,8 @@ just need a thin outer loop and S3 checkpoint persistence.
 ```
 ┌──────────────────────────────────────────────┐
 │  Hypervisor (kni@<host>)                     │
-│  screen -S soak                              │
+│  soak-loop.sh --background (nohup-based)     │
 │                                              │
-│  soak-loop.sh                                │
 │    for each iteration (every 1h):            │
 │      1. run-pytest.sh --perf-soak            │
 │      2. publish checkpoint to S3             │
@@ -514,7 +513,9 @@ just need a thin outer loop and S3 checkpoint persistence.
 │    end                                       │
 │                                              │
 │  Runs for --days N (default 7)               │
-│  Detach: Ctrl-A D / Reattach: screen -r soak │
+│  Survives SSH disconnect (no screen/tmux     │
+│  needed) — log: /tmp/soak-loop.log           │
+│  Stop: touch /tmp/soak-stop                  │
 └──────────────────────────────────────────────┘
          │
          │  S3 checkpoint after each iteration
@@ -550,19 +551,38 @@ Monitoring is as simple as pulling the latest checkpoint from S3 — no VPN, no
 
 #### Execution
 
+`soak-loop.sh` does not depend on `screen`/`tmux` being installed on the
+hypervisor. Use its built-in `--background` flag, which daemonizes itself
+via `nohup` + `disown` — the loop survives the SSH session ending, and there
+is no need to reattach to anything. (If `screen` or `tmux` happen to be
+available, running it inside one works too, but it's not required.)
+
 ```bash
 ssh kni@<hypervisor>
-screen -S soak
 export KUBECONFIG=/home/kni/clusterconfigs/auth/kubeconfig_ocp-edge94
 cd /path/to/cost-onprem-chart
 
-# 7-day soak: 1-hour iterations, checkpoint to S3 after each
+# 7-day soak: 1-hour iterations, checkpoint to S3 after each.
+# --background returns immediately once the loop is launched.
 SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
-  ./scripts/soak-loop.sh --days 7 \
+  ./scripts/soak-loop.sh --days 7 --background \
   --s3-bucket eco-bucket-perf-scale \
   --s3-endpoint https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com
 
-# Ctrl-A D to detach, screen -r soak to reattach
+# You can safely exit the SSH session now — the loop keeps running.
+```
+
+```bash
+# Reconnect later to check on it
+ssh kni@<hypervisor>
+tail -50 /tmp/soak-loop.log          # recent progress
+kill -0 $(cat /tmp/soak-loop.pid)    # exits 0 if still running
+
+# Stop gracefully after the current iteration finishes
+touch /tmp/soak-stop
+
+# Force kill (last resort — skips final summary)
+kill $(cat /tmp/soak-loop.pid)
 ```
 
 ```bash

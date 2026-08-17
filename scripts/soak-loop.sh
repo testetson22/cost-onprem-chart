@@ -3,11 +3,13 @@
 #
 # Runs 1-hour pytest soak iterations back-to-back for N days, publishing
 # a JSON checkpoint to S3 after each iteration. Designed to run on a
-# hypervisor inside a screen/tmux session.
+# hypervisor. Does NOT require screen/tmux — use --background (nohup-based)
+# to keep it running after the SSH session ends, or run it inside
+# screen/tmux yourself if one happens to be available.
 #
 # Usage:
 #   SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
-#     ./scripts/soak-loop.sh --days 7 \
+#     ./scripts/soak-loop.sh --days 7 --background \
 #       --s3-bucket eco-bucket-perf-scale \
 #       --s3-endpoint https://minio-s3-...
 #
@@ -18,6 +20,7 @@
 #   KUBECONFIG                Path to kubeconfig
 #
 # Stop signal: touch /tmp/soak-stop to gracefully stop after current iteration.
+# Status:      tail -f /tmp/soak-loop.log (or check PID in /tmp/soak-loop.pid)
 
 set -euo pipefail
 
@@ -28,6 +31,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 SOAK_DAYS=7
 ITERATION_HOURS="${SOAK_DURATION_HOURS:-1}"
+EXPLICIT_ITERATIONS=""
 S3_BUCKET=""
 S3_ENDPOINT=""
 S3_NO_VERIFY_SSL="${S3_NO_VERIFY_SSL:-true}"
@@ -36,6 +40,9 @@ NAMESPACE="${NAMESPACE:-cost-onprem}"
 STOP_FILE="/tmp/soak-stop"
 LISTENER_CPU="${LISTENER_CPU:-none}"
 DRY_RUN=false
+BACKGROUND=false
+LOG_FILE="/tmp/soak-loop.log"
+PID_FILE="/tmp/soak-loop.pid"
 
 # ── Parse Arguments ───────────────────────────────────────────────────────
 
@@ -45,31 +52,97 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --days N              Number of days to run (default: 7)
-  --iteration-hours N   Duration of each pytest iteration in hours (default: 1)
+  --iteration-hours N   Duration of each pytest iteration in hours (default: 1).
+                         Accepts fractional values (e.g. 0.25 for condensed mode).
+  --iterations N        Run exactly N iterations, overriding --days (useful for
+                         short condensed validation runs, e.g. --iterations 4
+                         --iteration-hours 0.25 for a ~1h validation)
   --s3-bucket BUCKET    S3 bucket for checkpoints (required for S3 upload)
   --s3-endpoint URL     S3 endpoint URL (e.g., https://minio-s3-...)
   --listener-cpu MODE   Listener CPU mode: none, max (default: none)
   --namespace NS        Kubernetes namespace (default: cost-onprem)
   --stop-file PATH      Stop signal file (default: /tmp/soak-stop)
+  --background, -d      Daemonize via nohup and return immediately (no
+                         screen/tmux required). Survives SSH disconnects.
+  --log-file PATH       Log file when backgrounded (default: /tmp/soak-loop.log)
+  --pid-file PATH       PID file when backgrounded (default: /tmp/soak-loop.pid)
   --dry-run             Print what would run without executing
   -h, --help            Show this help
+
+Condensed validation (~1h, exercises the full loop + checkpoint machinery):
+  SOAK_TESTS=true SOAK_CONDENSED=true ./scripts/soak-loop.sh \\
+    --iterations 4 --iteration-hours 0.25 \\
+    --s3-bucket eco-bucket-perf-scale --s3-endpoint https://minio-s3-...
+
+Backgrounding (no screen/tmux needed):
+  SOAK_TESTS=true ./scripts/soak-loop.sh --days 7 --background \\
+    --s3-bucket eco-bucket-perf-scale --s3-endpoint https://minio-s3-...
+
+  # Monitor:
+  tail -f /tmp/soak-loop.log
+  # Stop gracefully after the current iteration:
+  touch /tmp/soak-stop
+  # Force kill (last resort):
+  kill \$(cat /tmp/soak-loop.pid)
 EOF
 }
+
+# Keep the raw args around so --background can re-exec without itself.
+_ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days)          SOAK_DAYS="$2"; shift 2 ;;
         --iteration-hours) ITERATION_HOURS="$2"; shift 2 ;;
+        --iterations)    EXPLICIT_ITERATIONS="$2"; shift 2 ;;
         --s3-bucket)     S3_BUCKET="$2"; shift 2 ;;
         --s3-endpoint)   S3_ENDPOINT="$2"; shift 2 ;;
         --listener-cpu)  LISTENER_CPU="$2"; shift 2 ;;
         --namespace)     NAMESPACE="$2"; shift 2 ;;
         --stop-file)     STOP_FILE="$2"; shift 2 ;;
+        --background|-d) BACKGROUND=true; shift ;;
+        --log-file)      LOG_FILE="$2"; shift 2 ;;
+        --pid-file)      PID_FILE="$2"; shift 2 ;;
         --dry-run)       DRY_RUN=true; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               echo "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
+
+# ── Daemonize (nohup-based; no screen/tmux dependency) ───────────────────
+#
+# Re-exec ourselves in the background with the same args minus --background,
+# detached from the controlling terminal via nohup + disown, so the loop
+# survives the SSH session ending. This is the standard fallback pattern
+# when screen/tmux aren't installed on the host.
+
+if [[ "${BACKGROUND}" == "true" ]]; then
+    child_args=()
+    for arg in "${_ORIGINAL_ARGS[@]}"; do
+        case "${arg}" in
+            --background|-d) continue ;;
+            *) child_args+=("${arg}") ;;
+        esac
+    done
+
+    if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+        echo "ERROR: soak-loop already running with PID $(cat "${PID_FILE}") (${PID_FILE})" >&2
+        exit 1
+    fi
+
+    export _SOAK_PID_FILE="${PID_FILE}"
+    nohup "${BASH_SOURCE[0]}" "${child_args[@]}" > "${LOG_FILE}" 2>&1 &
+    child_pid=$!
+    disown "${child_pid}"
+    echo "${child_pid}" > "${PID_FILE}"
+
+    echo "soak-loop started in background (PID ${child_pid})"
+    echo "  Log:  ${LOG_FILE}"
+    echo "  PID:  ${PID_FILE}"
+    echo "  Stop: touch ${STOP_FILE}   (graceful, after current iteration)"
+    echo "  Kill: kill ${child_pid}    (last resort)"
+    exit 0
+fi
 
 # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -81,7 +154,16 @@ log_err()  { log "ERROR $*"; }
 # ── Derived Values ────────────────────────────────────────────────────────
 
 RUN_ID="soak-$(date +%Y%m%d-%H%M%S)"
-TOTAL_ITERATIONS=$(( SOAK_DAYS * 24 / ITERATION_HOURS ))
+if [[ -n "${EXPLICIT_ITERATIONS}" ]]; then
+    TOTAL_ITERATIONS="${EXPLICIT_ITERATIONS}"
+else
+    # ITERATION_HOURS may be fractional (e.g. 0.25 for condensed mode), so use
+    # awk rather than bash's integer-only `$(( ))` arithmetic.
+    TOTAL_ITERATIONS=$(awk -v d="${SOAK_DAYS}" -v h="${ITERATION_HOURS}" 'BEGIN { printf "%d", (d * 24) / h }')
+fi
+if [[ "${TOTAL_ITERATIONS}" -lt 1 ]]; then
+    TOTAL_ITERATIONS=1
+fi
 RESULTS_DIR="${PROJECT_ROOT}/tests/soak-runs/${RUN_ID}"
 CHECKPOINT_DIR="${RESULTS_DIR}/checkpoints"
 S3_UPLOAD_SCRIPT="${SCRIPT_DIR}/s3-upload.py"
@@ -102,6 +184,7 @@ preflight() {
     log_info "Run ID:          ${RUN_ID}"
     log_info "Days:            ${SOAK_DAYS}"
     log_info "Iteration hours: ${ITERATION_HOURS}"
+    log_info "Condensed mode: ${SOAK_CONDENSED:-false}"
     log_info "Total iterations: ${TOTAL_ITERATIONS}"
     log_info "Namespace:       ${NAMESPACE}"
     log_info "Listener CPU:    ${LISTENER_CPU}"
@@ -224,7 +307,8 @@ publish_checkpoint() {
     "namespace": "${NAMESPACE}",
     "iteration_hours": ${ITERATION_HOURS},
     "soak_days": ${SOAK_DAYS},
-    "listener_cpu": "${LISTENER_CPU}"
+    "listener_cpu": "${LISTENER_CPU}",
+    "condensed": $([ "${SOAK_CONDENSED:-}" = "true" ] && echo "true" || echo "false")
   }
 }
 CHECKPOINT_EOF
@@ -282,7 +366,8 @@ publish_final_summary() {
     "namespace": "${NAMESPACE}",
     "iteration_hours": ${ITERATION_HOURS},
     "soak_days": ${SOAK_DAYS},
-    "listener_cpu": "${LISTENER_CPU}"
+    "listener_cpu": "${LISTENER_CPU}",
+    "condensed": $([ "${SOAK_CONDENSED:-}" = "true" ] && echo "true" || echo "false")
   }
 }
 SUMMARY_EOF
@@ -308,6 +393,12 @@ SUMMARY_EOF
 # ── Main Loop ─────────────────────────────────────────────────────────────
 
 main() {
+    # If launched by our own --background re-exec, clean up the PID file
+    # we were told about once this process exits (success, failure, or signal).
+    if [[ -n "${_SOAK_PID_FILE:-}" ]]; then
+        trap 'rm -f "${_SOAK_PID_FILE}"' EXIT
+    fi
+
     preflight
 
     if [[ "${DRY_RUN}" == "true" ]]; then
@@ -329,7 +420,7 @@ main() {
     for (( i=1; i<=TOTAL_ITERATIONS; i++ )); do
         # Check stop signal
         if [[ -f "${STOP_FILE}" ]]; then
-            log_info "Stop signal detected (${STOP_FILE}). Stopping after ${i-1} iterations."
+            log_info "Stop signal detected (${STOP_FILE}). Stopping after $(( i - 1 )) iterations."
             rm -f "${STOP_FILE}"
             break
         fi
