@@ -186,14 +186,22 @@ RESULTS_DIR="${PROJECT_ROOT}/tests/soak-runs/${RUN_ID}"
 CHECKPOINT_DIR="${RESULTS_DIR}/checkpoints"
 S3_UPLOAD_SCRIPT="${SCRIPT_DIR}/s3-upload.py"
 
-# Find Python with boto3 for S3 uploads
-_s3_python=""
-if [[ -f "${PROJECT_ROOT}/tests/.venv/bin/python" ]] && \
-   "${PROJECT_ROOT}/tests/.venv/bin/python" -c "import boto3" 2>/dev/null; then
-    _s3_python="${PROJECT_ROOT}/tests/.venv/bin/python"
-elif python3 -c "import boto3" 2>/dev/null; then
-    _s3_python="python3"
-fi
+# Resolve a Python interpreter with boto3 available for S3 uploads.
+#
+# This is intentionally NOT cached in a global at script startup: the test
+# venv (tests/.venv) that provides boto3 doesn't exist yet on a fresh
+# checkout — it's created by run-pytest.sh during the *first* iteration's
+# dependency setup. Caching this once, before the loop has even run once,
+# would permanently disable S3 uploads for the whole run even though boto3
+# becomes available moments later. Call this fresh each time it's needed.
+resolve_s3_python() {
+    if [[ -f "${PROJECT_ROOT}/tests/.venv/bin/python" ]] && \
+       "${PROJECT_ROOT}/tests/.venv/bin/python" -c "import boto3" 2>/dev/null; then
+        echo "${PROJECT_ROOT}/tests/.venv/bin/python"
+    elif python3 -c "import boto3" 2>/dev/null; then
+        echo "python3"
+    fi
+}
 
 # ── Pre-flight ────────────────────────────────────────────────────────────
 
@@ -248,22 +256,30 @@ preflight() {
         log_info "All pods healthy"
     fi
 
-    # Verify S3 connectivity (if configured)
-    if [[ -n "${S3_BUCKET}" ]] && [[ -n "${_s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
-        local s3_args=""
-        [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
-        [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
-        [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
+    # Verify S3 connectivity (if configured). Note: we do NOT permanently
+    # disable S3_BUCKET here just because boto3 isn't available yet — on a
+    # fresh checkout the test venv is created by the *first* iteration
+    # (see resolve_s3_python() above), so it may become available moments
+    # after this check runs. publish_checkpoint()/publish_final_summary()
+    # re-resolve the interpreter on every call and will pick it up then.
+    if [[ -n "${S3_BUCKET}" ]]; then
+        local preflight_s3_python
+        preflight_s3_python="$(resolve_s3_python)"
+        if [[ -n "${preflight_s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
+            local s3_args=""
+            [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
+            [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
+            [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
 
-        if timeout 15 "${_s3_python}" "${S3_UPLOAD_SCRIPT}" ls "s3://${S3_BUCKET}/" ${s3_args} &>/dev/null; then
-            log_info "S3 preflight OK"
+            if timeout 15 "${preflight_s3_python}" "${S3_UPLOAD_SCRIPT}" ls "s3://${S3_BUCKET}/" ${s3_args} &>/dev/null; then
+                log_info "S3 preflight OK"
+            else
+                log_warn "S3 preflight failed (bucket/endpoint unreachable) — checkpoints will be local only for this run"
+                S3_BUCKET=""
+            fi
         else
-            log_warn "S3 preflight failed — checkpoints will be local only"
-            S3_BUCKET=""
+            log_warn "boto3 not yet available (test venv not created) — will retry automatically once the first iteration sets it up"
         fi
-    elif [[ -n "${S3_BUCKET}" ]]; then
-        log_warn "S3 upload requires python3 with boto3 and s3-upload.py — checkpoints will be local only"
-        S3_BUCKET=""
     fi
 
     # Clean any stale stop signal
@@ -341,15 +357,18 @@ CHECKPOINT_EOF
     # Also write a "latest" symlink for easy monitoring
     cp "${checkpoint_file}" "${CHECKPOINT_DIR}/checkpoint-latest.json"
 
-    # Upload to S3 if configured
-    if [[ -n "${S3_BUCKET}" ]] && [[ -n "${_s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
+    # Upload to S3 if configured. Resolved fresh (not cached) since the test
+    # venv providing boto3 may not have existed yet at script startup.
+    local s3_python
+    s3_python="$(resolve_s3_python)"
+    if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
         local s3_prefix="soak-runs/${RUN_ID}"
         local s3_args=""
         [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
         [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
         [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
 
-        if timeout 30 "${_s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
+        if timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${checkpoint_file}" "s3://${S3_BUCKET}/${s3_prefix}/$(basename "${checkpoint_file}")" \
             ${s3_args} 2>/dev/null; then
             log_info "Checkpoint uploaded to s3://${S3_BUCKET}/${s3_prefix}/$(basename "${checkpoint_file}")"
@@ -358,10 +377,12 @@ CHECKPOINT_EOF
         fi
 
         # Also upload latest
-        timeout 30 "${_s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
+        timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${CHECKPOINT_DIR}/checkpoint-latest.json" \
             "s3://${S3_BUCKET}/${s3_prefix}/checkpoint-latest.json" \
             ${s3_args} 2>/dev/null || true
+    elif [[ -n "${S3_BUCKET}" ]]; then
+        log_warn "boto3 still not available — checkpoint ${iteration} saved locally only (will retry next iteration)"
     fi
 }
 
@@ -397,19 +418,23 @@ SUMMARY_EOF
 
     log_info "Final summary: ${summary_file}"
 
-    # Upload to S3
-    if [[ -n "${S3_BUCKET}" ]] && [[ -n "${_s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
+    # Upload to S3 (resolved fresh — see resolve_s3_python() for why)
+    local s3_python
+    s3_python="$(resolve_s3_python)"
+    if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
         local s3_prefix="soak-runs/${RUN_ID}"
         local s3_args=""
         [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
         [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
         [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
 
-        timeout 30 "${_s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
+        timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${summary_file}" "s3://${S3_BUCKET}/${s3_prefix}/final-results.json" \
             ${s3_args} 2>/dev/null \
             && log_info "Final summary uploaded to s3://${S3_BUCKET}/${s3_prefix}/final-results.json" \
             || log_warn "S3 upload of final summary failed"
+    elif [[ -n "${S3_BUCKET}" ]]; then
+        log_warn "boto3 not available — final summary saved locally only"
     fi
 }
 
