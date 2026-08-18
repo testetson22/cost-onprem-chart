@@ -86,6 +86,51 @@ _SOAK_DURATION_S = int(float(os.environ.get(
 # same collected samples rather than re-collecting independently.
 _soak_shared: Dict[str, Any] = {}
 
+# Number of consecutive iterations a pod must exceed the leak threshold
+# before SOAK-002 actually fails. soak-loop.sh runs each iteration as an
+# independent process, so a single hour's snapshot can't tell a one-time
+# step-change (e.g. JVM heap growth during warm-up, which plateaus) apart
+# from a genuine sustained leak. Requiring persistence across iterations
+# filters out one-off blips while still catching real leaks (just one
+# iteration later). See docs/performance/performance-testing-plan.md.
+_SOAK_LEAK_CONSECUTIVE_ITERATIONS = int(
+    os.environ.get("SOAK_LEAK_CONSECUTIVE_ITERATIONS", "2")
+)
+
+
+def _soak_leak_state_path() -> Optional[Path]:
+    """Stable file location shared across soak-loop.sh iterations.
+
+    PERF_OUTPUT_DIR is set per-iteration to ``<run_dir>/iteration-N``; its
+    parent is the stable run directory shared by every iteration of a
+    soak-loop.sh run. Returns None when not running under the loop (e.g. a
+    single long continuous soak run), where cross-iteration persistence
+    doesn't apply and detection falls back to immediate (single-window)
+    evaluation.
+    """
+    perf_output_dir = os.environ.get("PERF_OUTPUT_DIR")
+    if not perf_output_dir:
+        return None
+    return Path(perf_output_dir).parent / ".soak_leak_state.json"
+
+
+def _load_soak_leak_state(path: Optional[Path]) -> Dict[str, int]:
+    if not path or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_soak_leak_state(path: Optional[Path], state: Dict[str, int]) -> None:
+    if not path:
+        return
+    try:
+        path.write_text(json.dumps(state))
+    except OSError:
+        pass
+
 
 # =============================================================================
 # Configuration
@@ -945,24 +990,28 @@ class TestSoakStability:
         memory_analysis = analyze_memory_trend(samples)
 
         leak_detected = False
-        leak_pods = []
 
         # For short runs (< 1h), extrapolation to daily growth is unreliable.
         # Normal JVM/Python GC and cache warm-up cause memory fluctuations that
         # extrapolate to hundreds of percent daily growth when measured over
         # 15 minutes. Require substantial absolute growth to flag a leak.
+        #
+        # This floor also applies to normal (>= 1h) windows: a 1-4MB swing on
+        # a low-memory pod (e.g. 36MB -> 37MB) extrapolates to 60%+/day when
+        # projected linearly from a single hour, but it's pure measurement
+        # noise, not a leak. See COST-7634 soak validation findings.
         duration_hours = actual_duration_s / 3600 if actual_duration_s > 0 else 0
         daily_threshold = 5.0 if duration_hours >= 1.0 else 50.0
-        min_absolute_growth_mb = 50.0 if duration_hours < 1.0 else 0.0
+        min_absolute_growth_mb = 50.0
 
+        candidates = []
         for pod, stats in memory_analysis.items():
             if isinstance(stats, dict) and "growth_pct" in stats:
                 if duration_hours > 0:
                     daily_growth_pct = stats["growth_pct"] * (24 / duration_hours)
                     absolute_growth = stats["final_mb"] - stats["initial_mb"]
                     if daily_growth_pct > daily_threshold and absolute_growth > min_absolute_growth_mb:
-                        leak_detected = True
-                        leak_pods.append({
+                        candidates.append({
                             "pod": pod,
                             "daily_growth_pct": daily_growth_pct,
                             "initial_mb": stats["initial_mb"],
@@ -970,12 +1019,39 @@ class TestSoakStability:
                             "absolute_growth_mb": absolute_growth,
                         })
 
+        # Require growth to persist across consecutive iterations before
+        # failing. A single hour's step-change (e.g. one-time JVM heap growth
+        # during warm-up, which then plateaus) looks identical to the start
+        # of a leak when viewed through one 1-hour window in isolation.
+        state_path = _soak_leak_state_path()
+        leak_state = _load_soak_leak_state(state_path)
+        candidate_pods = {c["pod"] for c in candidates}
+        for pod in list(leak_state.keys()):
+            if pod not in candidate_pods:
+                leak_state[pod] = 0
+        for pod in candidate_pods:
+            leak_state[pod] = leak_state.get(pod, 0) + 1
+        _save_soak_leak_state(state_path, leak_state)
+
+        if state_path is None:
+            # No loop context (standalone/continuous run) — nothing to wait
+            # for next iteration, so evaluate immediately.
+            leak_pods = candidates
+        else:
+            leak_pods = [
+                c for c in candidates
+                if leak_state.get(c["pod"], 0) >= _SOAK_LEAK_CONSECUTIVE_ITERATIONS
+            ]
+
+        leak_detected = bool(leak_pods)
+
         perf_result.metrics = {
             "duration_seconds": actual_duration_s,
             "sample_count": len(samples),
             "memory_analysis": memory_analysis,
             "leak_detected": leak_detected,
             "leak_pods": leak_pods,
+            "leak_candidates": candidates,
         }
 
         perf_result.passed = not leak_detected
@@ -985,10 +1061,12 @@ class TestSoakStability:
         print(f"  Duration: {actual_duration_s/60:.0f} minutes")
         print(f"  Samples: {len(samples)}")
         print(f"  Leak detected: {leak_detected}")
-        if leak_pods:
-            for p in leak_pods:
-                print(f"    - {p['pod']}: {p['daily_growth_pct']:.1f}% daily growth")
-        
+        if candidates:
+            for c in candidates:
+                confirmed = leak_state.get(c["pod"], 0) >= _SOAK_LEAK_CONSECUTIVE_ITERATIONS
+                marker = "CONFIRMED" if confirmed else f"watch ({leak_state.get(c['pod'], 0)}/{_SOAK_LEAK_CONSECUTIVE_ITERATIONS})"
+                print(f"    - {c['pod']}: {c['daily_growth_pct']:.1f}% daily growth [{marker}]")
+
         assert not leak_detected, f"Memory leak detected in pods: {[p['pod'] for p in leak_pods]}"
 
     @pytest.mark.skipif(
