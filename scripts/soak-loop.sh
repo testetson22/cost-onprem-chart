@@ -10,8 +10,10 @@
 # Usage:
 #   SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
 #     ./scripts/soak-loop.sh --days 7 --background \
-#       --s3-bucket eco-bucket-perf-scale \
-#       --s3-endpoint https://minio-s3-...
+#       --s3-bucket "$S3_BUCKET" --s3-endpoint "$S3_ENDPOINT"
+#
+# S3_BUCKET/S3_ENDPOINT: same values you use for publishing results with
+# collect-metrics.sh / deploy-test-cost-onprem.sh.
 #
 # Environment (inherited by run-pytest.sh):
 #   SOAK_TESTS=true           Required — enables soak suite
@@ -58,7 +60,7 @@ Options:
                          short condensed validation runs, e.g. --iterations 4
                          --iteration-hours 0.25 for a ~1h validation)
   --s3-bucket BUCKET    S3 bucket for checkpoints (required for S3 upload)
-  --s3-endpoint URL     S3 endpoint URL (e.g., https://minio-s3-...)
+  --s3-endpoint URL     S3 endpoint URL (your team's perf-results storage)
   --listener-cpu MODE   Listener CPU mode: none, max (default: none)
   --namespace NS        Kubernetes namespace (default: cost-onprem)
   --stop-file PATH      Stop signal file (default: /tmp/soak-stop)
@@ -72,11 +74,11 @@ Options:
 Condensed validation (~1h, exercises the full loop + checkpoint machinery):
   SOAK_TESTS=true SOAK_CONDENSED=true ./scripts/soak-loop.sh \\
     --iterations 4 --iteration-hours 0.25 \\
-    --s3-bucket eco-bucket-perf-scale --s3-endpoint https://minio-s3-...
+    --s3-bucket "\$S3_BUCKET" --s3-endpoint "\$S3_ENDPOINT"
 
 Backgrounding (no screen/tmux needed):
   SOAK_TESTS=true ./scripts/soak-loop.sh --days 7 --background \\
-    --s3-bucket eco-bucket-perf-scale --s3-endpoint https://minio-s3-...
+    --s3-bucket "\$S3_BUCKET" --s3-endpoint "\$S3_ENDPOINT"
 
   # Monitor:
   tail -f /tmp/soak-loop.log
@@ -362,7 +364,7 @@ CHECKPOINT_EOF
     local s3_python
     s3_python="$(resolve_s3_python)"
     if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
-        local s3_prefix="soak-runs/${RUN_ID}"
+        local s3_prefix="${S3_PREFIX:-cost-onprem-performance}/${RUN_ID}"
         local s3_args=""
         [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
         [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
@@ -422,7 +424,7 @@ SUMMARY_EOF
     local s3_python
     s3_python="$(resolve_s3_python)"
     if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
-        local s3_prefix="soak-runs/${RUN_ID}"
+        local s3_prefix="${S3_PREFIX:-cost-onprem-performance}/${RUN_ID}"
         local s3_args=""
         [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
         [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"

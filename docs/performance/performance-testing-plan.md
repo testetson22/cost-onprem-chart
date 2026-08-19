@@ -449,7 +449,7 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 - [x] Profile-aware resource tuning (`apply_perf_profile_config()` in `perf-testing.sh`)
 - [x] Jenkins CI integration (`insights_onprem.groovy` with `PERF_PROFILE` and `PERF_SUITE` params)
 - [x] Self-contained HTML run reports and JSON summaries
-- [x] S3 result archival to shared MinIO
+- [x] S3 result archival to shared S3-compatible storage
 - [x] Stress ramp-to-failure + backlog recovery (`test_stress.py`, COST-7627 + COST-7600)
 
 ### Stress Test Environment Variables
@@ -521,15 +521,15 @@ just need a thin outer loop and S3 checkpoint persistence.
          │  S3 checkpoint after each iteration
          ▼
 ┌──────────────────────────────────────────────┐
-│  S3 bucket (eco-bucket-perf-scale)           │
+│  S3 bucket (internal, VPN-only storage)      │
 │                                              │
-│  soak-runs/<run-id>/                         │
+│  cost-onprem-performance/<run-id>/           │
 │    checkpoint-001.json  (hour 1)             │
 │    checkpoint-002.json  (hour 2)             │
 │    ...                                       │
 │    final-results.json   (day 7)              │
 │                                              │
-│  Pull from any machine — no VPN required     │
+│  Pull from any machine on Red Hat VPN        │
 └──────────────────────────────────────────────┘
 ```
 
@@ -537,8 +537,9 @@ Each checkpoint contains the iteration's `SoakTestState` snapshot: upload/query
 counts, error list, memory/disk/queue samples, and elapsed time. On completion,
 a final summary with aggregate analysis across all iterations is published.
 
-Monitoring is as simple as pulling the latest checkpoint from S3 — no VPN, no
-`kubectl`, no SSH required.
+Monitoring is as simple as pulling the latest checkpoint from S3 — no
+`kubectl` or SSH into the hypervisor required, though you do need to be on
+Red Hat VPN to reach the internal S3 endpoint.
 
 #### Prerequisites
 
@@ -557,6 +558,14 @@ via `nohup` + `disown` — the loop survives the SSH session ending, and there
 is no need to reattach to anything. (If `screen` or `tmux` happen to be
 available, running it inside one works too, but it's not required.)
 
+Use the same `S3_BUCKET`/`S3_ENDPOINT` you already have configured for
+publishing results elsewhere (see `docs/performance/OBSERVABILITY.md`):
+
+```bash
+export S3_BUCKET="<your-teams-perf-bucket>"
+export S3_ENDPOINT="<your-teams-s3-endpoint>"
+```
+
 ```bash
 ssh kni@<hypervisor>
 export KUBECONFIG=/home/kni/clusterconfigs/auth/kubeconfig_ocp-edge94
@@ -568,8 +577,7 @@ cd /path/to/cost-onprem-chart
 # ocp-edge94) default `python3` to 3.9 — see note below.
 SOAK_TESTS=true SOAK_DURATION_HOURS=1 PYTHON=python3.12 \
   ./scripts/soak-loop.sh --days 7 --background \
-  --s3-bucket eco-bucket-perf-scale \
-  --s3-endpoint https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com
+  --s3-bucket "${S3_BUCKET}" --s3-endpoint "${S3_ENDPOINT}"
 
 # You can safely exit the SSH session now — the loop keeps running.
 ```
@@ -597,9 +605,30 @@ kill $(cat /tmp/soak-loop.pid)
 ```
 
 ```bash
-# Monitor from any machine via S3
-aws s3 ls s3://eco-bucket-perf-scale/soak-runs/<run-id>/
-aws s3 cp s3://eco-bucket-perf-scale/soak-runs/<run-id>/checkpoint-latest.json -
+# Monitor from any machine on Red Hat VPN via S3 (rooted under the shared
+# cost-onprem-performance/ prefix, like every other perf suite). Use
+# scripts/s3-upload.py, not raw `aws s3` — this bucket is anonymous/public on
+# a non-AWS S3 endpoint with an untrusted cert, and a bare `aws` command
+# will behave differently (or fail) depending on your local AWS CLI config.
+# s3-upload.py bakes in anonymous signing, TLS bypass, and IPv4-only
+# resolution ($S3_BUCKET/$S3_ENDPOINT as set above).
+python3 scripts/s3-upload.py ls \
+  "s3://${S3_BUCKET}/cost-onprem-performance/<run-id>/" \
+  --endpoint-url "${S3_ENDPOINT}"
+
+python3 scripts/s3-upload.py cp \
+  "s3://${S3_BUCKET}/cost-onprem-performance/<run-id>/checkpoint-latest.json" - \
+  --endpoint-url "${S3_ENDPOINT}"
+```
+
+If you'd rather use the `aws` CLI directly, it needs all three flags to behave
+correctly against this bucket (and may still be flakier on networks with
+broken IPv6 to this endpoint):
+
+```bash
+aws s3 ls "s3://${S3_BUCKET}/cost-onprem-performance/<run-id>/" \
+  --endpoint-url "${S3_ENDPOINT}" \
+  --no-sign-request --no-verify-ssl
 ```
 
 #### Monitoring Checklist (check daily)

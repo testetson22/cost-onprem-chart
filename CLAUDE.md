@@ -11,6 +11,7 @@ For Cursor IDE users, see `.cursor/rules/` for auto-loaded context rules.
 - `check-logs.md` - View component logs
 - `debug-e2e.md` - Debug E2E test failures
 - `download-ci-artifacts.md` - Download CI artifacts from Prow/GCS
+- `run-soak-test.md` - Execute or monitor a soak test via SSH on a personal hypervisor
 
 ## Project Overview
 
