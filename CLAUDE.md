@@ -113,7 +113,7 @@ before tests run.
 # Performance tests only (skip deploy)
 ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-profile medium
 
-# Specific perf suite(s): api, ros, ingestion, scale, soak, valkey, db, kafka, celery, stress, stress_ramp, stress_recovery
+# Specific perf suite(s): api, ros, ingestion, scale, soak, valkey, db, kafka, celery, stress, stress_ramp, stress_recovery, rbac
 ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite ros,api
 ```
 
@@ -131,6 +131,7 @@ to node max for perf runs.
 - `tests/suites/performance/test_stress.py` — Stress ramp-to-failure + backlog recovery (STR-001, STR-002)
 - `tests/suites/performance/test_soak.py` — Soak stability tests (SOAK-001 through SOAK-004, opt-in via `SOAK_TESTS=true`)
 - `tests/suites/performance/tracker.py` — Resource cleanup tracker with configurable timeout
+- `tests/suites/performance/test_rbac_perf.py` — RBAC authorization performance (RBAC-001 through RBAC-006)
 
 ---
 

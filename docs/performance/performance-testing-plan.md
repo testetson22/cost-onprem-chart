@@ -451,6 +451,7 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 - [x] Self-contained HTML run reports and JSON summaries
 - [x] S3 result archival to shared S3-compatible storage
 - [x] Stress ramp-to-failure + backlog recovery (`test_stress.py`, COST-7627 + COST-7600)
+- [x] RBAC authorization performance (`test_rbac_perf.py`, COST-7643) — 6 tests validated at medium + large
 
 ### Stress Test Environment Variables
 
@@ -679,6 +680,7 @@ aws s3 ls "s3://${S3_BUCKET}/cost-onprem-performance/<run-id>/" \
 | `test_ros.py` | 4 | ROS/Kruize performance (ROS-001 through ROS-004) |
 | `test_soak.py` | 4 | Soak stability (SOAK-001 through SOAK-004, opt-in; condensed mode available) |
 | `test_stress.py` | 2 | Stress ramp-to-failure + backlog recovery (STR-001, STR-002) |
+| `test_rbac_perf.py` | 6 | RBAC authorization performance (RBAC-001 through RBAC-006) |
 | `profiles.py` | — | Profile definitions + NISE YAML generation |
 | `tracker.py` | — | Resource cleanup tracker with configurable timeout |
 | `conftest.py` | — | Fixtures, cleanup, data generation |
@@ -710,6 +712,9 @@ SOAK_TESTS=true SOAK_CONDENSED=true \
 SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
   ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
 
+# RBAC authorization tests
+./scripts/deploy-test-cost-onprem.sh --perf-only --perf-profile medium --perf-suite rbac
+
 # Via Jenkins
 # Job: flightpath-insights-onprem (RUN_PERF_TESTS=true, PERF_PROFILE=xlarge, PERF_SUITE=all)
 ```
@@ -722,7 +727,7 @@ SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
 |----|----------|--------|----------|
 | SC-1 | Sizing table | **Done** | [sizing-guide.md](./sizing-guide.md) — small through xlarge validated |
 | SC-2 | Cluster count limits | **Done** | XLarge (23 clusters) validated; stress ramp tested at medium (75), large (100), xlarge (100+) concurrent sources |
-| SC-3 | Bottleneck analysis | **Done** | [FINDINGS.md](./FINDINGS.md) — 13 findings documented with severity and evidence |
+| SC-3 | Bottleneck analysis | **Done** | [FINDINGS.md](./FINDINGS.md) — 14 findings documented with severity and evidence |
 | SC-4 | Processing window | **Partial** | XLarge completes in ~2h; need to validate against 6-hour SLA formally |
 | SC-5 | Soak test | **Partial** | 1-hour soak validated (4/4 passed, COST-7634). Condensed mode available for rapid iteration. 7-day run pending dedicated cluster time. |
 
@@ -734,3 +739,4 @@ SOAK_TESTS=true SOAK_DURATION_HOURS=1 \
    - [ ] Execute 7-day soak test — requires dedicated cluster time
 4. [x] Publish sizing profile overlays + operator mapping draft (COST-7618) — see `cost-onprem/values-*.yaml` and `operator-profile-crd-mapping.md`
 5. [x] File tickets for untracked findings — FLPATH-4428 (013), FLPATH-4429 (020), FLPATH-4430 (022), FLPATH-4431 (024)
+6. [x] RBAC authorization performance testing (COST-7643) — 6 tests, validated at medium + large, FINDING-037
