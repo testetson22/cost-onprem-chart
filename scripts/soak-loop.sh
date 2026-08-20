@@ -268,12 +268,12 @@ preflight() {
         local preflight_s3_python
         preflight_s3_python="$(resolve_s3_python)"
         if [[ -n "${preflight_s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
-            local s3_args=""
-            [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
-            [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
-            [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
+            local -a s3_args=()
+            [[ -n "${S3_ENDPOINT}" ]] && s3_args+=("--endpoint-url" "${S3_ENDPOINT}")
+            [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args+=("--no-verify-ssl")
+            [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args+=("--no-sign-request")
 
-            if timeout 15 "${preflight_s3_python}" "${S3_UPLOAD_SCRIPT}" ls "s3://${S3_BUCKET}/" ${s3_args} &>/dev/null; then
+            if timeout 15 "${preflight_s3_python}" "${S3_UPLOAD_SCRIPT}" ls "s3://${S3_BUCKET}/" "${s3_args[@]}" &>/dev/null; then
                 log_info "S3 preflight OK"
             else
                 log_warn "S3 preflight failed (bucket/endpoint unreachable) — checkpoints will be local only for this run"
@@ -365,14 +365,14 @@ CHECKPOINT_EOF
     s3_python="$(resolve_s3_python)"
     if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
         local s3_prefix="${S3_PREFIX:-cost-onprem-performance}/${RUN_ID}"
-        local s3_args=""
-        [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
-        [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
-        [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
+        local -a s3_args=()
+        [[ -n "${S3_ENDPOINT}" ]] && s3_args+=("--endpoint-url" "${S3_ENDPOINT}")
+        [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args+=("--no-verify-ssl")
+        [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args+=("--no-sign-request")
 
         if timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${checkpoint_file}" "s3://${S3_BUCKET}/${s3_prefix}/$(basename "${checkpoint_file}")" \
-            ${s3_args} 2>/dev/null; then
+            "${s3_args[@]}" 2>/dev/null; then
             log_info "Checkpoint uploaded to s3://${S3_BUCKET}/${s3_prefix}/$(basename "${checkpoint_file}")"
         else
             log_warn "S3 upload failed (non-fatal) — checkpoint available locally"
@@ -382,7 +382,7 @@ CHECKPOINT_EOF
         timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${CHECKPOINT_DIR}/checkpoint-latest.json" \
             "s3://${S3_BUCKET}/${s3_prefix}/checkpoint-latest.json" \
-            ${s3_args} 2>/dev/null || true
+            "${s3_args[@]}" 2>/dev/null || true
     elif [[ -n "${S3_BUCKET}" ]]; then
         log_warn "boto3 still not available — checkpoint ${iteration} saved locally only (will retry next iteration)"
     fi
@@ -425,14 +425,14 @@ SUMMARY_EOF
     s3_python="$(resolve_s3_python)"
     if [[ -n "${S3_BUCKET}" ]] && [[ -n "${s3_python}" ]] && [[ -f "${S3_UPLOAD_SCRIPT}" ]]; then
         local s3_prefix="${S3_PREFIX:-cost-onprem-performance}/${RUN_ID}"
-        local s3_args=""
-        [[ -n "${S3_ENDPOINT}" ]] && s3_args="--endpoint-url ${S3_ENDPOINT}"
-        [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args="${s3_args} --no-verify-ssl"
-        [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args="${s3_args} --no-sign-request"
+        local -a s3_args=()
+        [[ -n "${S3_ENDPOINT}" ]] && s3_args+=("--endpoint-url" "${S3_ENDPOINT}")
+        [[ "${S3_NO_VERIFY_SSL}" == "true" ]] && s3_args+=("--no-verify-ssl")
+        [[ "${S3_NO_SIGN_REQUEST}" == "true" ]] && s3_args+=("--no-sign-request")
 
         timeout 30 "${s3_python}" "${S3_UPLOAD_SCRIPT}" cp \
             "${summary_file}" "s3://${S3_BUCKET}/${s3_prefix}/final-results.json" \
-            ${s3_args} 2>/dev/null \
+            "${s3_args[@]}" 2>/dev/null \
             && log_info "Final summary uploaded to s3://${S3_BUCKET}/${s3_prefix}/final-results.json" \
             || log_warn "S3 upload of final summary failed"
     elif [[ -n "${S3_BUCKET}" ]]; then

@@ -578,8 +578,13 @@ def query_worker(
                         timeout=30,
                         verify=False,
                     )
-                except Exception:
-                    pass
+                except Exception as refresh_err:
+                    # Keep the stale token and retry next iteration rather than
+                    # crashing the worker, but surface the failure — silently
+                    # swallowing this would otherwise hide a permanent 401 loop
+                    # (e.g. Keycloak down/unreachable) for the rest of the run.
+                    print(f"[query_worker] Token refresh failed: {refresh_err}")
+                    state.add_error(f"Token refresh failed: {refresh_err}")
 
             if response.status_code in [200, 404]:
                 state.increment_queries(success=True)
@@ -740,6 +745,51 @@ def _get_restart_counts(namespace: str) -> Dict[str, int]:
                 if count.isdigit():
                     counts[pod] = int(count)
     return counts
+
+
+def _get_soak_samples_or_standalone(
+    namespace: str, perf_config: PerfTestConfig, test_id: str
+) -> List["MetricSample"]:
+    """Return SOAK-001's shared samples, or fall back to a short standalone
+    collection when no test in this process already populated ``_soak_shared``.
+
+    A missing SOAK-001 fallback almost always means either a deliberate
+    standalone invocation (fine — proceed with a short smoke check) or tests
+    ran out of order within the same process, e.g. under pytest-randomly or
+    pytest-xdist (not fine — silently degrading to a 2-minute sample would
+    mask that and produce a hollow pass/fail signal for a run that's supposed
+    to be a real multi-hour/multi-day soak). Distinguish the two by duration:
+    a non-condensed run with a substantial configured duration is expected to
+    have real SOAK-001 data, so treat its absence as an ordering error.
+    """
+    if "samples" in _soak_shared and len(_soak_shared["samples"]) >= 2:
+        samples = _soak_shared["samples"]
+        print(f"\n=== {test_id}: Analyzing {len(samples)} samples from SOAK-001 ===")
+        return samples
+
+    if not _SOAK_CONDENSED and _SOAK_DURATION_S > 300:
+        pytest.skip(
+            f"{test_id}: no SOAK-001 data available for a non-condensed "
+            f"{_SOAK_DURATION_S}s soak run. This usually means tests ran out "
+            "of order within this process (e.g. pytest-randomly/pytest-xdist) "
+            "rather than a deliberate standalone run — run the full "
+            "TestSoakStability class in its normal order, or set "
+            "SOAK_CONDENSED=true to opt into standalone smoke-check mode."
+        )
+
+    print(
+        f"\n=== {test_id}: No SOAK-001 data — collecting standalone (2 min, "
+        "smoke check only; too short for a meaningful trend signal) ==="
+    )
+    interval = perf_config.soak_metrics_interval_seconds
+    samples = []
+    start_time = time.time()
+    standalone_duration = 120
+    while time.time() - start_time < standalone_duration:
+        samples.append(collect_metrics(namespace, start_time))
+        time.sleep(interval)
+    print(f"  Collected {len(samples)} standalone samples")
+    return samples
 
 
 # =============================================================================
@@ -970,19 +1020,9 @@ class TestSoakStability:
 
         Success criteria: < 5% memory growth per day (extrapolated)
         """
-        if "samples" in _soak_shared and len(_soak_shared["samples"]) >= 2:
-            samples = _soak_shared["samples"]
-            print(f"\n=== PERF-SOAK-002: Analyzing {len(samples)} samples from SOAK-001 ===")
-        else:
-            print("\n=== PERF-SOAK-002: No SOAK-001 data — collecting standalone (2 min) ===")
-            interval = perf_config.soak_metrics_interval_seconds
-            samples = []
-            start_time = time.time()
-            standalone_duration = 120
-            while time.time() - start_time < standalone_duration:
-                samples.append(collect_metrics(cluster_config.namespace, start_time))
-                time.sleep(interval)
-            print(f"  Collected {len(samples)} standalone samples")
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-002"
+        )
 
         actual_duration_s = samples[-1].elapsed_seconds if samples else 0
 
@@ -1088,19 +1128,9 @@ class TestSoakStability:
 
         Success criteria: No disk exhaustion warnings (< 50 GB projected 7-day growth)
         """
-        if "samples" in _soak_shared and len(_soak_shared["samples"]) >= 2:
-            samples = _soak_shared["samples"]
-            print(f"\n=== PERF-SOAK-003: Analyzing {len(samples)} samples from SOAK-001 ===")
-        else:
-            print("\n=== PERF-SOAK-003: No SOAK-001 data — collecting standalone (2 min) ===")
-            interval = perf_config.soak_metrics_interval_seconds
-            samples = []
-            start_time = time.time()
-            standalone_duration = 120
-            while time.time() - start_time < standalone_duration:
-                samples.append(collect_metrics(cluster_config.namespace, start_time))
-                time.sleep(interval)
-            print(f"  Collected {len(samples)} standalone samples")
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-003"
+        )
 
         actual_duration_s = samples[-1].elapsed_seconds if samples else 0
 
@@ -1160,19 +1190,9 @@ class TestSoakStability:
 
         Success criteria: No sustained queue growth indicating processing backup
         """
-        if "samples" in _soak_shared and len(_soak_shared["samples"]) >= 2:
-            samples = _soak_shared["samples"]
-            print(f"\n=== PERF-SOAK-004: Analyzing {len(samples)} samples from SOAK-001 ===")
-        else:
-            print("\n=== PERF-SOAK-004: No SOAK-001 data — collecting standalone (2 min) ===")
-            interval = perf_config.soak_metrics_interval_seconds
-            samples = []
-            start_time = time.time()
-            standalone_duration = 120
-            while time.time() - start_time < standalone_duration:
-                samples.append(collect_metrics(cluster_config.namespace, start_time))
-                time.sleep(interval)
-            print(f"  Collected {len(samples)} standalone samples")
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-004"
+        )
 
         actual_duration_s = samples[-1].elapsed_seconds if samples else 0
 
