@@ -494,9 +494,15 @@ def upload_worker(
                                 current_token = _refresh_token(keycloak_config)
                                 print("[upload_worker] Refreshed JWT token (401)")
                                 auth_header = {"Authorization": f"Bearer {current_token}"}
+                                # Keycloak tokens expire after ~5 min while uploads happen
+                                # every 15 min, so nearly every upload takes this path. A single
+                                # attempt here (previously max_retries=1) had zero margin for
+                                # a transient RemoteDisconnected and permanently failed the
+                                # upload, tripping SOAK-001's zero-tolerance assertion on long
+                                # runs. Give it the same retry budget as the primary attempt.
                                 response = upload_with_retry(
                                     session, upload_url, tar_path, auth_header,
-                                    max_retries=1, timeout=120,
+                                    max_retries=2, timeout=120,
                                 )
 
                             if response.status_code in (200, 201, 202):
