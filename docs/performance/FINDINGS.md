@@ -937,7 +937,7 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 
 ### PERF-FINDING-038: Transient S3 Upload Drops Fail Soak Iterations (No Retry)
 
-**Status**: Documented
+**Status**: Fixed
 **Severity**: Medium
 **Category**: Test harness robustness (not a product issue)
 
