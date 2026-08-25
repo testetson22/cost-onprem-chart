@@ -982,7 +982,7 @@ queries — the failure mode did not reproduce.
 so the intermittent nature of the failure is not fully ruled out at longer
 durations.
 
-**Recommended fix**: Add retry with backoff (e.g., 2–3 attempts) to the
+**Fix**: Add retry with backoff (e.g., 2–3 attempts) to the
 soak upload loop for transient errors (`RemoteDisconnected`,
 `Connection aborted`, timeouts) so a single dropped connection does not
 fail a multi-hour stability iteration.
